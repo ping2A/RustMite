@@ -1,0 +1,16 @@
+id = "RM-FILE-0007"
+version = 1
+name = "Known-malicious hash (IOC feed)"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "ioc_hit"
+where = '''
+  ioc_hit.ioc_kind == "hash"
+'''
+title = "Known-malicious hash at {{ioc_hit.path}}"
+evidence_fields = ["path", "ioc_kind", "ioc_value", "severity"]
+attack = []
+rationale = "File hash matches a configured malicious IOC feed entry."

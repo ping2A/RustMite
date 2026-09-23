@@ -1,0 +1,6 @@
+//! NOTICE
+//!
+//! This crate vendors [anomark-rs](https://github.com/ping2A/anomark-rs) (MIT)
+//! as a first-class RustMite dependency for Markov command-line anomaly scoring.
+//! Upstream source adapted into `crates/rustmite-anomark` for workspace builds
+//! without a git dependency.

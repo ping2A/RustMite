@@ -1,0 +1,33 @@
+id = "RM-PROC-0019"
+version = 1
+name = "Python interpreter elevated to root from staging cwd"
+type = "process"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid == 0
+  and process.ruid != 0
+  and (
+    process.comm starts_with "python"
+    or process.comm == "python"
+    or process.comm == "python3"
+  )
+  and process.cwd != null
+  and (
+    process.cwd.path_under("/tmp")
+    or process.cwd.path_under("/var/tmp")
+    or process.cwd.path_under("/dev/shm")
+    or process.cwd.path_under("/home/")
+    or process.cwd.path_under("/run/user/")
+    or process.cwd.path_under("/var/www")
+  )
+'''
+title = "Python '{{process.comm}}' elevated from staging cwd {{process.cwd}}"
+evidence_fields = ["pid", "comm", "ruid", "euid", "cwd", "exe", "cmdline"]
+attack = ["T1068", "T1059.006"]
+rationale = "Elastic 'Suspicious UID Change to Root via Python' — many 2026 LPE PoCs finish as Python. Snapshot sees elevated python with staging cwd rather than uid_change events."
+references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
+collectors = ["process.inventory"]

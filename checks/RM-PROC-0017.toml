@@ -1,0 +1,31 @@
+id = "RM-PROC-0017"
+version = 1
+name = "Privileged-mode shell (bash/sh -p) as root"
+type = "process"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid == 0
+  and (
+    process.comm == "bash"
+    or process.comm == "sh"
+    or process.comm == "dash"
+    or process.comm == "zsh"
+  )
+  and (
+    process.cmdline contains "-p"
+    or process.cmdline contains " -p"
+  )
+'''
+title = "Privileged shell '{{process.comm}}' (pid {{process.pid}}) with -p — likely SUID shell abuse"
+evidence_fields = ["pid", "comm", "ruid", "euid", "exe", "cmdline", "cwd"]
+attack = ["T1548.001"]
+rationale = "Elastic SUID misconfiguration case: bash/sh -p keeps effective privileges after setuid. Classic GTFOBins privileged-shell pattern."
+references = [
+  "https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework",
+  "https://gtfobins.github.io/gtfobins/bash/",
+]
+collectors = ["process.inventory"]

@@ -1,0 +1,16 @@
+id = "RM-NET-0001"
+version = 1
+name = "Hidden socket (sock_diag vs /proc/net mismatch)"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "hidden_socket"
+where = '''
+  hidden_socket.local_port >= 0
+'''
+title = "Hidden {{hidden_socket.protocol}} socket on port {{hidden_socket.local_port}}"
+evidence_fields = ["inode", "local_port", "protocol", "sources_present", "sources_absent", "confidence"]
+attack = ["T1014"]
+rationale = "Socket visible via sock_diag but absent from /proc/net (or vice versa) indicates socket hiding."

@@ -1,0 +1,17 @@
+id = "RM-LOG-0002"
+version = 1
+name = "Log file NUL holes or selective deletion"
+type = "log"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "log_integrity"
+where = '''
+  log_integrity.issue == "nul_hole"
+  or log_integrity.issue contains "deletion"
+'''
+title = "Log tampering on {{log_integrity.path}} ({{log_integrity.issue}})"
+evidence_fields = ["path", "issue", "detail"]
+attack = ["T1070.002"]
+rationale = "NUL holes or sparse deletion patterns in logs suggest anti-forensics."

@@ -1,0 +1,31 @@
+[package]
+name = "rustmite-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SSH client, probe delivery, session pool"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-crypto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+lz4_flex = { workspace = true }
+uuid = { workspace = true, features = ["std"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+
+# Optional: keep macOS unit tests of framing/normaliser free of the SSH stack.
+russh = { workspace = true, optional = true }
+
+[features]
+default = []
+ssh = ["dep:russh"]

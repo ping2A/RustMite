@@ -1,0 +1,27 @@
+id = "RM-USER-0003"
+version = 2
+name = "Service account with interactive shell"
+type = "user"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "account"
+where = '''
+  account.uid < 1000
+  and account.uid != 0
+  and account.shell != "/usr/sbin/nologin"
+  and account.shell != "/sbin/nologin"
+  and account.shell != "/bin/false"
+  and account.shell != "/usr/bin/false"
+  and account.shell != "/bin/sync"
+  and account.shell != "/sbin/sync"
+  and account.shell != "/usr/sbin/sync"
+  and not (account.shell ends_with "/nologin")
+  and not (account.shell ends_with "/false")
+'''
+title = "Service account '{{account.username}}' has login shell {{account.shell}}"
+evidence_fields = ["username", "uid", "shell", "home"]
+attack = ["T1136"]
+rationale = "System/service accounts should normally use nologin/false shells. Excludes the traditional sync account (/bin/sync)."
+collectors = ["persistence.accounts"]

@@ -1,0 +1,16 @@
+id = "RM-USER-0002"
+version = 1
+name = "Passwordless account (empty shadow hash)"
+type = "user"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "shadow_entry"
+where = '''
+  shadow_entry.empty_password == true
+'''
+title = "Passwordless login enabled for account '{{shadow_entry.username}}'"
+evidence_fields = ["username", "empty_password", "algorithm", "locked"]
+attack = ["T1078"]
+rationale = "Empty password hashes allow login without credentials when paired with a valid shell."

@@ -1,0 +1,17 @@
+id = "RM-DRIFT-0001"
+version = 1
+name = "Critical-file hash changed without package event"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "medium"
+match = "integrity_mismatch"
+where = '''
+  integrity_mismatch.expected_hash != integrity_mismatch.actual_hash
+'''
+title = "Critical file drift / integrity mismatch for {{integrity_mismatch.path}}"
+evidence_fields = ["path", "expected_hash", "actual_hash", "package"]
+attack = ["T1554"]
+rationale = "Baseline and package-DB diffs both surface as integrity_mismatch; package-attributed changes are downgraded server-side."
+collectors = ["file.integrity"]

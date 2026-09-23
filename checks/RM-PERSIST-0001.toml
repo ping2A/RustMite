@@ -1,0 +1,20 @@
+id = "RM-PERSIST-0001"
+version = 1
+name = "ld.so.preload present"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "preload"
+where = '''
+  preload.present == true
+'''
+title = "ld.so.preload present at {{preload.path}}"
+evidence_fields = ["path", "present", "entries"]
+attack = ["T1574.006"]
+rationale = "/etc/ld.so.preload is rarely legitimate and is a common userland rootkit persistence mechanism."
+
+[test]
+fires_on = ["diamorphine-hidden-pid"]
+silent_on = ["clean-ubuntu2204"]

@@ -1,0 +1,18 @@
+id = "RM-FILE-0002"
+version = 1
+name = "Packer fingerprint / RWX segment"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "elf_info"
+where = '''
+  elf_info.has_rwx_segment == true
+  or elf_info.packer_hints_joined contains "upx"
+  or elf_info.packer_hints contains "UPX"
+'''
+title = "Packed or anomalous ELF at {{elf_info.path}}"
+evidence_fields = ["path", "has_rwx_segment", "packer_hints", "section_count", "machine"]
+attack = ["T1027.002"]
+rationale = "RWX segments and known packer section/name fingerprints indicate packed malware."

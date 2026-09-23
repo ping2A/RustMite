@@ -1,0 +1,16 @@
+id = "RM-LOG-0004"
+version = 1
+name = "Expected log file missing"
+type = "log"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "log_integrity"
+where = '''
+  log_integrity.issue == "missing"
+'''
+title = "Expected log missing: {{log_integrity.path}}"
+evidence_fields = ["path", "issue", "detail"]
+attack = ["T1070.002"]
+rationale = "Missing expected log files may indicate deliberate removal."

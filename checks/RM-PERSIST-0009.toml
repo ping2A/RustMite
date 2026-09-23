@@ -1,0 +1,27 @@
+id = "RM-PERSIST-0009"
+version = 1
+name = "Shell profile exports LD_* or fetch-exec"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "service"
+where = '''
+  service.exec_start != null
+  and (
+    service.exec_start contains "LD_PRELOAD"
+    or service.exec_start contains "LD_AUDIT"
+    or service.exec_start contains "curl "
+    or service.exec_start contains "wget "
+  )
+  and (
+    service.path.path_under("/etc/profile.d")
+    or service.path contains "bashrc"
+    or service.path contains "profile"
+  )
+'''
+title = "Suspicious shell startup hook in {{service.path}}"
+evidence_fields = ["name", "path", "exec_start"]
+attack = ["T1546.004"]
+rationale = "Profile/rc hooks that export LD_* or pull remote content are common userland persistence."

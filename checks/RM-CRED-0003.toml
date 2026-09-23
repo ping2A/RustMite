@@ -1,0 +1,19 @@
+id = "RM-CRED-0003"
+version = 1
+name = "Account should be locked but password usable"
+type = "user"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "shadow_entry"
+where = '''
+  shadow_entry.locked == false
+  and shadow_entry.empty_password == false
+  and shadow_entry.algorithm != "!"
+'''
+title = "Active password hash on account '{{shadow_entry.username}}' (review lock policy)"
+evidence_fields = ["username", "locked", "algorithm", "empty_password"]
+attack = ["T1078"]
+rationale = "Accounts expected to be locked should not expose usable password hashes."
+collectors = ["cred.audit"]

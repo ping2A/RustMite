@@ -1,0 +1,15 @@
+id = "RM-USER-0004"
+version = 1
+name = "New account vs baseline"
+type = "user"
+severity = "medium"
+confidence = "medium"
+enabled = false
+cost = "trivial"
+match = "account"
+where = "false"
+title = "New account '{{account.username}}' (uid {{account.uid}}) vs baseline"
+evidence_fields = ["username", "uid", "shell", "home"]
+attack = ["T1136"]
+rationale = "Accounts absent from the signed baseline indicate drift; evaluated by the baseline diff engine and server-side enrichment."
+collectors = ["persistence.accounts"]

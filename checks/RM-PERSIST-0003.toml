@@ -1,0 +1,19 @@
+id = "RM-PERSIST-0003"
+version = 1
+name = "Cron fetch-and-exec pattern"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "scheduled_task"
+where = '''
+  scheduled_task.command contains "curl"
+  or scheduled_task.command contains "wget"
+  or scheduled_task.command contains "base64"
+  or scheduled_task.command contains "/tmp/"
+'''
+title = "Suspicious scheduled task in {{scheduled_task.path}}: {{scheduled_task.command}}"
+evidence_fields = ["kind", "path", "user", "schedule", "command"]
+attack = ["T1053.003"]
+rationale = "Cron/at entries that fetch remote content or decode payloads are common persistence."

@@ -1,0 +1,21 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - rustmite_ch_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: rustmite
+      CLICKHOUSE_USER: rustmite
+      CLICKHOUSE_PASSWORD: rustmite
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+
+volumes:
+  rustmite_ch_data:

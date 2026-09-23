@@ -1,0 +1,13 @@
+Port 22
+Protocol 2
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin no
+AllowUsers rustmite
+Subsystem sftp /usr/lib/ssh/sftp-server
+UsePAM no
+PrintMotd no
+AcceptEnv LANG LC_*

@@ -1,0 +1,3 @@
+name = "cred-audit-weak"
+description = "Weak and duplicate shadow hashes for cred.audit"
+expected_findings = ["RM-CRED-0001", "RM-CRED-0002", "RM-USER-0002"]

@@ -1,0 +1,17 @@
+[package]
+name = "rustmite-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stage-0 memfd loader (tiny)"
+
+[[bin]]
+name = "rustmite-loader"
+path = "src/main.rs"
+
+[dependencies]
+lz4_flex = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, default-features = false, features = ["std", "fs", "stdio"] }

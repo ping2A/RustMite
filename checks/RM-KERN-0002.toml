@@ -1,0 +1,20 @@
+id = "RM-KERN-0002"
+version = 1
+name = "Unsigned or out-of-tree kernel module loaded"
+type = "incident"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "module"
+where = '''
+  module.taint_flags != null
+  and (
+    module.taint_flags contains "E"
+    or module.taint_flags contains "O"
+  )
+'''
+title = "Out-of-tree/unsigned module '{{module.name}}' (taint {{module.taint_flags}})"
+evidence_fields = ["name", "taint_flags", "size", "in_proc_modules"]
+attack = ["T1547.006"]
+rationale = "Taint flags E/O indicate proprietary or out-of-tree modules that warrant review."

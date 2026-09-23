@@ -1,0 +1,19 @@
+[package]
+name = "rustmite-checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Check manifests, compiler, and evaluation over observations"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-expr = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+toml = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

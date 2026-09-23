@@ -1,0 +1,30 @@
+[package]
+name = "rustmite-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ephemeral target-side collector probe"
+
+[[bin]]
+name = "rustmite-probe"
+path = "src/main.rs"
+
+[lib]
+name = "rustmite_probe"
+path = "src/lib.rs"
+
+[features]
+default = []
+respond = []
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-sys = { workspace = true }
+rustmite-collect = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+uuid = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }

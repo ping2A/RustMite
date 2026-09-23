@@ -1,0 +1,18 @@
+id = "RM-FILE-0013"
+version = 1
+name = "Non-standard ELF interpreter path"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "elf_info"
+where = '''
+  elf_info.interp != null
+  and not elf_info.interp.path_under("/lib")
+  and not elf_info.interp.path_under("/usr/lib")
+'''
+title = "ELF {{elf_info.path}} uses interpreter {{elf_info.interp}}"
+evidence_fields = ["path", "interp", "machine", "is_static"]
+attack = ["T1574"]
+rationale = "Dynamic linker paths outside standard lib directories may indicate hijacked interpreters."

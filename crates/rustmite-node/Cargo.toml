@@ -1,0 +1,37 @@
+[package]
+name = "rustmite-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RustMite scanner node daemon"
+
+[[bin]]
+name = "rustmite-node"
+path = "src/main.rs"
+
+[lib]
+name = "rustmite_node"
+path = "src/lib.rs"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-sys = { workspace = true }
+rustmite-crypto = { workspace = true }
+rustmite-collect = { workspace = true }
+rustmite-checks = { workspace = true }
+rustmite-transport = { workspace = true, features = ["ssh"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4", "v7"] }
+time = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
+base64 = { workspace = true, features = ["alloc"] }
+zeroize = { workspace = true }

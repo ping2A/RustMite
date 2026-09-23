@@ -1,0 +1,49 @@
+id = "RM-FILE-0015"
+version = 1
+name = "GTFOBins binary with setuid bit"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "medium"
+match = "file_meta"
+where = '''
+  file_meta.setuid == true
+  and (
+    file_meta.path ends_with "/find"
+    or file_meta.path ends_with "/nmap"
+    or file_meta.path ends_with "/vim"
+    or file_meta.path ends_with "/vi"
+    or file_meta.path ends_with "/nano"
+    or file_meta.path ends_with "/python"
+    or file_meta.path ends_with "/python3"
+    or file_meta.path ends_with "/perl"
+    or file_meta.path ends_with "/ruby"
+    or file_meta.path ends_with "/lua"
+    or file_meta.path ends_with "/awk"
+    or file_meta.path ends_with "/less"
+    or file_meta.path ends_with "/more"
+    or file_meta.path ends_with "/env"
+    or file_meta.path ends_with "/bash"
+    or file_meta.path ends_with "/dash"
+    or file_meta.path ends_with "/sh"
+    or file_meta.path ends_with "/cp"
+    or file_meta.path ends_with "/tar"
+    or file_meta.path ends_with "/gdb"
+    or file_meta.path ends_with "/strace"
+    or file_meta.path ends_with "/tcpdump"
+    or file_meta.path ends_with "/docker"
+    or file_meta.path ends_with "/podman"
+    or file_meta.path ends_with "/nsenter"
+    or file_meta.path ends_with "/unshare"
+  )
+'''
+title = "GTFOBins setuid binary {{file_meta.path}}"
+evidence_fields = ["path", "mode", "uid", "gid", "setuid"]
+attack = ["T1548.001"]
+rationale = "Elastic GTFOBins SUID abuse: find/bash/python/etc. with the setuid bit enable trivial root shells (find -exec, bash -p). High confidence misconfiguration."
+references = [
+  "https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework",
+  "https://gtfobins.github.io/",
+]
+collectors = ["file.ioc"]

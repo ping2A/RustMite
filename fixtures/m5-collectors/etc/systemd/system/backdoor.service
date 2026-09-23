@@ -1,0 +1,6 @@
+[Unit]
+Description=Example unit for fixture
+
+[Service]
+Type=simple
+ExecStart=/tmp/.hidden/payload

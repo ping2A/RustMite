@@ -1,0 +1,17 @@
+id = "RM-NET-0005"
+version = 1
+name = "Raw or packet socket owned by non-standard process"
+type = "incident"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "socket"
+where = '''
+  socket.protocol == "RAW"
+  or socket.protocol == "PACKET"
+'''
+title = "Sniffer-class socket ({{socket.protocol}}) uid {{socket.uid}} inode {{socket.inode}}"
+evidence_fields = ["protocol", "family", "uid", "owning_pid", "inode"]
+attack = ["T1040"]
+rationale = "Raw/packet sockets may indicate packet capture or L2 sniffing."

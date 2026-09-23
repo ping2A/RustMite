@@ -1,0 +1,19 @@
+id = "RM-CRED-0001"
+version = 1
+name = "Weak password hash algorithm"
+type = "user"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "shadow_entry"
+where = '''
+  shadow_entry.algorithm == "descrypt"
+  or shadow_entry.algorithm == "md5crypt"
+  or shadow_entry.algorithm == "sha1crypt"
+'''
+title = "Weak hash algorithm '{{shadow_entry.algorithm}}' for account '{{shadow_entry.username}}'"
+evidence_fields = ["username", "algorithm", "locked"]
+attack = ["T1110"]
+rationale = "Legacy DES/MD5-crypt hashes are fast to crack offline."
+collectors = ["cred.audit"]

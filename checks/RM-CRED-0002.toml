@@ -1,0 +1,17 @@
+id = "RM-CRED-0002"
+version = 1
+name = "Duplicate password hash across accounts"
+type = "user"
+severity = "medium"
+confidence = "medium"
+enabled = false
+cost = "trivial"
+match = "shadow_entry"
+where = '''
+  false
+'''
+title = "Duplicate password hash (server correlates hash_fingerprint across accounts)"
+evidence_fields = ["username", "hash_fingerprint", "algorithm"]
+attack = ["T1110"]
+rationale = "Expression check is disabled; rustmite_checks::find_duplicate_shadow_hashes emits RM-CRED-0002 from fingerprints."
+collectors = ["cred.audit"]

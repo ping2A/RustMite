@@ -1,0 +1,16 @@
+id = "RM-KERN-0004"
+version = 1
+name = "Known rootkit module name"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "module"
+where = '''
+  module.name matches "(?i)diamorphine|reptile|kit|rootkit"
+'''
+title = "Known rootkit module name '{{module.name}}'"
+evidence_fields = ["name", "in_sysfs", "in_proc_modules", "taint_flags"]
+attack = ["T1014"]
+rationale = "Module name matches a known rootkit or hiding kit signature."

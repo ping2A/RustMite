@@ -1,0 +1,48 @@
+[package]
+name = "rustmite-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RustMite control plane (operator + node APIs)"
+
+[[bin]]
+name = "rustmite-server"
+path = "src/main.rs"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-store = { workspace = true }
+rustmite-notify = { workspace = true }
+rustmite-checks = { workspace = true }
+rustmite-expr = { workspace = true }
+rustmite-rpl = { path = "../rustmite-rpl" }
+rustmite-transport = { path = "../rustmite-transport", features = ["ssh"] }
+rustmite-crypto = { workspace = true }
+rustmite-sift = { workspace = true }
+rustmite-anomark = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4", "v7"] }
+async-trait = { workspace = true }
+include_dir = "0.7"
+mime_guess = "2"
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
+reqwest = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rustls = { workspace = true }
+rcgen = "0.13"
+zeroize = { workspace = true }
+csv = "1.3"

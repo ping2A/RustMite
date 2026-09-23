@@ -1,0 +1,51 @@
+id = "RM-PROC-0018"
+version = 1
+name = "GTFOBins-style binary elevated (euid 0, ruid non-0)"
+type = "process"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid == 0
+  and process.ruid != 0
+  and (
+    process.comm == "find"
+    or process.comm == "nmap"
+    or process.comm == "vim"
+    or process.comm == "vi"
+    or process.comm == "nano"
+    or process.comm == "python"
+    or process.comm == "python3"
+    or process.comm == "perl"
+    or process.comm == "ruby"
+    or process.comm == "lua"
+    or process.comm == "awk"
+    or process.comm == "less"
+    or process.comm == "more"
+    or process.comm == "man"
+    or process.comm == "env"
+    or process.comm == "bash"
+    or process.comm == "dash"
+    or process.comm == "cp"
+    or process.comm == "tar"
+    or process.comm == "zip"
+    or process.comm == "gdb"
+    or process.comm == "strace"
+    or process.comm == "tcpdump"
+    or process.comm == "docker"
+    or process.comm == "podman"
+    or process.comm == "nsenter"
+    or process.comm == "unshare"
+  )
+'''
+title = "GTFOBins binary '{{process.comm}}' elevated (euid 0 / ruid {{process.ruid}})"
+evidence_fields = ["pid", "comm", "ruid", "euid", "exe", "cmdline"]
+attack = ["T1548.001"]
+rationale = "Elastic GTFOBins abuse detection adapted to snapshots: known dual-use binaries should not run with the SUID privilege shape. Covers find -exec root shells and similar misconfigurations."
+references = [
+  "https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework",
+  "https://gtfobins.github.io/",
+]
+collectors = ["process.inventory"]

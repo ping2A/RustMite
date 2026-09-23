@@ -1,0 +1,17 @@
+id = "RM-USER-0006"
+version = 1
+name = "Unsafe sudoers directive"
+type = "user"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "sudo_rule"
+where = '''
+  sudo_rule.line contains "!authenticate"
+  or sudo_rule.line contains "SETENV"
+'''
+title = "Unsafe sudoers line in {{sudo_rule.path}}: {{sudo_rule.line}}"
+evidence_fields = ["path", "line"]
+attack = ["T1548.003"]
+rationale = "!authenticate and permissive SETENV directives weaken sudo hardening."

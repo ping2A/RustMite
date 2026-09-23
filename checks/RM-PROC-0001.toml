@@ -1,0 +1,21 @@
+id = "RM-PROC-0001"
+version = 1
+name = "Hidden process (multi-source, confirmed)"
+type = "process"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "hidden_process"
+where = '''
+  hidden_process.passes_confirmed >= 2
+'''
+title = "Hidden process pid {{hidden_process.pid}} (kernel-present, /proc-absent)"
+evidence_fields = ["pid", "comm", "passes_confirmed", "sources_present", "sources_absent"]
+attack = ["T1014"]
+rationale = "Process visible to kernel PID probes but absent from /proc listing across ≥2 confirmation passes."
+false_positives = "Transient PID reuse races if passes_confirmed is low; require ≥2."
+
+[test]
+fires_on = ["diamorphine-hidden-pid"]
+silent_on = ["clean-ubuntu2204"]

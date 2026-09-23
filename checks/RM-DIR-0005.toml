@@ -1,0 +1,17 @@
+id = "RM-DIR-0005"
+version = 1
+name = "Open file absent from directory listing"
+type = "directory"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "medium"
+match = "dir_anomaly"
+where = '''
+  dir_anomaly.anomaly == "unlisted_open_file"
+'''
+title = "Hidden open file at {{dir_anomaly.path}}"
+evidence_fields = ["path", "anomaly", "detail", "confidence"]
+attack = ["T1014"]
+rationale = "Processes referencing paths that do not appear in parent directory listings indicate hiding."
+collectors = ["dir.hidden", "process.inventory"]

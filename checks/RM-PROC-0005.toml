@@ -1,0 +1,20 @@
+id = "RM-PROC-0005"
+version = 1
+name = "Fileless execution via memfd/anon_inode"
+type = "process"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.exe_memfd == true
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) executing from memfd/anon_inode"
+evidence_fields = ["pid", "comm", "exe", "exe_memfd"]
+attack = ["T1620"]
+rationale = "Executable backed by memfd or anon_inode is a strong fileless-execution signal."
+
+[test]
+fires_on = ["memfd-exec"]
+silent_on = ["clean-ubuntu2204"]

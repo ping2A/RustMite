@@ -1,0 +1,24 @@
+id = "RM-NET-0002"
+version = 1
+name = "Listener with no visible owning PID"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "socket"
+where = '''
+  socket.state == "LISTEN"
+  and socket.owning_pid == null
+  and socket.owner_unresolved == true
+'''
+title = "Listener {{socket.local_ip}}:{{socket.local_port}} has no visible owner"
+evidence_fields = ["local_ip", "local_port", "protocol", "state", "inode", "uid", "owning_comm", "owner_unresolved"]
+attack = ["T1014"]
+rationale = '''
+Listening sockets without a resolvable owning process (after a reliable root-level
+fd walk) may indicate a hidden-process backdoor. Non-root scans cannot read other
+users' /proc/*/fd tables — those leave owning_pid null without owner_unresolved and
+must not alert.
+'''
+collectors = ["decloak.socket", "net.sockets"]

@@ -1,0 +1,16 @@
+id = "RM-POL-0001"
+version = 1
+name = "SSH host key changed since pinning"
+type = "policy"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "ssh_host_key"
+where = '''
+  ssh_host_key.changed == true
+'''
+title = "SSH host key changed ({{ssh_host_key.key_type}} {{ssh_host_key.fingerprint}})"
+evidence_fields = ["path", "key_type", "fingerprint", "changed"]
+attack = []
+rationale = "A changed SSH host key blocks trust in scan results and may indicate MITM or host rebuild; always critical."

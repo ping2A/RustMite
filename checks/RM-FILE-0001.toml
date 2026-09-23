@@ -1,0 +1,23 @@
+id = "RM-FILE-0001"
+version = 1
+name = "High whole-file entropy ELF in suspicious path"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "file_entropy"
+where = '''
+  file_entropy.entropy > 7.2
+  and file_entropy.is_elf == true
+  and (
+    file_entropy.path.path_under("/tmp")
+    or file_entropy.path.path_under("/dev/shm")
+    or file_entropy.path.path_under("/var/tmp")
+    or file_entropy.path.path_under("/home")
+  )
+'''
+title = "High-entropy ELF at {{file_entropy.path}} (entropy {{file_entropy.entropy}})"
+evidence_fields = ["path", "entropy", "is_elf", "sha256"]
+attack = ["T1027.002"]
+rationale = "Packed or encrypted ELF payloads often show Shannon entropy above ~7.2."

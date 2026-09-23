@@ -1,0 +1,17 @@
+id = "RM-USER-0008"
+version = 2
+name = "New or unknown authorized_keys entry"
+type = "user"
+severity = "high"
+confidence = "medium"
+enabled = false
+cost = "low"
+match = "authorized_key"
+where = '''
+  authorized_key.fingerprint != ""
+'''
+title = "SSH authorized key for {{authorized_key.username}} ({{authorized_key.fingerprint}})"
+evidence_fields = ["username", "path", "fingerprint", "key_type", "comment"]
+attack = ["T1098.004"]
+rationale = "Disabled until authorized_keys baselines exist — without a baseline this matched every key. Re-enable when drift compares against a captured baseline."
+collectors = ["ssh.keys"]

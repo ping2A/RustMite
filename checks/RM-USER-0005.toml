@@ -1,0 +1,17 @@
+id = "RM-USER-0005"
+version = 1
+name = "sudoers NOPASSWD ALL"
+type = "user"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "sudo_rule"
+where = '''
+  sudo_rule.nopasswd == true
+  and sudo_rule.all_commands == true
+'''
+title = "Passwordless sudo for all commands in {{sudo_rule.path}}"
+evidence_fields = ["path", "line", "nopasswd", "all_commands"]
+attack = ["T1548.003"]
+rationale = "NOPASSWD:ALL grants passwordless full root access and is a common persistence/privesc vector."

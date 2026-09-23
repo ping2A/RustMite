@@ -1,0 +1,17 @@
+id = "RM-FILE-0008"
+version = 2
+name = "Known rootkit path present"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "medium"
+match = "ioc_hit"
+where = '''
+  ioc_hit.ioc_kind == "path"
+'''
+title = "Known rootkit/IOC path {{ioc_hit.path}} ({{ioc_hit.ioc_value}})"
+evidence_fields = ["path", "ioc_kind", "ioc_value", "severity"]
+attack = ["T1014"]
+rationale = "Path IOC match from file.ioc collector (known rootkit drop locations)."
+collectors = ["file.ioc"]

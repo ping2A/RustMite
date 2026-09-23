@@ -1,0 +1,30 @@
+title: IronSift library — suspicious file inventory paths (osquery file.path)
+id: ironsift-suspicious-file-paths
+status: experimental
+description: >
+  Matches file inventory JSONL exported from IronSift (SQLite `file` table / osquery `file` rows).
+  Flags paths under temp and shared-memory dirs, hidden executables under system bin directories,
+  and current-directory-relative paths — aligned with IronSift fleet suspicious-path heuristics.
+level: medium
+detection:
+  selection_tmp:
+    file_path|contains:
+      - '/tmp/'
+      - '/dev/shm/'
+      - '/var/tmp/'
+  selection_dot_bins:
+    file_path|contains:
+      - '/bin/.'
+      - '/sbin/.'
+      - '/usr/bin/.'
+      - '/usr/sbin/.'
+      - '/usr/local/bin/.'
+      - '/usr/local/sbin/.'
+  selection_rel:
+    file_path|startswith: './'
+  condition: selection_tmp or selection_dot_bins or selection_rel
+tags:
+  - library
+  - attack.defense_evasion
+  - attack.persistence
+  - osquery

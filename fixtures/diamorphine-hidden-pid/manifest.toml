@@ -1,0 +1,3 @@
+name = "diamorphine-hidden-pid"
+hidden_pids = [31337]
+expected_checks = ["RM-PROC-0001"]

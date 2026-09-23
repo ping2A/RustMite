@@ -1,0 +1,22 @@
+[package]
+name = "rustmite-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Alert sinks: webhook, syslog, ndjson file, severity router"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
+tracing = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

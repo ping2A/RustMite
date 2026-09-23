@@ -1,0 +1,16 @@
+id = "RM-DIR-0002"
+version = 1
+name = "getdents byte-sum mismatch"
+type = "directory"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "dir_anomaly"
+where = '''
+  dir_anomaly.anomaly == "getdents_mismatch"
+'''
+title = "getdents hiding suspected at {{dir_anomaly.path}}"
+evidence_fields = ["path", "anomaly", "detail", "confidence"]
+attack = ["T1014"]
+rationale = "Disagreement between getdents metadata and entry counts may indicate magic-prefix hiding."

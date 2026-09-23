@@ -1,0 +1,27 @@
+id = "RM-PROC-0016"
+version = 1
+name = "Root process executing from writable staging path"
+type = "process"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid == 0
+  and process.exe != null
+  and (
+    process.exe.path_under("/tmp")
+    or process.exe.path_under("/dev/shm")
+    or process.exe.path_under("/var/tmp")
+    or process.exe.path_under("/run/user/")
+    or process.exe.path_under("/home/")
+  )
+'''
+title = "Root process '{{process.comm}}' executing from staging path {{process.exe}}"
+evidence_fields = ["pid", "comm", "euid", "ruid", "exe", "cwd", "cmdline"]
+attack = ["T1068", "T1059"]
+rationale = "Elastic exec-then-elevate aftermath: kernel/userland LPE PoCs often leave a root shell or payload running from /tmp, /dev/shm, or a home directory. Snapshot cannot see uid_change events, but a live root exe from a writable path is high signal."
+false_positives = "Rare installer/bootstrap jobs. Prefer short TTL or allowlist."
+references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
+collectors = ["process.inventory"]

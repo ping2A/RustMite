@@ -1,0 +1,16 @@
+id = "RM-POL-0021"
+version = 1
+name = "Degraded inspection (pure-command fallback)"
+type = "policy"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "policy"
+where = '''
+  policy.code == "RM-POL-0021"
+'''
+title = "Host could not be inspected with full-fidelity probe: {{policy.detail}}"
+evidence_fields = ["code", "detail", "severity"]
+attack = []
+rationale = "Method D pure-command fallback cannot perform differential syscall checks; raise so operators know coverage is degraded."

@@ -1,0 +1,19 @@
+id = "RM-FILE-0005"
+version = 1
+name = "Setuid/setgid root binary (inventory)"
+type = "file"
+severity = "low"
+confidence = "high"
+enabled = false
+cost = "medium"
+match = "file_meta"
+where = '''
+  (file_meta.setuid == true or file_meta.setgid == true)
+  and file_meta.uid == 0
+'''
+title = "Setuid/setgid root binary {{file_meta.path}} (mode {{file_meta.mode}})"
+evidence_fields = ["path", "mode", "uid", "gid", "setuid", "setgid"]
+attack = ["T1548.001"]
+rationale = "Full setuid inventory for baseline/drift. Disabled by default (fires on every sudo/passwd). Prefer RM-FILE-0006, RM-FILE-0015, and drift once baselines exist."
+references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
+collectors = ["file.ioc"]

@@ -1,0 +1,42 @@
+id = "RM-PROC-0006"
+version = 2
+name = "Process comm/exe masquerade mismatch"
+type = "process"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.exe != null
+  and process.exe != ""
+  and process.comm != process.exe.basename()
+  and not process.comm matches "^\\[.*\\]$"
+  and not process.comm matches "^\\(.*\\)$"
+  and not (
+    process.comm.len() == 15
+    and process.exe.basename() starts_with process.comm
+  )
+  and not (process.comm starts_with process.exe.basename())
+  and not (
+    process.exe.basename() starts_with "python"
+    or process.exe.basename() starts_with "java"
+    or process.exe.basename() starts_with "gjs"
+    or process.exe.basename() starts_with "node"
+    or process.exe.basename() starts_with "ruby"
+    or process.exe.basename() starts_with "perl"
+    or process.exe.basename() starts_with "php"
+  )
+  and not (
+    process.exe.path_under("/usr")
+    or process.exe.path_under("/lib")
+    or process.exe.path_under("/bin")
+    or process.exe.path_under("/sbin")
+    or process.exe.path_under("/snap")
+  )
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) comm does not match exe basename"
+evidence_fields = ["pid", "comm", "exe", "cmdline"]
+attack = ["T1036"]
+rationale = "Comm diverging from exe basename outside trusted system paths may indicate masquerading. Ignores TASK_COMM_LEN truncation, systemd '(name)' comms, interpreter wrappers, and reverse-prefix renames (e.g. pipewire-pulse)."
+collectors = ["process.inventory"]

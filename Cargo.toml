@@ -1,0 +1,123 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustmite-sys",
+    "crates/rustmite-proto",
+    "crates/rustmite-analyze",
+    "crates/rustmite-collect",
+    "crates/rustmite-probe",
+    "crates/rustmite-loader",
+    "crates/rustmite-expr",
+    "crates/rustmite-checks",
+    "crates/rustmite-transport",
+    "crates/rustmite-crypto",
+    "crates/rustmite-store",
+    "crates/rustmite-notify",
+    "crates/rustmite-node",
+    "crates/rustmite-server",
+    "crates/rustmite-cli",
+    "crates/rustmite-rpl",
+    "crates/rustmite-sift",
+    "crates/rustmite-anomark",
+    "xtask",
+]
+default-members = [
+    "crates/rustmite-proto",
+    "crates/rustmite-analyze",
+    "crates/rustmite-collect",
+    "crates/rustmite-expr",
+    "crates/rustmite-checks",
+    "crates/rustmite-crypto",
+    "crates/rustmite-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.89"
+authors = ["RustMite Contributors"]
+repository = "https://github.com/rustmite/rustmite"
+
+[workspace.dependencies]
+rustmite-sys = { path = "crates/rustmite-sys" }
+rustmite-proto = { path = "crates/rustmite-proto" }
+rustmite-analyze = { path = "crates/rustmite-analyze" }
+rustmite-collect = { path = "crates/rustmite-collect" }
+rustmite-expr = { path = "crates/rustmite-expr" }
+rustmite-checks = { path = "crates/rustmite-checks" }
+rustmite-transport = { path = "crates/rustmite-transport" }
+rustmite-crypto = { path = "crates/rustmite-crypto" }
+rustmite-store = { path = "crates/rustmite-store" }
+rustmite-notify = { path = "crates/rustmite-notify" }
+rustmite-sift = { path = "crates/rustmite-sift" }
+rustmite-anomark = { path = "crates/rustmite-anomark" }
+
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", default-features = false, features = ["serde", "v4", "v7"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+md-5 = { version = "0.10", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+goblin = { version = "0.9", default-features = false, features = ["elf32", "elf64", "endian_fd", "alloc"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "mm", "thread", "event"] }
+linux-raw-sys = { version = "0.9", default-features = false }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.10"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+hkdf = "0.12"
+sha1 = { version = "0.10", default-features = false }
+aho-corasick = "1"
+regex = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "json", "migrate"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+dashmap = "6"
+governor = "0.8"
+argon2 = "0.5"
+password-hash = "0.5"
+metrics = "0.24"
+rayon = "1"
+smallvec = { version = "1", features = ["serde"] }
+hashbrown = { version = "0.15", default-features = false, features = ["ahash", "inline-more"] }
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+# keys API is integrated into modern russh; keep optional legacy name unused
+futures = "0.3"
+bytes = "1"
+http = "1"
+jsonschema = "0.28"
+notify = "7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.probe]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true

@@ -1,0 +1,21 @@
+id = "RM-POL-0032"
+version = 1
+name = "World-writable file in PATH"
+type = "policy"
+severity = "medium"
+confidence = "medium"
+enabled = false
+cost = "low"
+match = "file_meta"
+where = '''
+  file_meta.world_writable == true
+  and (
+    file_meta.path.path_under("/usr/bin")
+    or file_meta.path.path_under("/usr/local/bin")
+    or file_meta.path.path_under("/bin")
+  )
+'''
+title = "World-writable binary in PATH: {{file_meta.path}}"
+evidence_fields = ["path", "mode", "world_writable", "uid", "gid"]
+attack = []
+rationale = "World-writable executables on PATH allow local privilege escalation; noisy on some images — disabled by default."

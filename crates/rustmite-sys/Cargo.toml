@@ -1,0 +1,21 @@
+[package]
+name = "rustmite-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Raw Linux syscall + /proc primitives with FixtureProc for tests"
+
+[features]
+default = ["std"]
+std = []
+live = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

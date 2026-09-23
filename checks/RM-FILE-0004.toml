@@ -1,0 +1,17 @@
+id = "RM-FILE-0004"
+version = 1
+name = "System binary hash mismatch vs package DB"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "medium"
+match = "integrity_mismatch"
+where = '''
+  integrity_mismatch.expected_hash != integrity_mismatch.actual_hash
+'''
+title = "Integrity mismatch for {{integrity_mismatch.path}}"
+evidence_fields = ["path", "expected_hash", "actual_hash", "package"]
+attack = ["T1554"]
+rationale = "Package-managed binaries should match the distribution hash; divergence suggests trojaning."
+collectors = ["file.integrity"]

@@ -1,0 +1,21 @@
+id = "RM-PROC-0013"
+version = 1
+name = "Process cwd in suspicious directory"
+type = "process"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.cwd != null
+  and (
+    process.cwd.path_under("/tmp")
+    or process.cwd.path_under("/dev/shm")
+    or process.cwd.path_under("/var/tmp")
+  )
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) cwd {{process.cwd}}"
+evidence_fields = ["pid", "comm", "cwd", "exe", "root"]
+attack = ["T1059"]
+rationale = "Processes with working directories under staging paths are often dropper shells or malware."

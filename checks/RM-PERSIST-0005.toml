@@ -1,0 +1,20 @@
+id = "RM-PERSIST-0005"
+version = 1
+name = "systemd ExecStart in staging path"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "service"
+where = '''
+  service.exec_start != null
+  and (
+    service.exec_start contains "/tmp/"
+    or service.exec_start contains "/dev/shm/"
+  )
+'''
+title = "systemd unit {{service.name}} ExecStart uses staging path"
+evidence_fields = ["name", "path", "exec_start", "unit_type"]
+attack = ["T1543.002"]
+rationale = "Services executing binaries from /tmp or /dev/shm are rarely legitimate."

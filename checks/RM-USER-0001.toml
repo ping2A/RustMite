@@ -1,0 +1,17 @@
+id = "RM-USER-0001"
+version = 1
+name = "UID 0 account other than root"
+type = "user"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "account"
+where = '''
+  account.uid == 0
+  and account.username != "root"
+'''
+title = "UID 0 account '{{account.username}}' other than root"
+evidence_fields = ["username", "uid", "gid", "home", "shell"]
+attack = ["T1136"]
+rationale = "Additional uid-0 accounts are a common backdoor."

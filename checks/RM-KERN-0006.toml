@@ -1,0 +1,16 @@
+id = "RM-KERN-0006"
+version = 1
+name = "Orphan eBPF program of hooking type"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "bpf_prog"
+where = '''
+  bpf_prog.orphan == true
+'''
+title = "Orphan eBPF program id {{bpf_prog.id}} ({{bpf_prog.prog_type}})"
+evidence_fields = ["id", "prog_type", "name", "tag", "orphan"]
+attack = ["T1014"]
+rationale = "Kernel-listed eBPF programs without an owning userspace process may hide traffic or processes."

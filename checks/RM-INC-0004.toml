@@ -1,0 +1,17 @@
+id = "RM-INC-0004"
+version = 1
+name = "Stolen SSH key placement across hosts"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = false
+cost = "low"
+match = "authorized_key"
+where = '''
+  false
+'''
+title = "SSH key reused across hosts (server bipartite graph)"
+evidence_fields = ["username", "path", "fingerprint", "key_type"]
+attack = ["T1021.004", "T1078"]
+rationale = "Expression check is disabled; rustmite_checks::correlate_ssh_key_graph emits RM-INC-0004 when a fingerprint appears on multiple hosts."
+collectors = ["ssh.keys"]

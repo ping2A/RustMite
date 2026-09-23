@@ -1,0 +1,22 @@
+id = "RM-CRED-0005"
+version = 2
+name = "Weak or deprecated SSH key type"
+type = "user"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "authorized_key"
+where = '''
+  authorized_key.key_type == "ssh-dss"
+  or (
+    authorized_key.key_type == "ssh-rsa"
+    and authorized_key.bits != null
+    and authorized_key.bits < 2048
+  )
+'''
+title = "Weak SSH key {{authorized_key.key_type}} ({{authorized_key.bits}} bits) for {{authorized_key.username}}"
+evidence_fields = ["username", "key_type", "bits", "fingerprint", "path"]
+attack = ["T1110"]
+rationale = "DSA is obsolete. RSA keys under 2048 bits are weak offline. Modern RSA (2048+) still uses the ssh-rsa key type name in authorized_keys — that alone is not deprecated."
+collectors = ["ssh.keys"]

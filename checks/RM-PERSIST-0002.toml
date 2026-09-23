@@ -1,0 +1,17 @@
+id = "RM-PERSIST-0002"
+version = 1
+name = "Injected directory in ld.so configuration"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "preload"
+where = '''
+  preload.present == true
+  and preload.path contains "ld.so.conf"
+'''
+title = "Suspicious ld.so config at {{preload.path}}"
+evidence_fields = ["path", "present", "entries"]
+attack = ["T1574"]
+rationale = "Extra library search paths in ld.so.conf.d enable hijacked shared objects."

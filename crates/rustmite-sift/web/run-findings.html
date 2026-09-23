@@ -1,0 +1,1214 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IronSift — Run results</title>
+  <link rel="icon" href="/logo.png" type="image/png" sizes="any" />
+  <script>
+    /* Match workbench `initUiPreferences`: theme is localStorage.ironsift_theme or default "dark" (not prefers-color-scheme). */
+    (function applyThemeFromStorage() {
+      try {
+        var s = localStorage.getItem("ironsift_theme");
+        var t = String(s || "").trim().toLowerCase() === "light" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+  </script>
+  <style>
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg-page: #0f172a;
+      --bg-card: #111827;
+      --bg-elevated: #0b1220;
+      --bg-input: #0b1220;
+      --border: #334155;
+      --border-strong: #475569;
+      --text: #e2e8f0;
+      --text-muted: #94a3b8;
+      --link: #7dd3fc;
+      --accent: #1d4ed8;
+      --pill-bg: #1e293b;
+      --pre-bg: #020617;
+      --table-row-b: #1e293b;
+      --tab-inactive-text: #cbd5e1;
+      --kpi-label: #94a3b8;
+      --honey-bg: #020617;
+      --honey-stroke: #0f172a;
+      --danger-b: #7f1d1d;
+      --danger-t: #fecaca;
+      --inspect-btn-b: #3b82f6;
+      --summary: #e2e8f0;
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg-page: #f1f5f9;
+      --bg-card: #ffffff;
+      --bg-elevated: #f8fafc;
+      --bg-input: #ffffff;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --link: #0369a1;
+      --accent: #2563eb;
+      --pill-bg: #e2e8f0;
+      --pre-bg: #f8fafc;
+      --table-row-b: #f1f5f9;
+      --tab-inactive-text: #475569;
+      --kpi-label: #64748b;
+      --honey-bg: #f1f5f9;
+      --honey-stroke: #e2e8f0;
+      --danger-b: #dc2626;
+      --danger-t: #991b1b;
+      --inspect-btn-b: #2563eb;
+      --summary: #0f172a;
+    }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px 24px 40px; background: var(--bg-page); color: var(--text); }
+    a { color: var(--link); }
+    .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .topbar h1 { font-size: 1.15rem; margin: 0; font-weight: 600; }
+    .run-id { font-family: ui-monospace, monospace; font-size: 0.85rem; color: var(--text-muted); word-break: break-all; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button, .btn {
+      font: inherit; cursor: pointer; border-radius: 8px; padding: 8px 14px; border: 1px solid var(--border);
+      background: var(--bg-card); color: var(--text);
+    }
+    button:hover, .btn:hover { filter: brightness(1.08); }
+    .btn-primary { background: #1d4ed8; border-color: #2563eb; color: #eff6ff; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 16px 0; }
+    .kpi { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; text-align: center; }
+    .kpi .label { font-size: 11px; color: var(--kpi-label); text-transform: uppercase; letter-spacing: 0.04em; }
+    .kpi .value { font-size: 1.25rem; font-weight: 700; margin-top: 4px; }
+    .findings-run-stats {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: color-mix(in srgb, var(--bg-elevated) 92%, var(--bg-card));
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .findings-run-stats h4 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--text); }
+    .findings-run-stats dl {
+      display: grid;
+      grid-template-columns: minmax(10rem, 34%) 1fr;
+      gap: 4px 12px;
+      margin: 0;
+      align-items: start;
+    }
+    .findings-run-stats dt { color: var(--text-muted); font-weight: 500; }
+    .findings-run-stats dd { margin: 0; word-break: break-word; }
+    .findings-run-stats code { font-size: 11px; }
+    .honey-ui { margin-top: 12px; }
+    .honey-toolbar { margin-bottom: 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .honey-toolbar .muted { font-size: 12px; max-width: 60%; color: var(--text-muted); }
+    .honey-clip {
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--bg-elevated);
+    }
+    .honey-ui .honey-svg { display: block; width: 100%; min-height: 200px; max-height: 320px; cursor: crosshair; }
+    .honey-hex { cursor: help; }
+    .honey-hex--infected { cursor: pointer; }
+    .honey-hex--infected:hover { filter: brightness(1.12); }
+    .honey-hex--dim { opacity: 0.4; }
+    .honey-hover-hint { min-height: 1.3em; font-size: 12px; color: var(--tab-inactive-text); margin-top: 6px; padding: 0 2px; font-family: ui-monospace, Menlo, monospace; }
+    .honey-panel { margin-top: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); }
+    .honey-panel h4 { margin: 0 0 8px; font-size: 15px; }
+    .honey-panel .pill { font-size: 11px; }
+    .honey-panel ul { margin: 0; padding-left: 18px; }
+    .honey-panel .det-list { color: var(--tab-inactive-text); font-size: 13px; line-height: 1.45; }
+    .legend { margin-top: 8px; font-size: 12px; color: var(--text-muted); display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+    .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+    .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-top: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; border-bottom: 1px solid var(--table-row-b); padding: 8px 6px; vertical-align: top; }
+    th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-muted); }
+    .muted { color: var(--text-muted); font-size: 12px; }
+    .pill { display: inline-block; font-size: 11px; padding: 2px 8px; margin: 2px 4px 2px 0; border-radius: 999px; background: var(--pill-bg); border: 1px solid var(--border); }
+    .sev-badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .sev-low { background: #14532d; color: #dcfce7; }
+    .sev-medium { background: #78350f; color: #fef3c7; }
+    .sev-high { background: #7f1d1d; color: #fee2e2; }
+    .sev-critical { background: #450a0a; color: #fecaca; border: 1px solid #991b1b; }
+    html[data-theme="light"] .sev-low { background: #dcfce7; color: #14532d; }
+    html[data-theme="light"] .sev-medium { background: #fef3c7; color: #78350f; }
+    html[data-theme="light"] .sev-high { background: #fee2e2; color: #7f1d1d; }
+    html[data-theme="light"] .sev-critical { background: #fecaca; color: #450a0a; border-color: #991b1b; }
+    .score-wrap { width: 120px; height: 8px; background: var(--bg-page); border: 1px solid var(--border); border-radius: 99px; overflow: hidden; }
+    .score-bar { height: 100%; }
+    .err { background: #450a0a; color: #fecaca; padding: 12px 14px; border-radius: 10px; margin: 12px 0; border: 1px solid #7f1d1d; }
+    html[data-theme="light"] .err { background: #fee2e2; color: #7f1d1d; border-color: #fecaca; }
+    pre.raw { background: var(--pre-bg); padding: 12px; border-radius: 8px; overflow: auto; max-height: 50vh; font-size: 11px; border: 1px solid var(--border); }
+    #copyStatus { font-size: 12px; color: var(--text-muted); min-height: 1.2em; }
+    code { font-size: 12px; }
+    .findings-dataset-tags { margin-top: 6px; line-height: 1.45; }
+    .findings-td-reasons { min-width: 280px; width: 42%; vertical-align: top; }
+    /* Findings reasons — card + grouped panels (aligned with workbench run cards) */
+    details.findings-reasons-box {
+      max-width: min(100%, 620px);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: linear-gradient(165deg, color-mix(in srgb, var(--bg-card) 88%, var(--bg-elevated)) 0%, var(--bg-elevated) 100%);
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.14);
+      overflow: hidden;
+    }
+    html[data-theme="light"] details.findings-reasons-box { box-shadow: 0 2px 10px rgba(15, 23, 42, 0.07); }
+    .findings-reasons-sum {
+      list-style: none;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--link);
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 13px;
+      background: color-mix(in srgb, var(--bg-input) 48%, transparent);
+      border-bottom: 1px solid transparent;
+    }
+    details.findings-reasons-box[open] .findings-reasons-sum { border-bottom-color: var(--border); }
+    .findings-reasons-sum::-webkit-details-marker { display: none; }
+    .findings-reasons-sum::marker { content: ""; }
+    .findings-reasons-sum::before {
+      content: "▶";
+      font-size: 9px;
+      width: 1.35rem;
+      height: 1.35rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      flex-shrink: 0;
+      transition: transform 0.15s ease;
+    }
+    details.findings-reasons-box[open] .findings-reasons-sum::before { transform: rotate(90deg); }
+    .findings-reasons-groups {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      max-height: min(70vh, 520px);
+      overflow: auto;
+      padding: 12px 12px 14px;
+      background: var(--bg-card);
+    }
+    .findings-reasons-group {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 11px;
+      background: color-mix(in srgb, var(--bg-elevated) 88%, var(--bg-card));
+      box-shadow: 0 1px 6px rgba(0, 0, 0, 0.08);
+    }
+    html[data-theme="light"] .findings-reasons-group { box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05); }
+    .findings-reasons-group-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      padding-bottom: 6px;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+    }
+    .findings-reasons-group-pill {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 9999px;
+      background: var(--pill-bg);
+      border: 1px solid var(--border);
+      font-family: ui-monospace, Menlo, monospace;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .findings-reasons-group-pill--ironsift-process { background: rgba(99, 179, 237, 0.22); border-color: rgba(99, 179, 237, 0.45); }
+    .findings-reasons-group-pill--anomark-rs { background: rgba(245, 159, 86, 0.24); border-color: rgba(245, 159, 86, 0.48); }
+    .findings-reasons-group-pill--sigma-zero { background: rgba(167, 139, 250, 0.26); border-color: rgba(167, 139, 250, 0.5); }
+    .findings-reasons-group-pill--ironsift-file { background: rgba(120, 200, 130, 0.22); border-color: rgba(120, 200, 130, 0.45); }
+    .findings-reasons-group-count { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .findings-reasons-group-list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.55; color: var(--text); }
+    .findings-reasons-group-list > li { margin: 4px 0; }
+    .findings-reasons-group-list--triage > li.findings-reason-triage-li {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 8px 12px;
+      justify-content: space-between;
+      list-style: disc;
+      padding: 8px 8px 8px 4px;
+      margin: 6px 0 6px -4px;
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--bg-page) 55%, transparent);
+      border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    }
+    .findings-reason-li-main { flex: 1; min-width: min(100%, 200px); }
+    .findings-reasons-group-list--triage > li.findings-reason-triage-li--no-decision {
+      display: list-item;
+      list-style: disc;
+      padding: 0;
+      margin: 4px 0;
+      background: transparent;
+      border: 0;
+    }
+    .findings-reasons-label { font-weight: 600; color: var(--text); margin-right: 4px; }
+    .findings-reasons-payload,
+    .findings-reasons-payload-kv {
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 11.5px;
+      word-break: break-all;
+      white-space: pre-wrap;
+    }
+    .findings-reasons-payload-kv .kv-key { color: var(--text-muted); }
+    .findings-reasons-payload-kv .kv-val { color: var(--text); }
+    .findings-reasons-truncated { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+    .findings-machine { font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-all; }
+    .findings-machine-cell {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 10px;
+      row-gap: 6px;
+    }
+    .findings-machine-pending {
+      flex-shrink: 0;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid color-mix(in srgb, #f59e0b 55%, var(--border));
+      background: color-mix(in srgb, #f59e0b 14%, var(--bg-card));
+      color: #fcd34d;
+    }
+    html[data-theme="light"] .findings-machine-pending {
+      color: #92400e;
+      border-color: color-mix(in srgb, #d97706 45%, var(--border));
+      background: color-mix(in srgb, #fbbf24 22%, var(--bg-card));
+    }
+    tr.findings-row--triage-pending td {
+      background: color-mix(in srgb, #f59e0b 7%, transparent);
+    }
+    html[data-theme="light"] tr.findings-row--triage-pending td {
+      background: color-mix(in srgb, #fbbf24 12%, transparent);
+    }
+    a.findings-machine-link { color: var(--link); text-decoration: none; }
+    a.findings-machine-link:hover { text-decoration: underline; }
+    a.findings-machine-link:focus-visible {
+      outline: 2px solid var(--inspect-btn-b);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+    .triage-reason-verdict {
+      font-size: 11px;
+      max-width: 12rem;
+      flex-shrink: 0;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-input);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .triage-reason-verdict[data-verdict="unset"] {
+      border-color: var(--border-strong);
+      background: var(--bg-input);
+      color: var(--text-muted);
+    }
+    .triage-reason-verdict[data-verdict="false_positive"] {
+      border-color: rgba(34, 197, 94, 0.5);
+      background: color-mix(in srgb, #22c55e 16%, var(--bg-input));
+      color: #bbf7d0;
+    }
+    html[data-theme="light"] .triage-reason-verdict[data-verdict="false_positive"] {
+      border-color: #86efac;
+      background: #ecfdf5;
+      color: #166534;
+    }
+    .triage-reason-verdict[data-verdict="malicious"] {
+      border-color: rgba(248, 113, 113, 0.55);
+      background: color-mix(in srgb, #ef4444 22%, var(--bg-card));
+      color: #fecaca;
+    }
+    html[data-theme="light"] .triage-reason-verdict[data-verdict="malicious"] {
+      border-color: #fecaca;
+      background: #fef2f2;
+      color: #991b1b;
+    }
+    .findings-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0 8px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <h1>Detection run results</h1>
+      <div class="run-id" id="runIdLabel">…</div>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn-primary" id="btnCopy">Copy page link</button>
+      <a class="btn" id="linkFleetMemory" href="/" style="display:none;">Fleet triage memory</a>
+      <a class="btn" id="linkWorkbench" href="/">Open full workbench</a>
+    </div>
+  </div>
+  <p class="muted" style="margin:0 0 12px;font-size:12px;">Uses the same theme rules as the workbench (<code>localStorage.ironsift_theme</code>, default dark); updates when you change theme in another tab or return to this tab.</p>
+  <div id="copyStatus" role="status" aria-live="polite"></div>
+  <div id="bannerErr" class="err" style="display:none;"></div>
+  <div id="loading" class="muted">Loading…</div>
+  <div id="mainContent" style="display:none;">
+    <div class="kpis">
+      <div class="kpi"><div class="label">Critical</div><div class="value" id="kCr">0</div></div>
+      <div class="kpi"><div class="label">High</div><div class="value" id="kHi">0</div></div>
+      <div class="kpi"><div class="label">Medium</div><div class="value" id="kMd">0</div></div>
+      <div class="kpi"><div class="label">Low</div><div class="value" id="kLo">0</div></div>
+    </div>
+    <div id="runStats" class="findings-run-stats" style="display:none;"></div>
+    <div id="honeyErrBanner" class="err" style="display:none;margin-bottom:0;"></div>
+    <div class="honey-ui card" style="padding:12px;">
+      <div class="honey-toolbar row">
+        <button type="button" class="honey-zin" data-honey="runHoneycomb" title="Zoom in">+</button>
+        <button type="button" class="honey-zout" data-honey="runHoneycomb" title="Zoom out">−</button>
+        <button type="button" class="honey-zreset" data-honey="runHoneycomb" title="Reset view">Reset</button>
+        <span class="muted">Drag to pan · wheel to zoom. Hover a hex for the host; click for details.</span>
+      </div>
+      <div class="honey-clip">
+        <svg id="runHoneycomb" class="honey-svg" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <div id="runHoneyHoverHint" class="honey-hover-hint" aria-live="polite"></div>
+      <div id="runHoneyPanel" class="honey-panel" style="display:none" hidden></div>
+      <div class="legend">
+        <span><i style="background:#166534"></i>Clean</span>
+        <span><i style="background:#16a34a"></i>Low</span>
+        <span><i style="background:#f59e0b"></i>Medium</span>
+        <span><i style="background:#dc2626"></i>High</span>
+        <span><i style="background:#b91c1c"></i>Critical</span>
+      </div>
+    </div>
+    <div class="findings-toolbar card" id="triageToolbar" style="padding:12px;margin-top:12px;display:none;">
+      <button type="button" class="btn-primary" id="btnSaveTriage">Save triage</button>
+      <span id="triageSaveStatus" class="muted" role="status" aria-live="polite" style="font-size:13px;"></span>
+      <span id="triageAutoHint" class="muted" style="font-size:12px;margin-left:auto;"></span>
+    </div>
+    <div class="card" id="findingsTableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Machine</th>
+            <th>Severity</th>
+            <th>Score</th>
+            <th>Risk</th>
+            <th>Detectors</th>
+            <th>Reasons</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <details class="card" style="margin-top:12px;">
+      <summary class="muted" style="cursor:pointer;">Raw JSON (advanced)</summary>
+      <pre class="raw" id="rawPre"></pre>
+    </details>
+  </div>
+
+  <script src="/run-findings-ui.js"></script>
+  <script>
+    function reapplyThemeFromWorkbenchStorage() {
+      try {
+        var s = localStorage.getItem("ironsift_theme");
+        var t = String(s || "").trim().toLowerCase() === "light" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (_) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    }
+    window.addEventListener("storage", function (e) {
+      if (e.key === "ironsift_theme") reapplyThemeFromWorkbenchStorage();
+    });
+    window.addEventListener("focus", reapplyThemeFromWorkbenchStorage);
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) reapplyThemeFromWorkbenchStorage();
+    });
+
+    var gRunDetectionsState = { findings: [], user_triage: { machines: [] }, dataset_ids: [] };
+    /** Honeycomb cells from API; values patched live from triage (see `refreshEffectiveRiskUi`). */
+    var gRunHoneyCells = [];
+
+    function parseRunId() {
+      var parts = location.pathname.split("/").filter(Boolean);
+      if (parts[0] === "run" && parts[1]) return decodeURIComponent(parts[1]);
+      var q = new URLSearchParams(location.search).get("id");
+      return q && String(q).trim() ? String(q).trim() : "";
+    }
+
+    function escHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function severityClass(sev) {
+      var s = String(sev || "").toUpperCase();
+      if (s === "CLEAN" || s === "NONE") return "sev-low";
+      if (s === "CRITICAL") return "sev-critical";
+      if (s === "HIGH") return "sev-high";
+      if (s === "MEDIUM") return "sev-medium";
+      return "sev-low";
+    }
+
+    function severityColor(v) {
+      var n = Number(v);
+      if (n >= 0.9) return "#b91c1c";
+      if (n >= 0.7) return "#dc2626";
+      if (n >= 0.4) return "#f59e0b";
+      return "#16a34a";
+    }
+
+    function cellFill(c) {
+      if (c && c.infected === false) return "#166534";
+      return severityColor(Number(c && c.value != null ? c.value : 0));
+    }
+
+    var HONEY_HINTS = { runHoneycomb: "runHoneyHoverHint" };
+    function honeyGetHintEl(svg) {
+      var i = HONEY_HINTS[svg && svg.id];
+      return i ? document.getElementById(i) : null;
+    }
+
+    function honeyDatasetTagsPlain(tags) {
+      if (!tags || !tags.length) return "";
+      var short = tags.length > 4 ? tags.slice(0, 4).join(", ") + "…" : tags.map(String).join(", ");
+      return short;
+    }
+
+    function honeyDatasetTagsPanelHtml(tags) {
+      if (!tags || !tags.length) return "";
+      var pills = tags.map(function (tag) {
+        return '<span class="pill">' + escHtml(String(tag)) + "</span>";
+      }).join(" ");
+      return '<p class="muted" style="margin:8px 0 0;font-size:12px;"><span style="margin-right:6px;">Dataset tags:</span>' + pills + "</p>";
+    }
+
+    function honeyStatusLine(c) {
+      if (!c) return "";
+      var name = c.name != null && c.name !== "" ? String(c.name) : "(unknown host)";
+      var tagBit = honeyDatasetTagsPlain(c.dataset_tags);
+      if (c.infected === false) {
+        return name + " — clean (no finding)" + (tagBit ? " · " + tagBit : "");
+      }
+      var sev = (c.severity || "").toUpperCase();
+      var v = c.value != null ? Number(c.value) : 0;
+      var line = name + " — " + (sev || "UNKNOWN") + " (score " + v.toFixed(2) + "). Click for details.";
+      if (tagBit) line += " Tags: " + tagBit;
+      return line;
+    }
+
+    var honeyView = {};
+
+    function hexPoints(cx, cy, r) {
+      var pts = [];
+      for (var i = 0; i < 6; i++) {
+        var a = (Math.PI / 180) * (60 * i - 30);
+        pts.push((cx + r * Math.cos(a)).toFixed(2) + "," + (cy + r * Math.sin(a)).toFixed(2));
+      }
+      return pts.join(" ");
+    }
+
+    function applyHoneyTransform(svg) {
+      var st = honeyView[svg.id];
+      if (!st) return;
+      var g = svg.querySelector(".honey-pan");
+      if (!g) return;
+      var k = st.k,
+        panX = st.panX,
+        panY = st.panY,
+        cx = st.cx,
+        cy = st.cy;
+      g.setAttribute("transform", "translate(" + panX + " " + panY + ") translate(" + cx + " " + cy + ") scale(" + k + ") translate(" + -cx + " " + -cy + ")");
+    }
+
+    function openHoneyPanel(panelId, cell, idx, toggle) {
+      var panel = document.getElementById(panelId);
+      if (!panel) return;
+      if (!cell) {
+        panel.style.display = "none";
+        panel.setAttribute("hidden", "");
+        return;
+      }
+      if (toggle && panel.dataset.selectedIdx === String(idx) && panel.style.display !== "none") {
+        panel.style.display = "none";
+        panel.setAttribute("hidden", "");
+        delete panel.dataset.selectedIdx;
+        return;
+      }
+      panel.dataset.selectedIdx = String(idx);
+      panel.removeAttribute("hidden");
+      panel.style.display = "block";
+      if (cell.infected === false) {
+        var nm = cell.name != null && cell.name !== "" ? String(cell.name) : "(unknown host)";
+        panel.innerHTML =
+          "<h4><code>" +
+          escHtml(nm) +
+          '</code> <span class="pill" style="background:#14532d;color:#dcfce7">Clean</span></h4>' +
+          honeyDatasetTagsPanelHtml(cell.dataset_tags) +
+          '<p class="muted" style="margin:0;font-size:13px;">No finding for this host.</p>';
+        return;
+      }
+      var sev = (cell.severity || "").toUpperCase();
+      var reasons = (cell.reasons || [])
+        .map(function (r) {
+          return "<li>" + escHtml(r) + "</li>";
+        })
+        .join("");
+      var dets = (cell.detectors || [])
+        .map(function (d) {
+          return '<span class="pill">' + escHtml(d) + "</span>";
+        })
+        .join(" ");
+      panel.innerHTML =
+        "<h4><code>" +
+        escHtml(cell.name || "") +
+        '</code> <span class="sev-badge ' +
+        severityClass(sev) +
+        '">' +
+        escHtml(sev) +
+        "</span></h4>" +
+        honeyDatasetTagsPanelHtml(cell.dataset_tags) +
+        '<p class="muted" style="margin:0 0 6px">Score: <strong>' +
+        Number(cell.value).toFixed(3) +
+        "</strong></p>" +
+        '<p class="muted" style="margin:0 0 4px;font-size:12px;">Detectors: ' +
+        (dets || "—") +
+        "</p>" +
+        '<p class="muted" style="margin:0 0 4px;font-size:12px;">Reasons:</p>' +
+        '<ul class="det-list">' +
+        (reasons || '<li class="muted">(none)</li>') +
+        "</ul>";
+    }
+
+    function installHoneyView(svg, panelId, cells, hasFilter) {
+      var id = svg.id;
+      var hi = honeyGetHintEl(svg);
+      if (hi) hi.textContent = "";
+      if (!honeyView[id]) {
+        var onMove = function (e) {
+          var s = honeyView[id];
+          if (!s || !s.drag) return;
+          var w = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.width : 1;
+          var h = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.height : 1;
+          var cw = svg.clientWidth || 1;
+          var ch = svg.clientHeight || 1;
+          s.panX += ((e.clientX - s.lastX) * w) / cw;
+          s.panY += ((e.clientY - s.lastY) * h) / ch;
+          s.lastX = e.clientX;
+          s.lastY = e.clientY;
+          s.moved = true;
+          applyHoneyTransform(svg);
+        };
+        var onUp = function () {
+          var s = honeyView[id];
+          if (s) {
+            if (s.moved) s.suppressClickOnce = true;
+            s.drag = false;
+            s.moved = false;
+          }
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+        };
+        svg.addEventListener("pointerdown", function (e) {
+          if (e.button !== 0) return;
+          if (e.target && e.target.closest && e.target.closest("polygon[data-idx]")) return;
+          var s = honeyView[id];
+          if (!s) return;
+          s.drag = true;
+          s.moved = false;
+          s.lastX = e.clientX;
+          s.lastY = e.clientY;
+          try {
+            svg.setPointerCapture(e.pointerId);
+          } catch (_) {}
+          window.addEventListener("pointermove", onMove);
+          window.addEventListener("pointerup", onUp);
+        });
+        var hintMove = function (e) {
+          var s = honeyView[id];
+          var h = honeyGetHintEl(svg);
+          if (!h) return;
+          if (s && s.drag) {
+            h.textContent = "";
+            return;
+          }
+          if (!s || !s.cells) {
+            h.textContent = "";
+            return;
+          }
+          var el = document.elementFromPoint(e.clientX, e.clientY);
+          if (!el || !svg.contains(el)) {
+            h.textContent = "";
+            return;
+          }
+          var poly = el.closest && el.closest("polygon[data-idx]");
+          if (!poly) {
+            h.textContent = "";
+            return;
+          }
+          var j = parseInt(poly.getAttribute("data-idx"), 10);
+          var c = s.cells[j];
+          h.textContent = c ? honeyStatusLine(c) : "";
+        };
+        var hintLeave = function () {
+          var h = honeyGetHintEl(svg);
+          if (h) h.textContent = "";
+        };
+        svg.addEventListener("pointermove", hintMove, { passive: true });
+        svg.addEventListener("pointerleave", hintLeave);
+        svg.addEventListener("click", function (e) {
+          var s = honeyView[id];
+          if (s && s.suppressClickOnce) {
+            s.suppressClickOnce = false;
+            return;
+          }
+          var poly = e.target && e.target.closest && e.target.closest("polygon[data-idx]");
+          if (!poly) return;
+          if (!s) return;
+          var ii = parseInt(poly.getAttribute("data-idx"), 10);
+          var c = s.cells && s.cells[ii];
+          if (!c) return;
+          openHoneyPanel(s.panelId, c, ii, true);
+        });
+        svg.addEventListener(
+          "wheel",
+          function (e) {
+            var s = honeyView[id];
+            if (!s) return;
+            e.preventDefault();
+            var f = e.deltaY > 0 ? 0.9 : 1.11;
+            s.k = Math.min(4, Math.max(0.2, s.k * f));
+            applyHoneyTransform(svg);
+          },
+          { passive: false }
+        );
+      }
+      var layout = (function buildLayout(cells) {
+        if (!cells.length) {
+          return {
+            vbW: 240,
+            vbH: 200,
+            inner:
+              "<text x='120' y='100' text-anchor='middle' fill='#94a3b8' font-size='13'>No machine data for this run</text>",
+            cx: 120,
+            cy: 100,
+          };
+        }
+        var n = cells.length;
+        var r = Math.max(8, Math.min(26, 300 / Math.sqrt(n + 2)));
+        var dx = Math.sqrt(3) * r;
+        var dy = 1.5 * r;
+        var cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.15)));
+        var rows = Math.ceil(n / cols);
+        var pad = 28;
+        var vbW = Math.max(240, pad * 2 + (cols - 0.5) * dx + r * 2);
+        var vbH = Math.max(200, pad * 2 + rows * dy + r * 1.2);
+        var cx = vbW / 2;
+        var cy = (pad * 2 + rows * dy) / 2;
+        var dim = function (c) {
+          return c && c.infected && hasFilter && c.matches_filter === false;
+        };
+        var hintEsc = function (t) {
+          return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        };
+        var g = "";
+        cells.forEach(function (c, i) {
+          var col = i % cols;
+          var row = Math.floor(i / cols);
+          var x = pad + col * dx + (row % 2 ? dx / 2 : 0);
+          var y = pad + row * dy;
+          var color = cellFill(c);
+          var cl = "honey-hex " + (c && c.infected ? "honey-hex--infected " : "") + (dim(c) ? "honey-hex--dim" : "");
+          var tip = hintEsc(honeyStatusLine(c));
+          g +=
+            "<g><polygon class=\"" +
+            cl +
+            '" data-idx="' +
+            i +
+            '" points="' +
+            hexPoints(x, y, r) +
+            '" fill="' +
+            color +
+            '" stroke="var(--honey-stroke)" stroke-width="' +
+            Math.max(1, r * 0.04) +
+            '"><title>' +
+            tip +
+            "</title></polygon></g>";
+        });
+        return { vbW: vbW, vbH: vbH, inner: g, cx: cx, cy: cy };
+      })(cells);
+      honeyView[id] = {
+        k: 1,
+        panX: 0,
+        panY: 0,
+        cx: layout.cx,
+        cy: layout.cy,
+        cells: cells,
+        hasFilter: !!hasFilter,
+        panelId: panelId,
+        drag: false,
+        moved: false,
+      };
+      svg.setAttribute("viewBox", "0 0 " + layout.vbW + " " + layout.vbH);
+      svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      svg.innerHTML =
+        '<rect class="honey-bg" x="0" y="0" width="' +
+        layout.vbW +
+        '" height="' +
+        layout.vbH +
+        '" fill="var(--honey-bg)" /><g class="honey-pan">' +
+        layout.inner +
+        "</g>";
+      applyHoneyTransform(svg);
+    }
+
+    document.addEventListener("click", function (e) {
+      var b = e.target;
+      if (!b || !b.classList) return;
+      if (!b.classList.contains("honey-zin") && !b.classList.contains("honey-zout") && !b.classList.contains("honey-zreset")) return;
+      var chartId = b.getAttribute("data-honey");
+      if (!chartId) return;
+      var svg = document.getElementById(chartId);
+      var st = honeyView[chartId];
+      if (!svg || !st) return;
+      if (b.classList.contains("honey-zin")) st.k = Math.min(4, st.k * 1.25);
+      if (b.classList.contains("honey-zout")) st.k = Math.max(0.2, st.k * 0.8);
+      if (b.classList.contains("honey-zreset")) {
+        st.k = 1;
+        st.panX = 0;
+        st.panY = 0;
+      }
+      applyHoneyTransform(svg);
+    });
+
+    async function apiGet(path) {
+      var r = await fetch(path, { headers: { Accept: "application/json" } });
+      var raw = await r.text();
+      var data = {};
+      try {
+        data = JSON.parse(String(raw || "").replace(/^\uFEFF/, "").trim() || "{}");
+      } catch (_) {
+        return { _ok: false, _httpStatus: r.status, error: "Invalid JSON", _rawPreview: raw.slice(0, 200) };
+      }
+      if (!r.ok) return Object.assign({}, data, { _ok: false, _httpStatus: r.status });
+      return Object.assign({}, data, { _ok: true, _httpStatus: r.status });
+    }
+
+    function labelDetectorModeShort(dm) {
+      var x = String(dm || "both")
+        .toLowerCase()
+        .replace(/-/g, "_");
+      if (x === "ironsift_only") return "IronSift only";
+      if (x === "anomark_only") return "AnoMark only";
+      return "IronSift + AnoMark";
+    }
+
+    function anomarkEffectiveForRunStats(req) {
+      if (!req || typeof req !== "object") return false;
+      var dm = String(req.detector_mode || "both")
+        .toLowerCase()
+        .replace(/-/g, "_");
+      if (dm === "ironsift_only") return false;
+      if (dm === "anomark_only") return true;
+      return !!req.enable_anomark;
+    }
+
+    function renderRunStats(data, findings) {
+      var el = document.getElementById("runStats");
+      if (!el) return;
+      var req = data && data.run_request && typeof data.run_request === "object" ? data.run_request : {};
+      var sig = data && data.sigma_stable_stats && typeof data.sigma_stable_stats === "object" ? data.sigma_stable_stats : null;
+      var list = Array.isArray(findings) ? findings : [];
+      var nFind = list.length;
+      var sigmaHosts = 0;
+      var sigmaPayloads = 0;
+      list.forEach(function (f) {
+        var dets = f.detectors || [];
+        if (Array.isArray(dets) && dets.some(function (d) { return String(d) === "sigma-zero"; })) sigmaHosts += 1;
+        var sm = f.sigma_matches;
+        if (Array.isArray(sm)) sigmaPayloads += sm.length;
+      });
+      var rows = [];
+      rows.push("<h4>Run summary</h4><dl>");
+      var runDate =
+        data && data.created_at != null && String(data.created_at).trim() !== ""
+          ? String(data.created_at).trim()
+          : "—";
+      rows.push("<dt>Run date</dt><dd>" + escHtml(runDate) + "</dd>");
+      rows.push("<dt>Findings (hosts)</dt><dd>" + escHtml(String(nFind)) + "</dd>");
+      rows.push("<dt>Detector mode</dt><dd>" + escHtml(labelDetectorModeShort(req.detector_mode)) + "</dd>");
+      rows.push(
+        "<dt>AnoMark on this run</dt><dd>" + (anomarkEffectiveForRunStats(req) ? "Yes" : "No") + "</dd>"
+      );
+      var sigmaOn = !!req.enable_sigma_stable;
+      if (!sigmaOn) {
+        rows.push("<dt>Sigma (stable)</dt><dd>Off</dd>");
+      } else if (sig) {
+        rows.push(
+          "<dt>Sigma (stable)</dt><dd>Matches: <strong>" +
+            escHtml(String(sig.rules_match_count != null ? sig.rules_match_count : 0)) +
+            "</strong></dd>"
+        );
+        rows.push(
+          "<dt>Sigma hosts / payloads</dt><dd>" +
+            escHtml(String(sigmaHosts)) +
+            " · payloads: " +
+            escHtml(String(sigmaPayloads)) +
+            "</dd>"
+        );
+        rows.push("<dt>Sigma rules compiled</dt><dd>" + escHtml(String(sig.rules_compiled != null ? sig.rules_compiled : 0)) + "</dd>");
+        rows.push(
+          "<dt>Sigma log lines evaluated</dt><dd>" + escHtml(String(sig.log_entries_evaluated != null ? sig.log_entries_evaluated : 0)) + "</dd>"
+        );
+        if (sig.approx_scalar_checks != null) {
+          rows.push(
+            "<dt>Sigma approx. scalar checks</dt><dd>" + escHtml(String(sig.approx_scalar_checks)) + "</dd>"
+          );
+        }
+        rows.push("<dt>Sigma evaluate time</dt><dd>" + escHtml(String(sig.evaluate_ms != null ? sig.evaluate_ms : 0)) + " ms</dd>");
+        rows.push("<dt>Sigma status</dt><dd><code>" + escHtml(String(sig.status || "")) + "</code></dd>");
+        if (sig.rules_source) {
+          rows.push("<dt>Sigma rules source</dt><dd><code>" + escHtml(String(sig.rules_source)) + "</code></dd>");
+        }
+        if (sig.process_log_source) {
+          rows.push(
+            "<dt>Sigma process export</dt><dd><code>" + escHtml(String(sig.process_log_source)) + "</code></dd>"
+          );
+        }
+        if (sig.file_log_source) {
+          rows.push("<dt>Sigma file export</dt><dd><code>" + escHtml(String(sig.file_log_source)) + "</code></dd>");
+        }
+      } else {
+        rows.push("<dt>Sigma (stable)</dt><dd><span class=\"muted\">On (no stats object on this run)</span></dd>");
+        rows.push(
+          "<dt>Sigma hosts / payloads</dt><dd>" +
+            escHtml(String(sigmaHosts)) +
+            " · payloads: " +
+            escHtml(String(sigmaPayloads)) +
+            "</dd>"
+        );
+      }
+      rows.push("</dl>");
+      el.innerHTML = rows.join("");
+      el.style.display = "block";
+    }
+
+    var __runTriageSaveBusy = false;
+    var __runTriageSaveQueued = false;
+    var __runTriageAutoTimer = null;
+
+    function scheduleRunTriageAutoSave(runId) {
+      if (__runTriageAutoTimer) clearTimeout(__runTriageAutoTimer);
+      __runTriageAutoTimer = setTimeout(function () {
+        __runTriageAutoTimer = null;
+        void saveRunTriage(runId, { auto: true });
+      }, 450);
+    }
+
+    async function saveRunTriage(runId, opts) {
+      var auto = opts && opts.auto === true;
+      var st = document.getElementById("triageSaveStatus");
+      var mount = document.getElementById("findingsTableWrap");
+      var R = window.RunFindingsUi;
+      if (!R || !mount) return;
+      if (__runTriageSaveBusy) {
+        if (auto) __runTriageSaveQueued = true;
+        return;
+      }
+      __runTriageSaveBusy = true;
+      try {
+        if (st) st.textContent = R.M.saving;
+        var body = R.collectTriagePayloadFromDom(mount, gRunDetectionsState.user_triage, gRunDetectionsState.findings);
+        var res = await fetch("/api/runs/" + encodeURIComponent(runId) + "/triage", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+        });
+        var raw = await res.text();
+        var data = {};
+        try {
+          data = JSON.parse(String(raw || "").replace(/^\uFEFF/, "").trim() || "{}");
+        } catch (_) {}
+        if (!res.ok) {
+          if (st) st.textContent = data.error || "HTTP " + res.status;
+          return;
+        }
+        if (st) st.textContent = R.M.saved;
+        gRunDetectionsState.user_triage = body.user_triage;
+        var clearMs = auto ? 1600 : 2500;
+        setTimeout(function () {
+          if (st) st.textContent = "";
+        }, clearMs);
+      } catch (e) {
+        if (st) st.textContent = e && e.message ? e.message : String(e);
+      } finally {
+        __runTriageSaveBusy = false;
+        if (__runTriageSaveQueued) {
+          __runTriageSaveQueued = false;
+          void saveRunTriage(runId, { auto: true });
+        }
+      }
+    }
+
+    function refreshEffectiveRiskUi() {
+      var R = window.RunFindingsUi;
+      var mount = document.getElementById("findingsTableWrap");
+      var findings = gRunDetectionsState.findings || [];
+      if (!R || !mount || !findings.length) return;
+      var body = R.collectTriagePayloadFromDom(mount, gRunDetectionsState.user_triage, findings);
+      var tri = body.user_triage;
+      gRunDetectionsState.user_triage = tri;
+      var tbody = document.getElementById("tbody");
+      if (!tbody) return;
+      var counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+      findings.forEach(function (f) {
+        var eff = R.effectiveScoreAndSeverity(f, tri);
+        var sev = String(eff.severity || "LOW").toUpperCase();
+        if (counts[sev] != null) counts[sev] += 1;
+        var tr = null;
+        tbody.querySelectorAll("tr[data-machine-id]").forEach(function (row) {
+          if (row.getAttribute("data-machine-id") === f.machine_id) tr = row;
+        });
+        if (!tr) return;
+        var tds = tr.querySelectorAll("td");
+        if (tds.length < 4) return;
+        var ds = gRunDetectionsState.dataset_ids || [];
+        var pending = R.machineHasPendingReasonTriage(f, tri);
+        if (pending) tr.classList.add("findings-row--triage-pending");
+        else tr.classList.remove("findings-row--triage-pending");
+        tds[0].innerHTML = R.findingsMachineCellHtml(f, ds, tri);
+        var sc = eff.score;
+        tds[1].innerHTML =
+          '<span class="sev-badge ' + R.severityClass(sev) + '">' + escHtml(sev) + "</span>";
+        tds[2].textContent = sc.toFixed(3);
+        tds[3].innerHTML =
+          '<div class="score-wrap"><div class="score-bar" style="width:' +
+          Math.max(0, Math.min(100, sc * 100)) +
+          "%;background:" +
+          R.severityColor(sc) +
+          ';"></div></div>';
+      });
+      var kCr = document.getElementById("kCr");
+      var kHi = document.getElementById("kHi");
+      var kMd = document.getElementById("kMd");
+      var kLo = document.getElementById("kLo");
+      if (kCr) kCr.textContent = String(counts.CRITICAL);
+      if (kHi) kHi.textContent = String(counts.HIGH);
+      if (kMd) kMd.textContent = String(counts.MEDIUM);
+      if (kLo) kLo.textContent = String(counts.LOW);
+      if (gRunHoneyCells && gRunHoneyCells.length) {
+        gRunHoneyCells.forEach(function (c) {
+          if (!c || !c.infected) return;
+          var f = null;
+          for (var i = 0; i < findings.length; i++) {
+            if (findings[i].machine_id === c.name) {
+              f = findings[i];
+              break;
+            }
+          }
+          if (!f) return;
+          var eff = R.effectiveScoreAndSeverity(f, tri);
+          c.value = eff.score;
+          c.severity = eff.severity;
+        });
+        var fhc = document.getElementById("runHoneycomb");
+        if (fhc) installHoneyView(fhc, "runHoneyPanel", gRunHoneyCells, false);
+      }
+    }
+
+    function renderFindingsTbodyAndKpi(R, runId, findings, runDatasetIds, userTriage) {
+      var tbody = document.getElementById("tbody");
+      var triageBar = document.getElementById("triageToolbar");
+      if (!tbody || !R) return;
+      if (!findings.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">No findings for this run.</td></tr>';
+        if (triageBar) triageBar.style.display = "none";
+        ["kCr", "kHi", "kMd", "kLo"].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.textContent = "0";
+        });
+        return;
+      }
+      if (triageBar) triageBar.style.display = "flex";
+      tbody.innerHTML = findings
+        .map(function (f) {
+          var sev = String(f.severity || "").toUpperCase();
+          var sc = Number(f.score || 0);
+          var pending = R.machineHasPendingReasonTriage(f, userTriage);
+          var rowClsAttr = pending ? ' class="findings-row--triage-pending"' : "";
+          return (
+            '<tr data-machine-id="' +
+            escHtml(f.machine_id || "") +
+            '"' +
+            rowClsAttr +
+            ">" +
+            "<td>" +
+            R.findingsMachineCellHtml(f, runDatasetIds, userTriage) +
+            "</td>" +
+            '<td><span class="sev-badge ' +
+            R.severityClass(sev) +
+            '">' +
+            R.esc(String(sev)) +
+            "</span></td>" +
+            "<td>" +
+            sc.toFixed(3) +
+            "</td>" +
+            '<td><div class="score-wrap"><div class="score-bar" style="width:' +
+            Math.max(0, Math.min(100, sc * 100)) +
+            "%;background:" +
+            R.severityColor(sc) +
+            ';"></div></div></td>' +
+            "<td>" +
+            R.findingsDetectorsCell(f) +
+            "</td>" +
+            '<td class="findings-td-reasons">' +
+            R.findingsReasonsCell(f, userTriage, runId) +
+            "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+      R.wireTriageReasonVerdictTheming(document.getElementById("findingsTableWrap"));
+      refreshEffectiveRiskUi();
+    }
+
+    async function main() {
+      var runId = parseRunId();
+      document.getElementById("runIdLabel").textContent = runId || "(missing run id)";
+      document.getElementById("linkWorkbench").href = "/?tab=runs";
+      var linkFm = document.getElementById("linkFleetMemory");
+      if (linkFm && runId) {
+        linkFm.href = "/?tab=fleet-memory";
+        linkFm.style.display = "";
+      }
+
+      document.getElementById("btnCopy").addEventListener("click", async function () {
+        var st = document.getElementById("copyStatus");
+        try {
+          await navigator.clipboard.writeText(window.location.href);
+          if (st) st.textContent = "Link copied to clipboard.";
+        } catch (e) {
+          if (st) st.textContent = "Copy the URL from the address bar to share.";
+        }
+        setTimeout(function () {
+          if (st) st.textContent = "";
+        }, 3500);
+      });
+
+      if (!runId) {
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("bannerErr").style.display = "block";
+        document.getElementById("bannerErr").textContent =
+          "Invalid URL. Use /run/<run-id> (from the workbench or after starting a run).";
+        return;
+      }
+
+      document.title = "Run " + runId + " · IronSift";
+
+      if (!window.RunFindingsUi) {
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("bannerErr").style.display = "block";
+        document.getElementById("bannerErr").textContent = "Could not load run UI script (/run-findings-ui.js).";
+        return;
+      }
+      var R = window.RunFindingsUi;
+
+      var dataP = apiGet("/api/runs/" + encodeURIComponent(runId) + "/detections");
+      var honP = apiGet("/api/fleet/honeycomb?" + new URLSearchParams({ run_id: runId }).toString());
+      var data = await dataP;
+      var hon = await honP;
+
+      document.getElementById("loading").style.display = "none";
+
+      if (!data._ok) {
+        document.getElementById("bannerErr").style.display = "block";
+        document.getElementById("bannerErr").textContent =
+          "Could not load findings: " + (data.error || "HTTP " + (data._httpStatus || ""));
+        return;
+      }
+
+      var findings = data.findings || [];
+      var runDatasetIds = data.dataset_ids || [];
+      var userTriage = data.user_triage && typeof data.user_triage === "object" ? data.user_triage : { machines: [] };
+      gRunDetectionsState.findings = findings;
+      gRunDetectionsState.user_triage = userTriage;
+      gRunDetectionsState.dataset_ids = runDatasetIds;
+      document.getElementById("mainContent").style.display = "block";
+
+      renderRunStats(data, findings);
+
+      var fhc = document.getElementById("runHoneycomb");
+      var cells = hon && hon._ok && Array.isArray(hon.cells) ? hon.cells : [];
+      gRunHoneyCells = cells.slice();
+      if (fhc) installHoneyView(fhc, "runHoneyPanel", gRunHoneyCells, false);
+      var honeyBanner = document.getElementById("honeyErrBanner");
+      if (honeyBanner) {
+        if (hon && hon._ok === false) {
+          honeyBanner.style.display = "block";
+          honeyBanner.textContent =
+            "Honeycomb data could not be loaded: " +
+            (hon.error || hon._jsonParseError || "HTTP " + (hon._httpStatus || "") + ". The table below still lists findings.");
+        } else {
+          honeyBanner.style.display = "none";
+          honeyBanner.textContent = "";
+        }
+      }
+      if (hon && (hon._jsonParseError || hon._ok === false)) {
+        var note =
+          "[Honeycomb: " +
+          (hon.error || hon._jsonParseError || "unavailable") +
+          (hon._rawPreview ? " — " + String(hon._rawPreview).slice(0, 160) : "") +
+          "]\n\n";
+        document.getElementById("rawPre").textContent = note + JSON.stringify(findings, null, 2);
+      } else {
+        document.getElementById("rawPre").textContent = JSON.stringify(findings, null, 2);
+      }
+
+      var triageBar = document.getElementById("triageToolbar");
+      var btnSv = document.getElementById("btnSaveTriage");
+      if (!findings.length) {
+        renderFindingsTbodyAndKpi(R, runId, findings, runDatasetIds, userTriage);
+        if (triageBar) triageBar.style.display = "none";
+        return;
+      }
+      if (triageBar) triageBar.style.display = "flex";
+      if (btnSv) {
+        btnSv.onclick = function () {
+          void saveRunTriage(runId);
+        };
+      }
+
+      var wrap = document.getElementById("findingsTableWrap");
+      if (wrap && !wrap.dataset.triageAutoBound) {
+        wrap.dataset.triageAutoBound = "1";
+        wrap.addEventListener("change", function (ev) {
+          var t = ev.target;
+          if (!t || !t.classList || !t.classList.contains("triage-reason-verdict")) return;
+          refreshEffectiveRiskUi();
+          scheduleRunTriageAutoSave(runId);
+        });
+      }
+      var triageHint = document.getElementById("triageAutoHint");
+      if (triageHint && R.M && R.M.autoSaveHint) triageHint.textContent = R.M.autoSaveHint;
+
+      renderFindingsTbodyAndKpi(R, runId, findings, runDatasetIds, userTriage);
+    }
+
+    main();
+  </script>
+</body>
+</html>

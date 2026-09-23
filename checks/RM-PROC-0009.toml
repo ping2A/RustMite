@@ -1,0 +1,17 @@
+id = "RM-PROC-0009"
+version = 1
+name = "Live process with LD_PRELOAD or LD_AUDIT"
+type = "process"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.environ_flags contains "LD_PRELOAD"
+  or process.environ_flags contains "LD_AUDIT"
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) has LD_PRELOAD/LD_AUDIT in environment"
+evidence_fields = ["pid", "comm", "environ_flags", "exe"]
+attack = ["T1574.006"]
+rationale = "LD_PRELOAD/LD_AUDIT on a live process is a strong userland hooking signal."

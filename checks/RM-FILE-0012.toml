@@ -1,0 +1,16 @@
+id = "RM-FILE-0012"
+version = 1
+name = "Timestomp indicator (btime after mtime)"
+type = "file"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "timestomp"
+where = '''
+  timestomp.btime_after_mtime == true
+'''
+title = "Timestomp suspected on {{timestomp.path}}"
+evidence_fields = ["path", "btime", "mtime", "ctime", "btime_after_mtime"]
+attack = ["T1070.006"]
+rationale = "Birth time newer than modification time can indicate timestomping on supported filesystems."

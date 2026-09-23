@@ -1,0 +1,17 @@
+id = "RM-PROC-0010"
+version = 2
+name = "Unbacked executable memory regions"
+type = "process"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "process"
+where = '''
+  process.unbacked_exec > 0
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) has unbacked executable mappings"
+evidence_fields = ["pid", "comm", "rwx_maps", "unbacked_exec", "exe"]
+attack = ["T1055"]
+rationale = "Unbacked executable mappings are a stronger injection/shellcode signal than RWX alone (JIT runtimes like gnome-shell/java/gjs commonly have RWX)."
+collectors = ["process.inventory"]

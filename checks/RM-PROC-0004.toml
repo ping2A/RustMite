@@ -1,0 +1,17 @@
+id = "RM-PROC-0004"
+version = 1
+name = "Process running deleted executable"
+type = "process"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.exe_deleted == true
+  or (process.exe != null and process.exe contains "(deleted)")
+'''
+title = "Process '{{process.comm}}' (pid {{process.pid}}) running deleted executable"
+evidence_fields = ["pid", "comm", "exe", "exe_deleted"]
+attack = ["T1070.004"]
+rationale = "An exe symlink ending in (deleted) indicates the binary was removed after exec — common for fileless/malware staging."

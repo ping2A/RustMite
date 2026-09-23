@@ -1,0 +1,20 @@
+id = "RM-PROC-0011"
+version = 2
+name = "Root daemon listening without TTY"
+type = "process"
+severity = "medium"
+confidence = "medium"
+enabled = false
+cost = "trivial"
+match = "process"
+where = '''
+  process.uid == 0
+  and process.ppid == 1
+  and process.tty == 0
+  and process.listen_ports.len() > 0
+'''
+title = "Root process '{{process.comm}}' (pid {{process.pid}}) listening without controlling TTY"
+evidence_fields = ["pid", "comm", "listen_ports", "starttime", "exe"]
+attack = ["T1543"]
+rationale = "Disabled until listener baselines exist — sshd/cupsd/tailscaled/etc. always match on a normal host."
+collectors = ["process.inventory", "net.sockets"]

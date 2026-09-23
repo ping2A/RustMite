@@ -1,0 +1,3 @@
+name = "ssh-key-reuse"
+description = "Same authorized_keys fingerprint on two users (simulates cross-host reuse locally)"
+expected_findings = ["RM-INC-0004"]

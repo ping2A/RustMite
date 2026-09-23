@@ -1,0 +1,45 @@
+id = "RM-PROC-0015"
+version = 1
+name = "Effective root with non-root real UID (SUID/helper elevation)"
+type = "process"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid == 0
+  and process.ruid != 0
+  and not (
+    process.comm == "sudo"
+    or process.comm == "su"
+    or process.comm == "pkexec"
+    or process.comm == "passwd"
+    or process.comm == "chpasswd"
+    or process.comm == "unix_chkpwd"
+    or process.comm == "sudoedit"
+    or process.comm == "newuidmap"
+    or process.comm == "newgidmap"
+    or process.comm == "mount"
+    or process.comm == "umount"
+    or process.comm == "fusermount"
+    or process.comm == "fusermount3"
+    or process.comm == "polkit-agent-helper-1"
+    or process.comm == "dbus-daemon-lau"
+    or process.comm == "ssh-keysign"
+    or process.comm == "snap-confine"
+    or process.comm == "crontab"
+    or process.comm == "chage"
+    or process.comm == "chfn"
+    or process.comm == "chsh"
+    or process.comm == "gpasswd"
+    or process.comm == "newgrp"
+  )
+'''
+title = "Process '{{process.comm}}' running as euid 0 with ruid {{process.ruid}} (active privilege elevation)"
+evidence_fields = ["pid", "comm", "ruid", "euid", "suid", "exe", "cmdline", "cwd"]
+attack = ["T1548.001"]
+rationale = "Elastic LPE framework: euid=0 with ruid≠0 is the SUID/SGID helper privilege shape. Excludes common distro helpers; remaining hits are uncommon SUID abuse or post-exploit elevation visible in a snapshot."
+false_positives = "Legitimate uncommon setuid helpers (vendor agents). Allowlist by process.exe if confirmed."
+references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
+collectors = ["process.inventory"]

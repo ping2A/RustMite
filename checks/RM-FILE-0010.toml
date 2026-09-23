@@ -1,0 +1,18 @@
+id = "RM-FILE-0010"
+version = 1
+name = "Regular file masquerading under /dev"
+type = "file"
+severity = "high"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "file_meta"
+where = '''
+  file_meta.path.path_under("/dev/")
+  and not file_meta.path.path_under("/dev/shm")
+  and file_meta.size > 4096
+'''
+title = "Large regular file under {{file_meta.path}}"
+evidence_fields = ["path", "size", "mode", "uid", "inode"]
+attack = ["T1014"]
+rationale = "Oversized regular files directly under /dev may masquerade as device nodes to evade casual inspection."

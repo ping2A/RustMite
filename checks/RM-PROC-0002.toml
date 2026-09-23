@@ -1,0 +1,16 @@
+id = "RM-PROC-0002"
+version = 1
+name = "Hidden process (single-source, unconfirmed)"
+type = "process"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "hidden_process"
+where = '''
+  hidden_process.passes_confirmed == 1
+'''
+title = "Unconfirmed hidden process pid {{hidden_process.pid}} (needs review)"
+evidence_fields = ["pid", "comm", "passes_confirmed", "sources_present", "sources_absent", "confidence"]
+attack = ["T1014"]
+rationale = "Process visible to one decloak source but not yet confirmed across multiple passes."

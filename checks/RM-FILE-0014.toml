@@ -1,0 +1,16 @@
+id = "RM-FILE-0014"
+version = 1
+name = "String IOC in flagged file"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "ioc_hit"
+where = '''
+  ioc_hit.ioc_kind == "string"
+'''
+title = "String IOC match in {{ioc_hit.path}} ({{ioc_hit.ioc_value}})"
+evidence_fields = ["path", "ioc_kind", "ioc_value"]
+attack = []
+rationale = "File content matched a configured string IOC (C2, wallet, loader marker, etc.)."

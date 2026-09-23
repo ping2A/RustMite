@@ -1,0 +1,16 @@
+id = "RM-DIR-0003"
+version = 1
+name = "Dotdir stash in sensitive mountpoint"
+type = "directory"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "dir_anomaly"
+where = '''
+  dir_anomaly.anomaly == "dotdir_stash"
+'''
+title = "Suspicious dot-directory at {{dir_anomaly.path}}"
+evidence_fields = ["path", "anomaly", "detail"]
+attack = ["T1564.001"]
+rationale = "Hidden dot-directories directly under /, /tmp, or /dev are uncommon on production servers."

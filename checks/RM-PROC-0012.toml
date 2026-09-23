@@ -1,0 +1,19 @@
+id = "RM-PROC-0012"
+version = 1
+name = "Non-root process holding dangerous capabilities"
+type = "process"
+severity = "medium"
+confidence = "medium"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  process.euid != 0
+  and process.dangerous_caps == true
+'''
+title = "Non-root process '{{process.comm}}' (pid {{process.pid}}) holds dangerous capabilities"
+evidence_fields = ["pid", "comm", "euid", "ruid", "caps_eff", "exe"]
+attack = ["T1548"]
+rationale = "CAP_SYS_MODULE, CAP_SYS_PTRACE, CAP_SYS_ADMIN, or CAP_BPF on a non-root process enables local privilege escalation. Snapshot of Elastic LPE capability posture."
+references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
+collectors = ["process.inventory"]

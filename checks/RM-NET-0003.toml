@@ -1,0 +1,18 @@
+id = "RM-NET-0003"
+version = 2
+name = "Unexpected listening socket"
+type = "incident"
+severity = "high"
+confidence = "medium"
+enabled = false
+cost = "low"
+match = "socket"
+where = '''
+  socket.state == "LISTEN"
+  and socket.local_port > 0
+'''
+title = "Listening {{socket.protocol}} socket on {{socket.local_ip}}:{{socket.local_port}}"
+evidence_fields = ["local_ip", "local_port", "protocol", "owning_pid", "uid"]
+attack = ["T1571"]
+rationale = "Disabled until host allow-baselines exist — without a baseline this matched every listener (including sshd :22). Re-enable when RM-NET-0003 is evaluated against an allowlist / baseline drift path."
+collectors = ["net.sockets"]

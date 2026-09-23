@@ -1,0 +1,17 @@
+id = "RM-FILE-0003"
+version = 1
+name = "High-entropy window inside binary"
+type = "file"
+severity = "high"
+confidence = "medium"
+enabled = true
+cost = "low"
+match = "file_entropy"
+where = '''
+  file_entropy.window_max != null
+  and file_entropy.window_max > 7.0
+'''
+title = "High-entropy payload window in {{file_entropy.path}} (peak {{file_entropy.window_max}})"
+evidence_fields = ["path", "entropy", "window_max", "window_offset", "size"]
+attack = ["T1027"]
+rationale = "Localized high-entropy regions inside an otherwise normal binary may indicate appended encrypted payloads."

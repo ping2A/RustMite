@@ -1,0 +1,22 @@
+id = "RM-KERN-0001"
+version = 1
+name = "Hidden kernel module (/sys/module vs /proc/modules)"
+type = "incident"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "module"
+where = '''
+  (module.in_sysfs == true and module.in_proc_modules == false)
+  or (module.in_sysfs == false and module.in_proc_modules == true)
+'''
+title = "Hidden or inconsistent module '{{module.name}}' (sysfs={{module.in_sysfs}} proc={{module.in_proc_modules}})"
+evidence_fields = ["name", "in_sysfs", "in_proc_modules", "size", "refcount"]
+attack = ["T1014"]
+rationale = '''
+Disagreement between loadable modules in /sys/module (entries with initstate) and
+/proc/modules is a classic LKM rootkit hiding signal. Built-in (compiled-in) modules
+appear under /sys/module without initstate and are excluded from this comparison —
+they never appear in /proc/modules and are not a finding.
+'''

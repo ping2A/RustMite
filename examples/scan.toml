@@ -1,0 +1,10 @@
+# Example standalone CLI config (M8).
+host = "127.0.0.1"
+port = 2222
+user = "rustmite"
+identity = "docker/ssh-matrix/.keys/client"
+probe = "target/aarch64-unknown-linux-musl/probe/rustmite-probe"
+loader = "target/aarch64-unknown-linux-musl/probe/rustmite-loader"
+checks = "checks"
+tofu = true
+selftest = false

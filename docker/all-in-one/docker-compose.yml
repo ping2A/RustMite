@@ -1,0 +1,26 @@
+# All-in-one M4 stack: server + node (fixture mode) + webhook catcher + openssh target.
+# Usage:
+#   cargo xtask e2e-stack
+#
+# The node runs in fixture_mode against diamorphine so macOS hosts need no musl probe
+# for the control-plane path. Live SSH is exercised separately via ssh-matrix.
+
+services:
+  webhook:
+    image: mendhak/http-https-echo:31
+    ports:
+      - "9090:8080"
+
+  openssh:
+    build: ../ssh-matrix/openssh
+    ports:
+      - "2222:22"
+    volumes:
+      - ../ssh-matrix/.keys:/keys:ro
+    environment:
+      RUSTMITE_NOEXEC_TMP: "0"
+      RUSTMITE_KEYDIR: /keys
+    privileged: true
+
+  # Server/node run on the host via xtask (not containerized) so we keep the
+  # workspace toolchain. This compose only brings up dependencies.

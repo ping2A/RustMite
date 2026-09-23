@@ -1,0 +1,21 @@
+[package]
+name = "rustmite-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared wire types for RustMite (no_std + alloc)"
+
+[features]
+default = ["std"]
+std = ["serde_json/std", "uuid/std", "base64/std"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }

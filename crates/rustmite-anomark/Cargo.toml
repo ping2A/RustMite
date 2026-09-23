@@ -1,0 +1,33 @@
+[package]
+name = "rustmite-anomark"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+rust-version.workspace = true
+description = "AnoMark command-line anomaly scoring (Markov n-grams) for RustMite"
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "rustmite_anomark"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+csv = "1.3"
+regex = "1.10"
+chrono = "0.4"
+anyhow = "1.0"
+rand = "0.8"
+ordered-float = "4.2"
+rayon = "1.8"
+memmap2 = "0.9"
+ahash = { version = "0.8", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"
+
+[dev-dependencies]
+tempfile = "3.10"
+ahash = { version = "0.8", features = ["serde"] }

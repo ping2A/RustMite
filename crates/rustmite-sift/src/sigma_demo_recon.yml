@@ -1,0 +1,21 @@
+title: IronSift demo — recon keywords (osquery processes.cmdline)
+id: ironsift-demo-recon-keywords
+status: experimental
+description: >
+  Bundled demo for the Sigma tab. Matches process JSONL exported from IronSift when the full
+  command line (osquery `processes.cmdline`, also present as `cmdline` in export) contains
+  whoami, curl, or wget. Export includes both Sigma synonyms (`command_line`, `process_name`)
+  and osquery 5.22.1-shaped fields (`cmdline`, `name`, `path`, `parent`, `pid`) aligned with
+  the SQLite `processes` table used for ingestion.
+level: informational
+detection:
+  selection:
+    cmdline|contains:
+      - whoami
+      - curl
+      - wget
+  condition: selection
+tags:
+  - demo
+  - attack.discovery
+  - osquery

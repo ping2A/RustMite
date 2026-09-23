@@ -1,0 +1,25 @@
+[package]
+name = "rustmite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RustMite operator CLI"
+
+[[bin]]
+name = "rustmite-cli"
+path = "src/main.rs"
+
+[dependencies]
+rustmite-proto = { workspace = true }
+rustmite-sys = { workspace = true }
+rustmite-collect = { workspace = true }
+rustmite-checks = { workspace = true }
+rustmite-transport = { workspace = true, features = ["ssh"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["std"] }
