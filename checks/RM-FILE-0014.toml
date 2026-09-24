@@ -14,3 +14,14 @@ title = "String IOC match in {{ioc_hit.path}} ({{ioc_hit.ioc_value}})"
 evidence_fields = ["path", "ioc_kind", "ioc_value"]
 attack = []
 rationale = "File content matched a configured string IOC (C2, wallet, loader marker, etc.)."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "String IOC"
+
+[test.expect.evidence]
+ioc_kind = "string"

@@ -17,3 +17,14 @@ evidence_fields = ["username", "algorithm", "locked"]
 attack = ["T1110"]
 rationale = "Legacy DES/MD5-crypt hashes are fast to crack offline."
 collectors = ["cred.audit"]
+
+[test]
+fires_on = ["cred-audit-weak"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Weak hash"
+
+[test.expect.evidence]
+algorithm = "md5crypt"

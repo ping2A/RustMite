@@ -17,3 +17,11 @@ evidence_fields = ["username", "locked", "algorithm", "empty_password"]
 attack = ["T1078"]
 rationale = "Accounts expected to be locked should not expose usable password hashes."
 collectors = ["cred.audit"]
+
+[test]
+fires_on = ["cred-audit-weak"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Active password"

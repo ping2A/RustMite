@@ -15,3 +15,11 @@ evidence_fields = ["path", "expected_hash", "actual_hash", "package"]
 attack = ["T1554"]
 rationale = "Baseline and package-DB diffs both surface as integrity_mismatch; package-attributed changes are downgraded server-side."
 collectors = ["file.integrity"]
+
+[test]
+fires_on = ["trojaned-ls"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Critical file drift"

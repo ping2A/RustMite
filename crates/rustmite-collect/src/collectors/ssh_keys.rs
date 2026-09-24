@@ -110,14 +110,27 @@ fn emit_host_keys(
             sink,
             Observation::SshHostKey(SshHostKeyObs {
                 path: PathBytes::from(format!("/{rel}")),
-                key_type: parsed.key_type,
-                fingerprint: parsed.fingerprint,
-                changed: false,
+                key_type: parsed.key_type.clone(),
+                fingerprint: parsed.fingerprint.clone(),
+                changed: host_key_changed(ctx, &parsed.fingerprint),
             }),
         )?;
         count = count.saturating_add(1);
     }
     Ok(count)
+}
+
+fn host_key_changed(ctx: &CollectCtx<'_>, fingerprint: &str) -> bool {
+    let Some(pin) = ctx
+        .fs
+        .read("etc/ssh/.rustmite_hostkey_pin")
+        .ok()
+        .or_else(|| ctx.proc.read("etc/ssh/.rustmite_hostkey_pin").ok())
+    else {
+        return false;
+    };
+    let pinned = String::from_utf8_lossy(&pin).trim().to_string();
+    !pinned.is_empty() && pinned != fingerprint
 }
 
 fn emit_keys(

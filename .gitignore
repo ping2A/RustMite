@@ -22,6 +22,9 @@
 .env
 .env.*
 
+# Packaged Docker images from ./scripts/share-image.sh
+/dist/
+
 # Local dev runtime (pids, logs, overrides) — managed by ./dev.sh
 .dev/
 

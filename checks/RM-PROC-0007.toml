@@ -17,3 +17,14 @@ evidence_fields = ["pid", "comm", "exe", "cmdline", "uid", "starttime"]
 attack = ["T1014", "T1036"]
 rationale = "Real kernel threads have no exe link. A bracketed comm with a backing executable indicates a userland process disguising itself."
 false_positives = "None known on standard distros. Some embedded init systems spawn bracketed userland helpers; allowlist if confirmed benign."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "masquerades"
+
+[test.expect.evidence]
+comm = "[kthreadd]"

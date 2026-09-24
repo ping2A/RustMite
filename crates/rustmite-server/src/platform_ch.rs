@@ -14,7 +14,6 @@ use crate::routes::AppState;
 pub const KIND_VIRTUAL_PROCESSES: &str = "virtual_processes";
 pub const KIND_VIRTUAL_FILES: &str = "virtual_files";
 pub const KIND_ANOMARK_TRAINING: &str = "anomark_training";
-pub const KIND_ANOMARK_AUTO: &str = "anomark_auto";
 pub const KIND_SIFT_DB: &str = "sift_platform_db";
 
 fn ingest_dir() -> PathBuf {
@@ -305,22 +304,6 @@ pub async fn restore_anomark_trainings(
         info!(count = n, "restored AnoMark trainings from ClickHouse");
     }
     Ok(n)
-}
-
-pub async fn sync_anomark_auto(ch: &ClickHouseClient, cfg: &serde_json::Value) {
-    if let Err(e) = ch
-        .upsert_platform_blob(KIND_ANOMARK_AUTO, "default", cfg, &cfg.to_string())
-        .await
-    {
-        warn!(error = %e, "ClickHouse AnoMark auto config sync failed");
-    }
-}
-
-pub async fn restore_anomark_auto(ch: &ClickHouseClient) -> Option<serde_json::Value> {
-    match ch.get_platform_blob(KIND_ANOMARK_AUTO, "default").await {
-        Ok(Some((_meta, payload))) => serde_json::from_str(&payload).ok(),
-        _ => None,
-    }
 }
 
 pub async fn sync_sift_db(ch: &ClickHouseClient) {

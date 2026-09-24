@@ -25,3 +25,11 @@ attack = ["T1548.001"]
 rationale = "Elastic SUID misconfiguration class: setuid binaries outside package-managed paths (/bin, /usr/bin, …) are classic LPE footholds (copied bash -p, find, etc.)."
 references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
 collectors = ["file.ioc"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Setuid binary in suspicious"

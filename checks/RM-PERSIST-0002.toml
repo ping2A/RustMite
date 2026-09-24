@@ -15,3 +15,11 @@ title = "Suspicious ld.so config at {{preload.path}}"
 evidence_fields = ["path", "present", "entries"]
 attack = ["T1574"]
 rationale = "Extra library search paths in ld.so.conf.d enable hijacked shared objects."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "ld.so config"

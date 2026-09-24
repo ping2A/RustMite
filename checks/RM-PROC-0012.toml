@@ -17,3 +17,11 @@ attack = ["T1548"]
 rationale = "CAP_SYS_MODULE, CAP_SYS_PTRACE, CAP_SYS_ADMIN, or CAP_BPF on a non-root process enables local privilege escalation. Snapshot of Elastic LPE capability posture."
 references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "dangerous capabilities"

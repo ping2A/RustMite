@@ -20,3 +20,14 @@ Disagreement between loadable modules in /sys/module (entries with initstate) an
 appear under /sys/module without initstate and are excluded from this comparison —
 they never appear in /proc/modules and are not a finding.
 '''
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Hidden or inconsistent"
+
+[test.expect.evidence]
+name = "hiddenmod"

@@ -43,3 +43,11 @@ rationale = "Elastic LPE framework: euid=0 with ruid≠0 is the SUID/SGID helper
 false_positives = "Legitimate uncommon setuid helpers (vendor agents). Allowlist by process.exe if confirmed."
 references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "privilege elevation"

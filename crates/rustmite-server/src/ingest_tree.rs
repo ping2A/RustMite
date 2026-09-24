@@ -3,9 +3,9 @@
 //! Designed for PulseSecure periodic snapshots laid out as:
 //! ```text
 //! /…/2026-05-10/
-//!   PulseSecure-Periodicsnapshot-standalone-CHINAADSGW01-20260511-0012/
+//!   PulseSecure-Periodicsnapshot-standalone-HOSTEXAMPLE01-20260511-0012/
 //!     *.jsonl   (mixed: file_information, process, network_connection, …)
-//!   PulseSecure-Periodicsnapshot-standalone-NOEVPN2b…/
+//!   PulseSecure-Periodicsnapshot-standalone-EDGEVPN01…/
 //!     *.jsonl
 //! ```
 
@@ -128,8 +128,8 @@ pub struct ImportTreeSummary {
 /// Extract hostname from PulseSecure snapshot directory names.
 ///
 /// Examples:
-/// - `PulseSecure-Periodicsnapshot-standalone-CHINAADSGW01-20260511-0012` → `CHINAADSGW01`
-/// - `PulseSecure-Periodicsnapshot-CLUSTER_LIC-LIC_NOE-20260513-2130` → `LIC_NOE`
+/// - `PulseSecure-Periodicsnapshot-standalone-HOSTEXAMPLE01-20260511-0012` → `HOSTEXAMPLE01`
+/// - `PulseSecure-Periodicsnapshot-CLUSTER_LIC-LIC_EXAMPLE-20260513-2130` → `LIC_EXAMPLE`
 pub fn host_name_from_pulsesecure_dir(dirname: &str) -> String {
     let name = dirname.trim().trim_end_matches('/');
     let Some(rest) = name.strip_prefix("PulseSecure-Periodicsnapshot-") else {
@@ -139,7 +139,7 @@ pub fn host_name_from_pulsesecure_dir(dirname: &str) -> String {
     let rest = if let Some(r) = rest.strip_prefix("standalone-") {
         r
     } else if let Some(idx) = rest.find('-') {
-        // CLUSTER_LIC-LIC_NOE-20260513-2130 → after first segment
+        // CLUSTER_LIC-LIC_EXAMPLE-20260513-2130 → after first segment
         &rest[idx + 1..]
     } else {
         rest
@@ -1181,7 +1181,12 @@ pub async fn create_virtual_import_scan(
         })
         .await;
 
-    crate::anomark_api::spawn_post_scan_anomark(state.clone(), host.id.0, "virtual-import");
+    crate::anomark_api::spawn_post_scan_anomark(
+        state.clone(),
+        host.id.0,
+        job.id.0,
+        "virtual-import",
+    );
 
     Ok(job.id.0)
 }
@@ -1194,21 +1199,21 @@ mod tests {
     fn pulsesecure_host_extraction() {
         assert_eq!(
             host_name_from_pulsesecure_dir(
-                "PulseSecure-Periodicsnapshot-standalone-CHINAADSGW01-20260511-0012"
+                "PulseSecure-Periodicsnapshot-standalone-HOSTEXAMPLE01-20260511-0012"
             ),
-            "CHINAADSGW01"
+            "HOSTEXAMPLE01"
         );
         assert_eq!(
             host_name_from_pulsesecure_dir(
-                "PulseSecure-Periodicsnapshot-standalone-NOEVPN2bEDFEXTK09ADS-20260512-1621"
+                "PulseSecure-Periodicsnapshot-standalone-EDGEVPN01EXAMPLE-20260512-1621"
             ),
-            "NOEVPN2bEDFEXTK09ADS"
+            "EDGEVPN01EXAMPLE"
         );
         assert_eq!(
             host_name_from_pulsesecure_dir(
-                "PulseSecure-Periodicsnapshot-CLUSTER_LIC-LIC_NOE-20260513-2130"
+                "PulseSecure-Periodicsnapshot-CLUSTER_LIC-LIC_EXAMPLE-20260513-2130"
             ),
-            "LIC_NOE"
+            "LIC_EXAMPLE"
         );
     }
 
@@ -1227,18 +1232,6 @@ mod tests {
         assert_eq!(f[0].path, "/data/var");
         assert_eq!(s.len(), 1);
         assert!(skip >= 1);
-    }
-
-    #[test]
-    fn parse_real_pulsesecure_sample_head() {
-        let path = "/Users/toto/Code/DATA/vpn/2026-05-10/PulseSecure-Periodicsnapshot-standalone-CHINAADSGW01-20260511-0012/pulsesecure-state-periodicsnapshot-localhost2-71-20260511-001006.jsonl";
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let head: String = content.lines().take(2000).collect::<Vec<_>>().join("\n");
-        let (p, f, s, _skip) = parse_mixed_snapshot_jsonl(&head, "CHINAADSGW01");
-        assert!(p.len() + f.len() + s.len() > 0, "expected rows from sample");
-        assert!(!f.is_empty(), "expected file_information rows");
     }
 
     #[test]

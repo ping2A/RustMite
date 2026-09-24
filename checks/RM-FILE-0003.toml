@@ -15,3 +15,11 @@ title = "High-entropy payload window in {{file_entropy.path}} (peak {{file_entro
 evidence_fields = ["path", "entropy", "window_max", "window_offset", "size"]
 attack = ["T1027"]
 rationale = "Localized high-entropy regions inside an otherwise normal binary may indicate appended encrypted payloads."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "High-entropy payload"

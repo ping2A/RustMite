@@ -1,0 +1,65 @@
+# Shareable local stack: RustMite server (+ optional fixture node).
+#
+# Build once from the repo root:
+#   docker compose -f docker/share/docker-compose.yml build
+#
+# Run:
+#   docker compose -f docker/share/docker-compose.yml up
+#   open http://127.0.0.1:8080/
+#
+# Tag & push to share:
+#   docker tag rustmite:latest your-registry/rustmite:0.1.0
+#   docker push your-registry/rustmite:0.1.0
+
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: rustmite:latest
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      RUST_LOG: info
+      RUSTMITE_LISTEN: 0.0.0.0:8080
+      RUSTMITE_NODE_LISTEN: 0.0.0.0:8443
+      RUSTMITE_CHECKS: /opt/rustmite/checks
+      RUSTMITE_NO_TLS: "1"
+      RUSTMITE_SEED_DEMO: "0"
+      RUSTMITE_SCAN_SIM: "0"
+    volumes:
+      - rustmite-data:/opt/rustmite/data
+      - rustmite-tls:/opt/rustmite/tls
+      - rustmite-vault:/opt/rustmite/vault
+    command: ["server", "--no-tls"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Optional: fixture-mode node that posts RM-PROC-0001 findings into the server.
+  node:
+    image: rustmite:latest
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      RUSTMITE_ALLOW_INSECURE: "1"
+    command:
+      [
+        "node",
+        "--server", "http://server:8443",
+        "--allow-insecure",
+        "--fixture-mode",
+        "--fixture", "/opt/rustmite/fixtures/diamorphine-hidden-pid",
+      ]
+    profiles: ["with-node"]
+
+volumes:
+  rustmite-data:
+  rustmite-tls:
+  rustmite-vault:

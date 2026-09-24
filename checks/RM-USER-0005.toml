@@ -15,3 +15,14 @@ title = "Passwordless sudo for all commands in {{sudo_rule.path}}"
 evidence_fields = ["path", "line", "nopasswd", "all_commands"]
 attack = ["T1548.003"]
 rationale = "NOPASSWD:ALL grants passwordless full root access and is a common persistence/privesc vector."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Passwordless sudo"
+
+[test.expect.evidence]
+nopasswd = true

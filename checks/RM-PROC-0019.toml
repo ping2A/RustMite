@@ -31,3 +31,11 @@ attack = ["T1068", "T1059.006"]
 rationale = "Elastic 'Suspicious UID Change to Root via Python' — many 2026 LPE PoCs finish as Python. Snapshot sees elevated python with staging cwd rather than uid_change events."
 references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Python"

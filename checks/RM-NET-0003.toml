@@ -16,3 +16,11 @@ evidence_fields = ["local_ip", "local_port", "protocol", "owning_pid", "uid"]
 attack = ["T1571"]
 rationale = "Disabled until host allow-baselines exist — without a baseline this matched every listener (including sshd :22). Re-enable when RM-NET-0003 is evaluated against an allowlist / baseline drift path."
 collectors = ["net.sockets"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Listening"

@@ -51,8 +51,6 @@ pub struct AppState {
     pub host_health: Arc<tokio::sync::RwLock<crate::host_health::HostHealthConfig>>,
     /// IronSift platform store (AnoMark / Sigma / honeycomb).
     pub sift_platform: crate::sift_platform::SiftPlatform,
-    /// AnoMark auto-run after scan (multi-model apply).
-    pub anomark_auto: crate::anomark_api::AnoMarkAutoStore,
     /// Named virtual-agent profiles (JSONL field mappings).
     pub virtual_agents: crate::virtual_agents::VirtualAgentStore,
 }
@@ -1491,6 +1489,13 @@ async fn list_checks(State(state): State<AppState>) -> impl IntoResponse {
                 "false_positives": m.false_positives,
                 "evidence_fields": m.evidence_fields,
                 "scan_sets": in_sets,
+                "is_anomark": m.is_anomark_rule(),
+                "anomark": m.anomark_options().map(|o| serde_json::json!({
+                    "model_id": o.model_id,
+                    "suspect_percent": o.suspect_percent,
+                    "tags": o.tags,
+                    "max_commands": o.max_commands,
+                })),
             })
         })
         .collect();
@@ -1524,6 +1529,13 @@ fn check_json(
         "path": path.display().to_string(),
         "toml": toml_text,
         "scan_sets": scan_sets,
+        "is_anomark": m.is_anomark_rule(),
+        "anomark": m.anomark_options().map(|o| serde_json::json!({
+            "model_id": o.model_id,
+            "suspect_percent": o.suspect_percent,
+            "tags": o.tags,
+            "max_commands": o.max_commands,
+        })),
     })
 }
 
@@ -2454,10 +2466,77 @@ async fn get_host(
 pub struct HostInventoryQuery {
     #[serde(default = "default_inventory_limit")]
     pub limit: usize,
+    /// Exact scan UUID to load. Takes precedence over `inventory`.
+    #[serde(default)]
+    pub scan_id: Option<Uuid>,
+    /// Nth newest finished scan with this inventory kind: `1`/`latest`, `2`/`previous`, …
+    #[serde(default)]
+    pub inventory: Option<String>,
 }
 
 fn default_inventory_limit() -> usize {
     10_000
+}
+
+fn inventory_index0(inventory: &str) -> usize {
+    let key = inventory.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "" | "latest" | "current" | "newest" => 0,
+        "previous" | "prev" | "prior" => 1,
+        other => other
+            .parse::<usize>()
+            .map(|n| if n == 0 { 0 } else { n.saturating_sub(1) })
+            .unwrap_or(0),
+    }
+}
+
+/// Resolve which scan's observations to return for a host inventory kind.
+async fn host_kind_rows(
+    state: &AppState,
+    host_id: HostId,
+    kind: &str,
+    limit: usize,
+    scan_override: Option<Uuid>,
+    inventory: Option<&str>,
+) -> Result<(Option<Uuid>, Vec<rustmite_store::StoredObservation>), ApiError> {
+    let rows = state
+        .store
+        .list_observations(Some(host_id), 50_000)
+        .await?;
+    let of_kind: Vec<_> = rows
+        .into_iter()
+        .filter(|o| o.kind == kind)
+        .collect();
+    if of_kind.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let scan_id = if let Some(sid) = scan_override {
+        sid
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered: Vec<Uuid> = Vec::new();
+        for o in of_kind.iter().rev() {
+            if seen.insert(o.scan_id.0) {
+                ordered.push(o.scan_id.0);
+            }
+        }
+        let idx = inventory
+            .map(inventory_index0)
+            .unwrap_or(0);
+        ordered
+            .get(idx)
+            .copied()
+            .or_else(|| ordered.first().copied())
+            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no scans for inventory".into()))?
+    };
+    let mut out: Vec<_> = of_kind
+        .into_iter()
+        .filter(|o| o.scan_id.0 == scan_id)
+        .collect();
+    if out.len() > limit && limit > 0 {
+        out.truncate(limit);
+    }
+    Ok((Some(scan_id), out))
 }
 
 /// Latest process inventory for a host (scan observations, or virtual ingest JSONL).
@@ -2479,10 +2558,15 @@ async fn host_processes(
         crate::platform_ch::ensure_virtual_local(&state, host.id.0).await;
     }
 
-    let (scan_id, rows) = state
-        .store
-        .list_observations_of_kind(HostId(id), "process", limit)
-        .await?;
+    let (scan_id, rows) = host_kind_rows(
+        &state,
+        HostId(id),
+        "process",
+        limit,
+        q.scan_id,
+        q.inventory.as_deref(),
+    )
+    .await?;
     let mut processes: Vec<serde_json::Value> = rows
         .iter()
         .filter_map(|o| match &o.data {
@@ -2492,8 +2576,18 @@ async fn host_processes(
         .collect();
     let mut source = if !processes.is_empty() { "scan" } else { "none" };
 
-    // Virtual agents have no SSH scan — ingested processes.jsonl is the source of truth.
-    if is_virtual {
+    // Virtual agents: fall back to ingest JSONL only for latest (no scan override).
+    let want_latest = q.scan_id.is_none()
+        && q.inventory
+            .as_deref()
+            .map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "" | "latest" | "current" | "newest" | "1" | "0"
+                )
+            })
+            .unwrap_or(true);
+    if is_virtual && want_latest && processes.is_empty() {
         let raw = crate::sift_api::load_virtual_jsonl(&host);
         if !raw.is_empty() {
             processes = raw
@@ -2507,7 +2601,8 @@ async fn host_processes(
 
     Ok(Json(serde_json::json!({
         "host_id": id,
-        "scan_id": scan_id.map(|s| s.0),
+        "scan_id": scan_id,
+        "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
         "source": source,
         "count": processes.len(),
         "processes": processes,
@@ -2560,11 +2655,17 @@ async fn host_files(
         crate::platform_ch::ensure_virtual_local(&state, host.id.0).await;
     }
 
-    let (scan_id, rows) = state
-        .store
-        .list_observations_of_kind(HostId(id), "file_meta", limit)
-        .await?;
-    let mut files: Vec<serde_json::Value> = rows
+    // Prefer file_meta; if that scan has none, try file_entropy for the same pick.
+    let (mut scan_id, meta_rows) = host_kind_rows(
+        &state,
+        HostId(id),
+        "file_meta",
+        limit,
+        q.scan_id,
+        q.inventory.as_deref(),
+    )
+    .await?;
+    let mut files: Vec<serde_json::Value> = meta_rows
         .iter()
         .filter_map(|o| match &o.data {
             Observation::FileMeta(f) => serde_json::to_value(f).ok(),
@@ -2572,9 +2673,41 @@ async fn host_files(
             other => serde_json::to_value(other).ok(),
         })
         .collect();
+    if files.is_empty() {
+        let (sid2, entropy_rows) = host_kind_rows(
+            &state,
+            HostId(id),
+            "file_entropy",
+            limit,
+            q.scan_id.or(scan_id),
+            q.inventory.as_deref(),
+        )
+        .await?;
+        if scan_id.is_none() {
+            scan_id = sid2;
+        }
+        files = entropy_rows
+            .iter()
+            .filter_map(|o| match &o.data {
+                Observation::FileMeta(f) => serde_json::to_value(f).ok(),
+                Observation::FileEntropy(f) => serde_json::to_value(f).ok(),
+                other => serde_json::to_value(other).ok(),
+            })
+            .collect();
+    }
     let mut source = if !files.is_empty() { "scan" } else { "none" };
 
-    if is_virtual {
+    let want_latest = q.scan_id.is_none()
+        && q.inventory
+            .as_deref()
+            .map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "" | "latest" | "current" | "newest" | "1" | "0"
+                )
+            })
+            .unwrap_or(true);
+    if is_virtual && want_latest && files.is_empty() {
         let raw = crate::sift_api::load_virtual_files_jsonl(&host);
         if !raw.is_empty() {
             files = raw
@@ -2599,7 +2732,8 @@ async fn host_files(
 
     Ok(Json(serde_json::json!({
         "host_id": id,
-        "scan_id": scan_id.map(|s| s.0),
+        "scan_id": scan_id,
+        "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
         "source": source,
         "count": files.len(),
         "files": files,
@@ -2614,10 +2748,15 @@ async fn host_connections(
 ) -> Result<impl IntoResponse, ApiError> {
     let host = state.store.get_host(HostId(id)).await?;
     let limit = q.limit.max(1);
-    let (scan_id, rows) = state
-        .store
-        .list_observations_of_kind(HostId(id), "socket", limit)
-        .await?;
+    let (scan_id, rows) = host_kind_rows(
+        &state,
+        HostId(id),
+        "socket",
+        limit,
+        q.scan_id,
+        q.inventory.as_deref(),
+    )
+    .await?;
     let connections: Vec<serde_json::Value> = rows
         .iter()
         .filter_map(|o| match &o.data {
@@ -2635,7 +2774,8 @@ async fn host_connections(
 
     Ok(Json(serde_json::json!({
         "host_id": id,
-        "scan_id": scan_id.map(|s| s.0),
+        "scan_id": scan_id,
+        "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
         "source": source,
         "count": connections.len(),
         "connections": connections,
@@ -2866,6 +3006,7 @@ async fn hunt(
         .list_observations(body.host.map(HostId), body.limit)
         .await?;
     let observations: Vec<Observation> = obs.into_iter().map(|o| o.data).collect();
+    // Keep hunt dry-run manifests valid under the catalog [test.expect] gate.
     let toml = format!(
         r#"
 id = "RM-HUNT-TEMP"
@@ -2881,6 +3022,14 @@ where = '''{}'''
 title = "hunt hit"
 evidence_fields = []
 attack = []
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "hunt"
 "#,
         body.match_on, body.where_expr
     );
@@ -3667,7 +3816,12 @@ async fn node_results(
             | "failed"
     );
     if !failed {
-        crate::anomark_api::spawn_post_scan_anomark(state.clone(), body.host_id, &check_set);
+        crate::anomark_api::spawn_post_scan_anomark(
+            state.clone(),
+            body.host_id,
+            body.scan_id,
+            &check_set,
+        );
     }
 
     Ok(StatusCode::NO_CONTENT)

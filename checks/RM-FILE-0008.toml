@@ -15,3 +15,14 @@ evidence_fields = ["path", "ioc_kind", "ioc_value", "severity"]
 attack = ["T1014"]
 rationale = "Path IOC match from file.ioc collector (known rootkit drop locations)."
 collectors = ["file.ioc"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "rootkit/IOC path"
+
+[test.expect.evidence]
+ioc_kind = "path"

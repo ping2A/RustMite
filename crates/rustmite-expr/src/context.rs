@@ -512,7 +512,13 @@ fn file_meta_value(f: &FileMetaObs) -> Value {
     m.insert("mode".into(), Value::Int(f.mode as i64));
     m.insert("uid".into(), Value::Int(f.uid as i64));
     m.insert("gid".into(), Value::Int(f.gid as i64));
-    m.insert("size".into(), Value::String(f.size.0.clone()));
+    m.insert(
+        "size".into(),
+        f.size
+            .as_u64()
+            .map(|s| Value::Int(s as i64))
+            .unwrap_or_else(|| Value::String(f.size.0.clone())),
+    );
     m.insert("inode".into(), Value::String(f.inode.0.clone()));
     m.insert("nlink".into(), Value::Int(f.nlink as i64));
     m.insert("setuid".into(), Value::Bool(f.setuid));

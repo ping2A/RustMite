@@ -14,3 +14,14 @@ title = "Unconfirmed hidden process pid {{hidden_process.pid}} (needs review)"
 evidence_fields = ["pid", "comm", "passes_confirmed", "sources_present", "sources_absent", "confidence"]
 attack = ["T1014"]
 rationale = "Process visible to one decloak source but not yet confirmed across multiple passes."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "Unconfirmed"
+
+[test.expect.evidence]
+passes_confirmed = 1

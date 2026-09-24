@@ -25,3 +25,14 @@ evidence_fields = ["username", "uid", "shell", "home"]
 attack = ["T1136"]
 rationale = "System/service accounts should normally use nologin/false shells. Excludes the traditional sync account (/bin/sync)."
 collectors = ["persistence.accounts"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Service account"
+
+[test.expect.evidence]
+username = "daemon"

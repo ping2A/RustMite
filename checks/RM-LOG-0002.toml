@@ -15,3 +15,14 @@ title = "Log tampering on {{log_integrity.path}} ({{log_integrity.issue}})"
 evidence_fields = ["path", "issue", "detail"]
 attack = ["T1070.002"]
 rationale = "NUL holes or sparse deletion patterns in logs suggest anti-forensics."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Log tampering"
+
+[test.expect.evidence]
+issue = "nul_hole"

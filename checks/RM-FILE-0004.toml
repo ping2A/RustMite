@@ -15,3 +15,11 @@ evidence_fields = ["path", "expected_hash", "actual_hash", "package"]
 attack = ["T1554"]
 rationale = "Package-managed binaries should match the distribution hash; divergence suggests trojaning."
 collectors = ["file.integrity"]
+
+[test]
+fires_on = ["trojaned-ls"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Integrity mismatch"

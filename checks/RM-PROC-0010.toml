@@ -15,3 +15,11 @@ evidence_fields = ["pid", "comm", "rwx_maps", "unbacked_exec", "exe"]
 attack = ["T1055"]
 rationale = "Unbacked executable mappings are a stronger injection/shellcode signal than RWX alone (JIT runtimes like gnome-shell/java/gjs commonly have RWX)."
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "unbacked"

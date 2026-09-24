@@ -16,3 +16,11 @@ title = "ELF {{elf_info.path}} uses interpreter {{elf_info.interp}}"
 evidence_fields = ["path", "interp", "machine", "is_static"]
 attack = ["T1574"]
 rationale = "Dynamic linker paths outside standard lib directories may indicate hijacked interpreters."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "interpreter"

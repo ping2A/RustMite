@@ -17,3 +17,13 @@ attack = ["T1548.001"]
 rationale = "Full setuid inventory for baseline/drift. Disabled by default (fires on every sudo/passwd). Prefer RM-FILE-0006, RM-FILE-0015, and drift once baselines exist."
 references = ["https://www.elastic.co/security-labs/threat-command/linux-privilege-escalation-detection-framework"]
 collectors = ["file.ioc"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Setuid"
+[test.expect.evidence]
+setuid = true

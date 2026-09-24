@@ -355,15 +355,15 @@ body {
   height: 100vh;
   overflow: auto;
 }
-.brand { display: flex; gap: 0.7rem; align-items: center; padding: 0.25rem 0.45rem 0.55rem; }
+.brand { display: flex; gap: 0.85rem; align-items: center; padding: 0.35rem 0.45rem 0.65rem; }
 .brand-logo {
-  width: 40px;
-  height: 40px;
+  width: 64px;
+  height: 64px;
   object-fit: contain;
   flex: 0 0 auto;
-  border-radius: 10px;
+  border-radius: 14px;
   background: rgba(18, 22, 28, 0.55);
-  padding: 0.15rem;
+  padding: 0.2rem;
   box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 8px 18px rgba(0,0,0,0.22);
 }
 .brand-mark {
@@ -381,8 +381,8 @@ body {
   border-top-color: transparent;
   transform: rotate(45deg);
 }
-.brand-name { font-weight: 700; letter-spacing: 0.02em; font-size: 1.05rem; }
-.brand-sub { font-size: 0.68rem; opacity: 0.65; letter-spacing: 0.04em; text-transform: uppercase; }
+.brand-name { font-weight: 700; letter-spacing: 0.02em; font-size: 1.15rem; }
+.brand-sub { font-size: 0.72rem; opacity: 0.65; letter-spacing: 0.04em; text-transform: uppercase; }
 
 .nav { display: flex; flex-direction: column; gap: 0.18rem; flex: 1; min-height: 0; }
 .nav-item {
@@ -1712,6 +1712,43 @@ pre.json {
   padding: 0.7rem 0.8rem;
   background: color-mix(in srgb, var(--panel, #fff) 94%, transparent);
   border-left: 3px solid color-mix(in srgb, var(--muted, #9aa3b2) 55%, transparent);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.sift-anom-card:hover,
+.sift-anom-card:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border, #fff));
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel, #fff));
+}
+.sift-anom-open {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.sift-detail-head {
+  padding: 0 0 0.75rem;
+  margin-bottom: 0.65rem;
+  border-bottom: 1px solid var(--line);
+}
+.sift-detail-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.55rem;
+}
+.sift-detail-h {
+  margin: 1rem 0 0.45rem;
+  font-size: 0.88rem;
+  font-weight: 650;
+}
+.sift-detail-notes {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.85rem;
 }
 .sift-anom-card--critical { border-left-color: #b42318; }
 .sift-anom-card--high { border-left-color: #b54708; }
@@ -1802,6 +1839,80 @@ pre.json {
   }
 }
 
+.ml-debug-panel {
+  margin: 0.65rem 0 0.85rem;
+  font-size: 0.82rem;
+}
+.ml-debug-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.45rem 0.75rem;
+  margin-top: 0.45rem;
+}
+.ml-debug-grid dt {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted, #9aa3b2);
+  margin: 0;
+}
+.ml-debug-grid dd {
+  margin: 0.1rem 0 0;
+  font-size: 0.84rem;
+  word-break: break-word;
+}
+.ml-debug-log {
+  list-style: none;
+  margin: 0.55rem 0 0;
+  padding: 0.45rem 0.55rem;
+  max-height: 9rem;
+  overflow: auto;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--line, #fff) 70%, transparent);
+  background: color-mix(in srgb, var(--ink) 3%, var(--panel, #fff));
+  font-size: 0.75rem;
+}
+.ml-debug-log li {
+  padding: 0.12rem 0;
+  display: flex;
+  gap: 0.45rem;
+  align-items: baseline;
+}
+.ml-train-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-bottom: 0.85rem;
+}
+.ml-train-banner-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.45rem;
+  font-size: 0.88rem;
+}
+.ml-model-detail .ml-debug-grid {
+  margin-top: 0;
+}
+.anomark-run-progress,
+.sift-run-progress {
+  margin-bottom: 0.85rem;
+}
+.ml-subtab-badge {
+  display: inline-block;
+  margin-left: 0.28rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink-soft);
+  vertical-align: middle;
+}
+.ml-subtabs .tab.active .ml-subtab-badge {
+  background: color-mix(in srgb, #fff 28%, transparent);
+  color: inherit;
+}
 .anomark-host-filters {
   margin-bottom: 0.55rem;
 }
@@ -1967,6 +2078,42 @@ pre.json {
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
+}
+.ml-score-card--suspect {
+  border-color: color-mix(in srgb, #b54708 40%, var(--border, #fff));
+  background: color-mix(in srgb, #b54708 8%, transparent);
+}
+.ml-score-card--ok {
+  border-color: color-mix(in srgb, #027a48 35%, var(--border, #fff));
+  background: color-mix(in srgb, #027a48 6%, transparent);
+}
+.ml-score-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.65rem;
+  margin-bottom: 0.15rem;
+}
+.ml-margin-bar { margin-top: 0.25rem; }
+.ml-margin-track {
+  height: 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 18%, transparent);
+  overflow: hidden;
+}
+.ml-margin-fill { display: block; height: 100%; border-radius: inherit; }
+.ml-margin-fill.is-suspect { background: #b54708; }
+.ml-margin-fill.is-ok { background: #027a48; }
+.ml-row-suspect td { background: color-mix(in srgb, #b54708 7%, transparent); }
+.ml-try-history li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+}
+.pill.ok {
+  background: color-mix(in srgb, #027a48 16%, transparent);
+  color: #027a48;
 }
 .ml-score-row {
   display: flex;
@@ -2619,6 +2766,30 @@ a.host-name-link {
 }
 .host-detail-tabs .tab.active {
   background: var(--accent); color: #fff; border-color: var(--accent);
+}
+.host-scan-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.65rem 1rem;
+  margin: -0.35rem 0 1rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 85%, var(--accent) 4%);
+}
+.host-scan-picker label {
+  display: grid;
+  gap: 0.28rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+  min-width: min(100%, 22rem);
+  flex: 1 1 16rem;
+}
+.host-scan-picker select {
+  width: 100%;
+  font-weight: 500;
 }
 .ssh-graph {
   display: grid; grid-template-columns: 1.2fr 1fr; gap: 1rem; align-items: start;
@@ -3536,6 +3707,13 @@ a.host-name-link {
 }
 .rules-scan-grid {
   display: flex; flex-wrap: wrap; gap: 0.4rem;
+}
+.rules-anomark-panel {
+  margin: 0.85rem 0 1rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
 }
 .rules-scan-chip {
   display: inline-flex; align-items: center; gap: 0.35rem;

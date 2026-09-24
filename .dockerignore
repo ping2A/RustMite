@@ -1,0 +1,22 @@
+# Build context noise — keep the image build lean and cache-friendly.
+.git/
+.github/
+.dev/
+.DS_Store
+**/.DS_Store
+target/
+**/target/
+models/
+docs/
+scripts/
+examples/
+assets/*.psd
+**/*.md
+!README.md
+docker/ssh-matrix/.keys/
+docker/clickhouse/
+*.pdb
+.env
+.env.*
+mutants.out*/
+**/*.rs.bk

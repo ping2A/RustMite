@@ -18,3 +18,13 @@ evidence_fields = ["pid", "comm", "listen_ports", "starttime", "exe"]
 attack = ["T1543"]
 rationale = "Disabled until listener baselines exist — sshd/cupsd/tailscaled/etc. always match on a normal host."
 collectors = ["process.inventory", "net.sockets"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "listening without"
+[test.expect.evidence]
+comm = "sshd"

@@ -148,10 +148,6 @@ pub fn openapi_json() -> serde_json::Value {
             "/v1/anomark/apply": {
                 "post": { "summary": "Score process inventories on one or more hosts" }
             },
-            "/v1/anomark/auto": {
-                "get": { "summary": "Get post-scan AnoMark auto-run config" },
-                "put": { "summary": "Update post-scan AnoMark auto-run config" }
-            },
             "/v1/anomark/availability": {
                 "get": { "summary": "AnoMark training / model availability" }
             },

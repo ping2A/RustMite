@@ -20,3 +20,14 @@ evidence_fields = ["username", "key_type", "bits", "fingerprint", "path"]
 attack = ["T1110"]
 rationale = "DSA is obsolete. RSA keys under 2048 bits are weak offline. Modern RSA (2048+) still uses the ssh-rsa key type name in authorized_keys — that alone is not deprecated."
 collectors = ["ssh.keys"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Weak SSH"
+
+[test.expect.evidence]
+key_type = "ssh-dss"

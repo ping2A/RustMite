@@ -8,8 +8,46 @@ use serde::Deserialize;
 
 use crate::error::CheckError;
 
+/// Optional post-scan AnoMark scoring config (`[anomark]` in TOML).
+/// When present (or `match = "anomark"`), the rule does not fire on observations;
+/// the server scores process inventory after a successful scan instead.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct AnomarkRuleOptions {
+    /// Training id; empty / omitted = platform default model path.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Suspect percentile (55–99.9). Lower = more sensitive.
+    #[serde(default = "default_suspect_percent")]
+    pub suspect_percent: f64,
+    /// Host tags that must all match (empty = any host).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Max process command lines to score per host.
+    #[serde(default = "default_max_commands")]
+    pub max_commands: usize,
+}
+
+fn default_suspect_percent() -> f64 {
+    95.0
+}
+
+fn default_max_commands() -> usize {
+    5_000
+}
+
+impl Default for AnomarkRuleOptions {
+    fn default() -> Self {
+        Self {
+            model_id: None,
+            suspect_percent: default_suspect_percent(),
+            tags: Vec::new(),
+            max_commands: default_max_commands(),
+        }
+    }
+}
+
 /// Data-defined check rule (TOML/JSON).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct CheckManifest {
     #[serde(deserialize_with = "deserialize_check_id")]
     pub id: CheckId,
@@ -24,6 +62,7 @@ pub struct CheckManifest {
     #[serde(default = "default_cost")]
     pub cost: String,
     /// Observation stream this check consumes (e.g. `"process"`, `"hidden_process"`).
+    /// Use `"anomark"` for post-scan Markov scoring (see `[anomark]`).
     #[serde(rename = "match")]
     pub match_on: String,
     #[serde(rename = "where")]
@@ -50,6 +89,65 @@ pub struct CheckManifest {
     /// Collector IDs required to feed this check (unioned into scan plans).
     #[serde(default)]
     pub collectors: Vec<String>,
+    /// Post-scan AnoMark options. Implied when `match = "anomark"`.
+    #[serde(default)]
+    pub anomark: Option<AnomarkRuleOptions>,
+    /// Fixture expectations: must fire / must stay silent.
+    #[serde(default)]
+    pub test: CheckTestSpec,
+}
+
+/// How positive fixture coverage is obtained.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckTestSource {
+    /// Fixture tree only — collectors must produce the matching observations.
+    #[default]
+    Collector,
+    /// Collectors plus post-scan correlators (`where = false` drift / graph rules).
+    Correlate,
+    /// Explicit `observations.ndjson` overlay (schema-validated); last resort.
+    Inject,
+}
+
+/// Required shape of at least one finding on a positive fixture.
+#[derive(Clone, Debug, PartialEq, Deserialize, Default)]
+pub struct CheckTestExpect {
+    /// Substring that must appear in the finding title.
+    #[serde(default)]
+    pub title_contains: Option<String>,
+    /// Evidence fields that must equal these JSON-compatible values.
+    #[serde(default)]
+    pub evidence: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CheckTestExpect {
+    pub fn is_empty(&self) -> bool {
+        self.title_contains.is_none() && self.evidence.is_empty()
+    }
+}
+
+/// Per-check fixture expectations (`[test]` in TOML).
+#[derive(Clone, Debug, PartialEq, Deserialize, Default)]
+pub struct CheckTestSpec {
+    /// Hostile fixtures where this check must produce ≥1 finding.
+    #[serde(default)]
+    pub fires_on: Vec<String>,
+    /// Clean / negative fixtures where this check must produce 0 findings.
+    #[serde(default)]
+    pub silent_on: Vec<String>,
+    /// How `fires_on` coverage is produced (required for non-AnoMark rules with fires_on).
+    #[serde(default)]
+    pub source: CheckTestSource,
+    /// Required finding shape on positive fixtures.
+    #[serde(default)]
+    pub expect: CheckTestExpect,
+}
+
+impl CheckTestSpec {
+    pub fn is_declared(&self) -> bool {
+        !self.fires_on.is_empty() || !self.silent_on.is_empty()
+    }
 }
 
 impl CheckManifest {
@@ -62,6 +160,22 @@ impl CheckManifest {
             .into_iter()
             .map(|c| c.as_str().to_string())
             .collect()
+    }
+
+    /// True when this rule is a post-scan AnoMark scorer (not an observation `where` match).
+    pub fn is_anomark_rule(&self) -> bool {
+        self.anomark.is_some() || self.match_on.eq_ignore_ascii_case("anomark")
+    }
+
+    /// Effective AnoMark options (defaults when `[anomark]` is omitted but `match = "anomark"`).
+    pub fn anomark_options(&self) -> Option<AnomarkRuleOptions> {
+        if let Some(opts) = &self.anomark {
+            return Some(opts.clone());
+        }
+        if self.match_on.eq_ignore_ascii_case("anomark") {
+            return Some(AnomarkRuleOptions::default());
+        }
+        None
     }
 }
 
@@ -92,6 +206,36 @@ pub fn load_manifest(toml_text: &str) -> Result<CheckManifest, CheckError> {
     }
     if observation_kind_for_match(&m.match_on).is_none() {
         return Err(CheckError::UnknownMatch(m.match_on.clone()));
+    }
+    if !m.test.is_declared() {
+        return Err(CheckError::Invalid(format!(
+            "check {}: missing [test] with fires_on and/or silent_on fixtures",
+            m.id.as_str()
+        )));
+    }
+    if m.test.silent_on.is_empty() {
+        return Err(CheckError::Invalid(format!(
+            "check {}: [test].silent_on must list at least one negative fixture",
+            m.id.as_str()
+        )));
+    }
+    if m.test.fires_on.is_empty() && !m.is_anomark_rule() {
+        return Err(CheckError::Invalid(format!(
+            "check {}: [test].fires_on must list at least one positive fixture",
+            m.id.as_str()
+        )));
+    }
+    if !m.is_anomark_rule() && !m.test.fires_on.is_empty() && m.test.expect.is_empty() {
+        return Err(CheckError::Invalid(format!(
+            "check {}: [test.expect] must declare title_contains and/or evidence",
+            m.id.as_str()
+        )));
+    }
+    if matches!(m.test.source, CheckTestSource::Inject) && m.test.expect.evidence.is_empty() {
+        return Err(CheckError::Invalid(format!(
+            "check {}: source=inject requires nonempty [test.expect.evidence]",
+            m.id.as_str()
+        )));
     }
     Ok(m)
 }
@@ -147,6 +291,8 @@ pub fn observation_kind_for_match(match_on: &str) -> Option<&'static str> {
         "timestomp" => "timestomp",
         "ioc_hit" => "ioc_hit",
         "container" => "container",
+        // Post-scan Markov scoring — never matched against observations.
+        "anomark" => "anomark",
         _ => return None,
     })
 }
@@ -177,6 +323,7 @@ pub fn default_collectors_for_match(match_on: &str) -> Vec<CollectorId> {
         "mount" => vec![CollectorId::MOUNT_ANOMALY],
         "container" | "container_info" => vec![CollectorId::CONTAINER_ESCAPE],
         "ssh_host_key" | "policy" | "recon" => vec![],
+        "anomark" => vec![CollectorId::PROCESS_INVENTORY],
         _ => vec![],
     }
 }

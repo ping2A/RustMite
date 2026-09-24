@@ -573,20 +573,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_store_flusher(store.clone(), clickhouse_arc.clone());
 
     if let Some(ch) = clickhouse_arc.clone() {
-        // Restore AnoMark auto-config + push any on-disk virtual ingest / models into ClickHouse.
-        match rustmite_server::platform_ch::restore_anomark_auto(ch.as_ref()).await {
-            Some(v) => {
-                if let Ok(cfg) =
-                    serde_json::from_value::<rustmite_server::anomark_api::AnoMarkAutoConfig>(v)
-                {
-                    // Applied after AppState is built — stash for now via file write.
-                    let auto = rustmite_server::anomark_api::AnoMarkAutoStore::load();
-                    let _ = auto.set(cfg);
-                    tracing::info!("AnoMark auto-config restored from ClickHouse");
-                }
-            }
-            None => {}
-        }
+        // Push on-disk virtual ingest / sift platform into ClickHouse.
         let _ = rustmite_server::platform_ch::restore_sift_db(ch.as_ref()).await;
         if let Ok(hosts) = store.list_hosts().await {
             for h in hosts {
@@ -714,7 +701,6 @@ async fn main() -> anyhow::Result<()> {
         probe_limits,
         host_health,
         sift_platform: rustmite_server::sift_platform::SiftPlatform::default(),
-        anomark_auto: rustmite_server::anomark_api::AnoMarkAutoStore::load(),
         virtual_agents: rustmite_server::virtual_agents::VirtualAgentStore::load_or_create(
             ".dev/virtual-agents.json",
         ),

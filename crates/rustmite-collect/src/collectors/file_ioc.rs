@@ -25,6 +25,7 @@ const SCAN_ROOTS: &[&str] = &[
     "tmp",
     "var/tmp",
     "dev/shm",
+    "dev",
     "home",
     "opt",
     "root",
@@ -76,6 +77,40 @@ impl Collector for FileIocCollector {
                         path: PathBytes::from(display),
                         ioc_kind: "path".into(),
                         ioc_value: (*ioc).into(),
+                        severity: Severity::High,
+                    }),
+                )?;
+                count = count.saturating_add(1);
+            }
+        }
+
+        // Optional hash/string IOC feed for fixtures / lab packs.
+        if let Ok(data) = ctx
+            .fs
+            .read("etc/rustmite/iocs.ndjson")
+            .or_else(|_| ctx.proc.read("etc/rustmite/iocs.ndjson"))
+        {
+            for line in String::from_utf8_lossy(&data).lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let kind = v.get("ioc_kind").and_then(|x| x.as_str()).unwrap_or("");
+                let value = v.get("ioc_value").and_then(|x| x.as_str()).unwrap_or("");
+                let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("/ioc");
+                if kind.is_empty() || value.is_empty() {
+                    continue;
+                }
+                emit(
+                    ctx,
+                    sink,
+                    Observation::IocHit(IocHitObs {
+                        path: PathBytes::from(path),
+                        ioc_kind: kind.into(),
+                        ioc_value: value.into(),
                         severity: Severity::High,
                     }),
                 )?;
@@ -150,8 +185,11 @@ fn file_meta_if_interesting(rel: &str, st: &Statx) -> Option<FileMetaObs> {
     let setgid = mode & 0o2000 != 0;
     let world_writable = mode & 0o002 != 0;
     let executable = mode & 0o111 != 0;
-    // Emit setuid/setgid always; also world-writable executables (RM-POL-0032).
-    if !(setuid || setgid || (world_writable && executable)) {
+    let under_dev = rel == "dev" || rel.starts_with("dev/");
+    let large_under_dev = under_dev && !rel.starts_with("dev/shm") && st.is_reg && st.size > 4096;
+    // Emit setuid/setgid always; also world-writable executables (RM-POL-0032);
+    // also oversized regular files under /dev (RM-FILE-0010).
+    if !(setuid || setgid || (world_writable && executable) || large_under_dev) {
         return None;
     }
     let display = format!("/{}", rel.trim_start_matches('/'));

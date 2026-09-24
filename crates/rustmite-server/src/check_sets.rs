@@ -269,6 +269,7 @@ pub fn default_plans(engine: &CheckEngine) -> BTreeMap<String, Vec<String>> {
             .manifests()
             .iter()
             .filter(|m| m.enabled)
+            .filter(|m| !m.is_anomark_rule())
             .filter(|m| {
                 let req = m.required_collectors();
                 !req.is_empty() && req.iter().all(|c| cols.contains(c.as_str()))

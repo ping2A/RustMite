@@ -15,3 +15,11 @@ evidence_fields = ["username", "path", "fingerprint", "key_type"]
 attack = ["T1021.004", "T1078"]
 rationale = "Expression check is disabled; rustmite_checks::correlate_ssh_key_graph emits RM-INC-0004 when a fingerprint appears on multiple hosts."
 collectors = ["ssh.keys"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "correlate"
+
+[test.expect]
+title_contains = "SSH key"

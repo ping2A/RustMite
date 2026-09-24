@@ -45,12 +45,41 @@ impl Collector for DirHiddenCollector {
                     sink,
                     Observation::DirAnomaly(DirAnomalyObs {
                         path: PathBytes::from_str(wire),
-                        anomaly: String::from("nlink_mismatch"),
-                        detail,
-                        confidence: Confidence::High,
-                    }),
-                )?;
-                count = count.saturating_add(1);
+                    // Catalog rules historically used link_count_mismatch; keep that name.
+                    anomaly: String::from("link_count_mismatch"),
+                    detail,
+                    confidence: Confidence::High,
+                }),
+            )?;
+            count = count.saturating_add(1);
+            }
+            // Dotdir stash under staging roots.
+            if let Ok(ents) = list_entries(ctx, rel) {
+                for ent in ents {
+                    if ent.is_dot_or_dotdot() {
+                        continue;
+                    }
+                    let name = String::from_utf8_lossy(&ent.name);
+                    if !name.starts_with('.') {
+                        continue;
+                    }
+                    let child = format!("{rel}/{name}");
+                    if let Ok(st) = stat_path(ctx, &child) {
+                        if st.is_dir {
+                            emit(
+                                ctx,
+                                sink,
+                                Observation::DirAnomaly(DirAnomalyObs {
+                                    path: PathBytes::from_str(&format!("{wire}/{name}")),
+                                    anomaly: String::from("dotdir_stash"),
+                                    detail: format!("hidden directory under {wire}"),
+                                    confidence: Confidence::Medium,
+                                }),
+                            )?;
+                            count = count.saturating_add(1);
+                        }
+                    }
+                }
             }
         }
 

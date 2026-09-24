@@ -1,0 +1,3 @@
+name = "memfd-exec"
+description = "Process with memfd/deleted exe (fileless)"
+expected_checks = ["RM-PROC-0004", "RM-PROC-0005", "RM-PROC-0006"]

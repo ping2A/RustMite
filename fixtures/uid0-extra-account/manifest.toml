@@ -1,0 +1,3 @@
+name = "uid0-extra-account"
+description = "Extra UID 0 account besides root"
+expected_checks = ["RM-USER-0001"]

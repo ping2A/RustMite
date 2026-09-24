@@ -14,3 +14,11 @@ title = "Orphan eBPF program id {{bpf_prog.id}} ({{bpf_prog.prog_type}})"
 evidence_fields = ["id", "prog_type", "name", "tag", "orphan"]
 attack = ["T1014"]
 rationale = "Kernel-listed eBPF programs without an owning userspace process may hide traffic or processes."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Orphan eBPF"

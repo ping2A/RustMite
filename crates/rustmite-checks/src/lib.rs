@@ -18,7 +18,7 @@ pub use error::CheckError;
 pub use key_graph::{correlate_ssh_key_graph, KeyPlacement};
 pub use manifest::{
     default_collectors_for_match, load_dir, load_manifest, match_observation, union_collectors,
-    CheckManifest,
+    AnomarkRuleOptions, CheckManifest, CheckTestExpect, CheckTestSource, CheckTestSpec,
 };
 
 #[cfg(test)]
@@ -75,6 +75,17 @@ where = '''
 title = "Process '{{process.comm}}' masquerades as a kernel thread"
 evidence_fields = ["pid", "comm", "exe"]
 attack = ["T1014", "T1036"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "kernel thread"
+
+[test.expect.evidence]
+comm = "[kthreadd]"
 "#;
         let m = load_manifest(toml).expect("parse");
         assert_eq!(m.id.as_str(), "RM-PROC-0007");
@@ -102,6 +113,17 @@ where = '''
 title = "Process '{{process.comm}}' masquerades as a kernel thread"
 evidence_fields = ["pid", "comm", "exe"]
 attack = ["T1014"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "kernel"
+
+[test.expect.evidence]
+comm = "[kthreadd]"
 "#;
         let engine = CheckEngine::from_manifests(vec![load_manifest(toml).unwrap()]).unwrap();
         let obs = vec![
@@ -137,6 +159,17 @@ where = '''
 title = "hit"
 evidence_fields = ["pid"]
 attack = []
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "hit"
+
+[test.expect.evidence]
+pid = 7
 "#;
         assert!(CheckEngine::from_toml(toml).unwrap().evaluate(&[sample_process("[x]", Some("/t"))]).is_empty());
         let engine = CheckEngine::from_toml_for_test(toml).unwrap();
@@ -159,6 +192,17 @@ where = "hidden_process.passes_confirmed >= 2"
 title = "Hidden process pid {{hidden_process.pid}}"
 evidence_fields = ["pid", "comm"]
 attack = ["T1014"]
+
+[test]
+fires_on = ["diamorphine-hidden-pid"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Hidden process"
+
+[test.expect.evidence]
+pid = 404
 "#;
         let engine = CheckEngine::from_manifests(vec![load_manifest(toml).unwrap()]).unwrap();
         let obs = vec![Observation::HiddenProcess(HiddenProcessObs {

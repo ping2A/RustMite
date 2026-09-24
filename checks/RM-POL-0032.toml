@@ -19,3 +19,11 @@ title = "World-writable binary in PATH: {{file_meta.path}}"
 evidence_fields = ["path", "mode", "world_writable", "uid", "gid"]
 attack = []
 rationale = "World-writable executables on PATH allow local privilege escalation; noisy on some images — disabled by default."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "World-writable"

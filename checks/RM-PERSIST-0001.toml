@@ -18,3 +18,7 @@ rationale = "/etc/ld.so.preload is rarely legitimate and is a common userland ro
 [test]
 fires_on = ["diamorphine-hidden-pid"]
 silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "ld.so.preload"

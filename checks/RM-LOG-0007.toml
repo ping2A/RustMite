@@ -8,10 +8,19 @@ enabled = true
 cost = "trivial"
 match = "process"
 where = '''
-  process.environ_flags contains "HISTFILE=/dev/null"
+  process.environ_flags contains "HISTFILE_NULL"
+  or process.environ_flags contains "HISTFILE=/dev/null"
   or process.environ_flags contains "HISTFILE=null"
 '''
 title = "Process '{{process.comm}}' (pid {{process.pid}}) disables shell history"
 evidence_fields = ["pid", "comm", "environ_flags", "uid"]
 attack = ["T1070.003"]
 rationale = "Disabling HISTFILE on an interactive process hinders command-line forensics."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "disables shell history"

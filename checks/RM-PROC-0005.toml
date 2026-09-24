@@ -18,3 +18,7 @@ rationale = "Executable backed by memfd or anon_inode is a strong fileless-execu
 [test]
 fires_on = ["memfd-exec"]
 silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "memfd"

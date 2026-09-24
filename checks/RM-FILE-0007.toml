@@ -14,3 +14,14 @@ title = "Known-malicious hash at {{ioc_hit.path}}"
 evidence_fields = ["path", "ioc_kind", "ioc_value", "severity"]
 attack = []
 rationale = "File hash matches a configured malicious IOC feed entry."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Known-malicious hash"
+
+[test.expect.evidence]
+ioc_kind = "hash"

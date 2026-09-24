@@ -61,4 +61,38 @@ Local console (see `./dev.sh help`):
 ./dev.sh start
 ```
 
+## Docker
+
+### Use the image directly
+
+If you already have `rustmite:<version>.tar.gz` (or pulled from a registry):
+
+```bash
+# From a shared archive
+gunzip -c rustmite-0.1.0.tar.gz | docker load
+
+# Or from a registry
+# docker pull your-registry/rustmite:0.1.0
+
+docker run --rm -p 8080:8080 -p 8443:8443 rustmite:0.1.0
+# → http://127.0.0.1:8080/
+```
+
+Clean install (empty fleet). Stop with Ctrl+C. Persist data with a volume:
+
+```bash
+docker run --rm -p 8080:8080 -p 8443:8443 \
+  -v rustmite-data:/opt/rustmite/data \
+  rustmite:0.1.0
+```
+
+### Build & package (to share)
+
+```bash
+./scripts/share-image.sh
+# → dist/rustmite-<version>.tar.gz
+```
+
+Details: [`docker/share/README.md`](docker/share/README.md).
+
 

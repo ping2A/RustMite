@@ -46,6 +46,7 @@ impl Collector for ModulesLkmCollector {
                 .cloned()
                 .unwrap_or((None, None, Vec::new()));
 
+            let taint_flags = read_module_taint(ctx, &name);
             let obs = ModuleObs {
                 name: name.clone(),
                 size,
@@ -53,7 +54,7 @@ impl Collector for ModulesLkmCollector {
                 used_by,
                 in_sysfs,
                 in_proc_modules: in_proc,
-                taint_flags: None,
+                taint_flags,
             };
 
             if in_proc != in_sysfs {
@@ -107,6 +108,17 @@ fn parse_proc_modules(
 
 /// Loadable LKMs expose `/sys/module/<name>/initstate` (`live` / `coming` / `going`).
 /// Built-in modules have a sysfs directory but no `initstate` — exclude them.
+fn read_module_taint(ctx: &CollectCtx<'_>, name: &str) -> Option<String> {
+    let path = format!("sys/module/{name}/taint");
+    let data = ctx.proc.read(&path).ok().or_else(|| ctx.fs.read(&path).ok())?;
+    let s = String::from_utf8_lossy(&data).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 fn list_loadable_sys_modules(ctx: &CollectCtx<'_>) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     let Ok(ents) = ctx.proc.list_dir_raw("sys/module") else {

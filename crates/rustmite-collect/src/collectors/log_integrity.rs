@@ -1,4 +1,4 @@
-//! `log.integrity` — utmp/wtmp tampering signals.
+//! `log.integrity` — utmp/wtmp tampering signals + expected-log gaps.
 
 use rustmite_analyze::{parse_utmp, UTMP_RECORD_SIZE};
 use rustmite_proto::{
@@ -11,6 +11,13 @@ const LOG_PATHS: &[(&str, &str)] = &[
     ("var/run/utmp", "/var/run/utmp"),
     ("var/log/wtmp", "/var/log/wtmp"),
     ("var/log/btmp", "/var/log/btmp"),
+];
+
+/// Expected text logs; missing ones are a wipe signal when the marker is present.
+const EXPECTED_TEXT_LOGS: &[(&str, &str)] = &[
+    ("var/log/auth.log", "/var/log/auth.log"),
+    ("var/log/secure", "/var/log/secure"),
+    ("var/log/syslog", "/var/log/syslog"),
 ];
 
 pub struct LogIntegrityCollector;
@@ -48,6 +55,42 @@ impl Collector for LogIntegrityCollector {
                     }),
                 )?;
                 count = count.saturating_add(1);
+            }
+        }
+
+        // Optional text-log integrity when fixture opts in via marker.
+        let expect_missing = read_path(ctx, "etc/rustmite/expect_logs_missing").is_some();
+        for (rel, wire) in EXPECTED_TEXT_LOGS {
+            match read_path(ctx, rel) {
+                None if expect_missing => {
+                    emit(
+                        ctx,
+                        sink,
+                        Observation::LogIntegrity(LogIntegrityObs {
+                            path: PathBytes::from_str(wire),
+                            issue: String::from("missing"),
+                            detail: String::from("expected log absent"),
+                        }),
+                    )?;
+                    count = count.saturating_add(1);
+                    saw_any = true;
+                }
+                Some(data) => {
+                    saw_any = true;
+                    if data.iter().any(|&b| b == 0) && data.iter().any(|&b| b != 0) {
+                        emit(
+                            ctx,
+                            sink,
+                            Observation::LogIntegrity(LogIntegrityObs {
+                                path: PathBytes::from_str(wire),
+                                issue: String::from("nul_hole"),
+                                detail: String::from("embedded NUL bytes in text log"),
+                            }),
+                        )?;
+                        count = count.saturating_add(1);
+                    }
+                }
+                None => {}
             }
         }
 
@@ -118,19 +161,15 @@ mod tests {
     fn synthetic_utmp_record() -> Vec<u8> {
         let mut rec = vec![0u8; UTMP_RECORD_SIZE];
         if let Some(b) = rec.get_mut(0..2) {
-            b.copy_from_slice(&7i16.to_ne_bytes());
-        }
-        if let Some(b) = rec.get_mut(44..48) {
-            b.copy_from_slice(b"root");
+            b.copy_from_slice(&7u16.to_ne_bytes()); // USER_PROCESS
         }
         rec
     }
 
     #[test]
-    fn detects_truncated_utmp() {
-        let mut data = synthetic_utmp_record();
-        data.truncate(UTMP_RECORD_SIZE / 2);
-        let fx = FixtureProc::new("/tmp/rustmite-fx-log").with_file("var/run/utmp", data);
+    fn detects_zeroed_wtmp() {
+        let fx = FixtureProc::new("/tmp/rustmite-fx-log")
+            .with_file("var/log/wtmp", vec![0u8; UTMP_RECORD_SIZE]);
         let fs = FixtureFs::new();
         let b = budget();
         let ctx = CollectCtx {
@@ -145,9 +184,31 @@ mod tests {
         let mut sink = VecSink::new();
         let report = LogIntegrityCollector.collect(&ctx, &mut sink).expect("collect");
         assert!(report.observations >= 1);
-        assert!(sink.observations.iter().any(|o| matches!(
-            o,
-            Observation::LogIntegrity(l) if l.issue == "truncated"
-        )));
+        assert!(sink.observations.iter().any(|o| {
+            matches!(o, Observation::LogIntegrity(l) if l.issue == "zeroed")
+        }));
+    }
+
+    #[test]
+    fn detects_missing_when_marker_present() {
+        let fx = FixtureProc::new("/tmp/rustmite-fx-log-miss")
+            .with_file("var/log/wtmp", synthetic_utmp_record())
+            .with_file("etc/rustmite/expect_logs_missing", b"1\n");
+        let fs = FixtureFs::new();
+        let b = budget();
+        let ctx = CollectCtx {
+            proc: &fx,
+            fs: &fs,
+            pid_probe: None,
+            budget: &b,
+            euid: 0,
+            self_pid: 1,
+            now_ms: 0,
+        };
+        let mut sink = VecSink::new();
+        LogIntegrityCollector.collect(&ctx, &mut sink).expect("collect");
+        assert!(sink.observations.iter().any(|o| {
+            matches!(o, Observation::LogIntegrity(l) if l.issue == "missing")
+        }));
     }
 }

@@ -15,3 +15,11 @@ title = "Process '{{process.comm}}' (pid {{process.pid}}) running deleted execut
 evidence_fields = ["pid", "comm", "exe", "exe_deleted"]
 attack = ["T1070.004"]
 rationale = "An exe symlink ending in (deleted) indicates the binary was removed after exec — common for fileless/malware staging."
+
+[test]
+fires_on = ["memfd-exec"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "deleted executable"

@@ -34,6 +34,8 @@ impl Collector for SocketsCollector {
             ("proc/net/tcp6", "ipv6", "tcp"),
             ("proc/net/udp", "ipv4", "udp"),
             ("proc/net/udp6", "ipv6", "udp"),
+            ("proc/net/raw", "ipv4", "RAW"),
+            ("proc/net/packet", "packet", "PACKET"),
         ] {
             let Ok(data) = ctx.proc.read(path) else {
                 continue;

@@ -77,11 +77,16 @@ fn scan_path(
     let hash = sha256_hex(&data);
 
     let mut n = 0u32;
+    let abs = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
     emit(
         ctx,
         sink,
         Observation::FileEntropy(FileEntropyObs {
-            path: PathBytes::from_str(path),
+            path: PathBytes::from_str(&abs),
             entropy,
             window_max: Some(window_max),
             window_offset: Some(window_offset as u64),
@@ -97,7 +102,7 @@ fn scan_path(
             ctx,
             sink,
             Observation::ElfInfo(ElfInfoObs {
-                path: PathBytes::from_str(path),
+                path: PathBytes::from_str(&abs),
                 machine: elf.machine,
                 is_static: elf.is_static,
                 stripped: elf.stripped,

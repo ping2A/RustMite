@@ -948,22 +948,28 @@ fn score_one_command_against_model(
     machine_name: Option<&str>,
     suspect_percent: f64,
 ) -> Result<AnoMarkCommandScore, Box<dyn Error>> {
+    let scores = score_commands_against_model(
+        model_path,
+        source,
+        train_id,
+        &[(machine_name, command)],
+        suspect_percent,
+    )?;
+    scores
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no score returned".into())
+}
+
+/// Load the model once and score many `(machine, command)` pairs. Empty commands are skipped.
+fn score_commands_against_model(
+    model_path: &Path,
+    source: &str,
+    train_id: Option<String>,
+    commands: &[(Option<&str>, &str)],
+    suspect_percent: f64,
+) -> Result<Vec<AnoMarkCommandScore>, Box<dyn Error>> {
     const MAX_CMD: usize = 32 * 1024;
-    if command.len() > MAX_CMD {
-        return Err(format!("command exceeds {} characters", MAX_CMD).into());
-    }
-    let trimmed = command.trim();
-    let machine_trim = machine_name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("");
-    let scored_line = anomark_score_line(machine_trim, trimmed);
-    if scored_line.is_empty() {
-        return Err("command is empty".into());
-    }
-    if scored_line.len() > MAX_CMD {
-        return Err(format!("scored line exceeds {} characters", MAX_CMD).into());
-    }
     if !model_path.is_file() {
         return Err(format!("model file not found: {}", model_path.display()).into());
     }
@@ -977,27 +983,49 @@ fn score_one_command_against_model(
     }
     let pct = clamp_anomark_suspect_percent(suspect_percent);
     let threshold_ln = ModelHandler::compute_threshold(&model, pct);
-    let padded = format!("{}{}", "~".repeat(model.order), scored_line);
-    let log_likelihood = model.log_likelihood(&padded);
-    let is_suspect = ModelHandler::is_suspect_command(log_likelihood, threshold_ln);
-    let margin_ln = log_likelihood - threshold_ln;
     let canonical = model_path
         .canonicalize()
         .unwrap_or_else(|_| model_path.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    Ok(AnoMarkCommandScore {
-        model_path: canonical,
-        source: source.to_string(),
-        train_id,
-        order: model.order,
-        log_likelihood,
-        suspect_threshold_ln: threshold_ln,
-        is_suspect,
-        margin_ln,
-        suspect_percent_used: pct,
-        line_scored: scored_line,
-    })
+    let order = model.order;
+    let pad = "~".repeat(order);
+
+    let mut out = Vec::with_capacity(commands.len());
+    for &(machine_name, command) in commands {
+        if command.len() > MAX_CMD {
+            return Err(format!("command exceeds {} characters", MAX_CMD).into());
+        }
+        let trimmed = command.trim();
+        let machine_trim = machine_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let scored_line = anomark_score_line(machine_trim, trimmed);
+        if scored_line.is_empty() {
+            continue;
+        }
+        if scored_line.len() > MAX_CMD {
+            return Err(format!("scored line exceeds {} characters", MAX_CMD).into());
+        }
+        let padded = format!("{}{}", pad, scored_line);
+        let log_likelihood = model.log_likelihood(&padded);
+        let is_suspect = ModelHandler::is_suspect_command(log_likelihood, threshold_ln);
+        let margin_ln = log_likelihood - threshold_ln;
+        out.push(AnoMarkCommandScore {
+            model_path: canonical.clone(),
+            source: source.to_string(),
+            train_id: train_id.clone(),
+            order,
+            log_likelihood,
+            suspect_threshold_ln: threshold_ln,
+            is_suspect,
+            margin_ln,
+            suspect_percent_used: pct,
+            line_scored: scored_line,
+        });
+    }
+    Ok(out)
 }
 
 /// Score a single command line against an AnoMark model (same suspect rule as fleet scoring).
@@ -1998,83 +2026,36 @@ impl PlatformStore {
         train_id: Option<&str>,
         suspect_percent: f64,
     ) -> Result<AnoMarkCommandScore, Box<dyn Error>> {
-        const MAX_CMD: usize = 32 * 1024;
-        if command.len() > MAX_CMD {
-            return Err(format!("command exceeds {} characters", MAX_CMD).into());
-        }
-        let trimmed = command.trim();
-        let machine_trim = machine_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
-        let scored_line = anomark_score_line(machine_trim, trimmed);
-        if scored_line.is_empty() {
-            return Err("command is empty".into());
-        }
-        if scored_line.len() > MAX_CMD {
-            return Err(format!("scored line exceeds {} characters", MAX_CMD).into());
-        }
+        let mut scores = self.score_anomark_commands(
+            &[(machine_name, command)],
+            train_id,
+            suspect_percent,
+        )?;
+        scores
+            .pop()
+            .ok_or_else(|| "command is empty".into())
+    }
 
-        let pct = clamp_anomark_suspect_percent(suspect_percent);
-
-        let tid = train_id.map(str::trim).filter(|s| !s.is_empty());
-
-        let (path, source, stored_id): (PathBuf, String, Option<String>) = if let Some(id) = tid {
-            let p = self.anomark_train_stored_model_path(id).ok_or_else(|| {
-                format!(
-                    "no model file for training {} (refresh the list or train again)",
-                    id
-                )
-            })?;
-            (p, "training".to_string(), Some(id.to_string()))
-        } else {
-            let cfg = self.get_anomark_settings();
-            let p = cfg.model_path.trim();
-            if p.is_empty() {
-                return Err(
-                    "AnoMark model path is empty — set it in AnoMark settings or pick a saved training"
-                        .into(),
-                );
-            }
-            let path = self.resolve_anomark_model_path(p).ok_or_else(|| {
-                format!(
-                    "AnoMark model file not found for settings path {:?} (use an absolute path or one relative to the platform directory next to db.json)",
-                    p
-                )
-            })?;
-            (path, "platform".to_string(), None)
-        };
-
-        if !path.is_file() {
-            return Err(format!("model file not found: {}", path.display()).into());
+    /// Score many commands against one model load (much faster than calling
+    /// [`Self::score_anomark_command`] per line). Each pair is `(optional machine label, command)`.
+    /// Empty commands are skipped.
+    pub fn score_anomark_commands(
+        &self,
+        commands: &[(Option<&str>, &str)],
+        train_id: Option<&str>,
+        suspect_percent: f64,
+    ) -> Result<Vec<AnoMarkCommandScore>, Box<dyn Error>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
         }
-        let path_str = path
-            .to_str()
-            .ok_or("model path is not valid UTF-8")?;
-        let mut model =
-            ModelHandler::load_model(path_str).map_err(|e: anyhow::Error| e.to_string())?;
-        if !model.is_trained() {
-            model.normalize_model_and_compute_prior();
-        }
-        let threshold_ln = ModelHandler::compute_threshold(&model, pct);
-        let padded = format!("{}{}", "~".repeat(model.order), scored_line);
-        let log_likelihood = model.log_likelihood(&padded);
-        let is_suspect = ModelHandler::is_suspect_command(log_likelihood, threshold_ln);
-        let margin_ln = log_likelihood - threshold_ln;
-        let model_path = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.clone())
-            .to_string_lossy()
-            .to_string();
-        Ok(AnoMarkCommandScore {
-            model_path,
-            source,
-            train_id: stored_id,
-            order: model.order,
-            log_likelihood,
-            suspect_threshold_ln: threshold_ln,
-            is_suspect,
-            margin_ln,
-            suspect_percent_used: pct,
-            line_scored: scored_line,
-        })
+        let (path, source, stored_id) = self.resolve_anomark_model_for_test(None, train_id)?;
+        score_commands_against_model(
+            &path,
+            &source,
+            stored_id,
+            commands,
+            suspect_percent,
+        )
     }
 
     pub fn get_run(&self, id: &str) -> Option<DetectionRunRecord> {

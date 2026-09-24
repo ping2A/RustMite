@@ -22,3 +22,11 @@ users' /proc/*/fd tables — those leave owning_pid null without owner_unresolve
 must not alert.
 '''
 collectors = ["decloak.socket", "net.sockets"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "no visible owner"

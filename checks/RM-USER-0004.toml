@@ -13,3 +13,11 @@ evidence_fields = ["username", "uid", "shell", "home"]
 attack = ["T1136"]
 rationale = "Accounts absent from the signed baseline indicate drift; evaluated by the baseline diff engine and server-side enrichment."
 collectors = ["persistence.accounts"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "correlate"
+
+[test.expect]
+title_contains = "New account"

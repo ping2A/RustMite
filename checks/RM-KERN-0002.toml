@@ -18,3 +18,14 @@ title = "Out-of-tree/unsigned module '{{module.name}}' (taint {{module.taint_fla
 evidence_fields = ["name", "taint_flags", "size", "in_proc_modules"]
 attack = ["T1547.006"]
 rationale = "Taint flags E/O indicate proprietary or out-of-tree modules that warrant review."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Out-of-tree"
+
+[test.expect.evidence]
+name = "ootmod"

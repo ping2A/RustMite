@@ -14,3 +14,14 @@ title = "Host could not be inspected with full-fidelity probe: {{policy.detail}}
 evidence_fields = ["code", "detail", "severity"]
 attack = []
 rationale = "Method D pure-command fallback cannot perform differential syscall checks; raise so operators know coverage is degraded."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "full-fidelity"
+
+[test.expect.evidence]
+code = "RM-POL-0021"

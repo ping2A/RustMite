@@ -9,8 +9,20 @@ cost = "low"
 match = "dir_anomaly"
 where = '''
   dir_anomaly.anomaly == "link_count_mismatch"
+  or dir_anomaly.anomaly == "nlink_mismatch"
 '''
 title = "Hidden directory suspected at {{dir_anomaly.path}}"
 evidence_fields = ["path", "anomaly", "detail", "confidence"]
 attack = ["T1014"]
 rationale = "Parent link count exceeding listed subdirectories may indicate hidden entries."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "Hidden directory"
+
+[test.expect.evidence]
+anomaly = "link_count_mismatch"

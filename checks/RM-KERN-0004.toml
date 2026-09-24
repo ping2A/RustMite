@@ -14,3 +14,14 @@ title = "Known rootkit module name '{{module.name}}'"
 evidence_fields = ["name", "in_sysfs", "in_proc_modules", "taint_flags"]
 attack = ["T1014"]
 rationale = "Module name matches a known rootkit or hiding kit signature."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "rootkit module"
+
+[test.expect.evidence]
+name = "diamorphine"

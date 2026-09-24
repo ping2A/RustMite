@@ -8,10 +8,25 @@ enabled = true
 cost = "low"
 match = "log_integrity"
 where = '''
-  log_integrity.issue contains "wtmp"
-  or log_integrity.issue contains "utmp"
+  (log_integrity.path contains "wtmp" or log_integrity.path contains "utmp")
+  and (
+    log_integrity.issue == "zeroed"
+    or log_integrity.issue == "out_of_order"
+    or log_integrity.issue == "truncated"
+  )
 '''
 title = "Login record integrity issue: {{log_integrity.path}} ({{log_integrity.issue}})"
 evidence_fields = ["path", "issue", "detail"]
 attack = ["T1070.002"]
 rationale = "Zeroed or out-of-order utmp/wtmp records may indicate login history wiping."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Login record"
+
+[test.expect.evidence]
+issue = "zeroed"

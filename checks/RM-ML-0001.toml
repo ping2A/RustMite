@@ -1,0 +1,32 @@
+id = "RM-ML-0001"
+version = 1
+name = "AnoMark suspect commands"
+type = "custom"
+severity = "high"
+confidence = "medium"
+enabled = false
+cost = "low"
+match = "anomark"
+where = "false"
+title = "AnoMark flagged suspect commands on this host"
+evidence_fields = ["suspects", "scored", "model_id", "suspect_percent", "sample"]
+attack = ["T1059"]
+collectors = ["process.inventory"]
+rationale = """
+After a successful scan, score process command lines with a trained AnoMark Markov model.
+Enable this rule and add it to Pulse / Standard / Deep / Incident profiles to run automatically.
+Configure model, host tags, and suspect percentile under [anomark].
+"""
+false_positives = "Benign rare admin tooling or one-off maintenance commands may score below the threshold; raise suspect_percent or train on a broader baseline."
+
+[anomark]
+# Empty model_id → platform default AnoMark model path.
+model_id = ""
+suspect_percent = 95.0
+# Empty tags → all hosts. Otherwise every listed tag must match the host.
+tags = []
+max_commands = 5000
+
+[test]
+fires_on = []
+silent_on = ["clean-ubuntu2204"]

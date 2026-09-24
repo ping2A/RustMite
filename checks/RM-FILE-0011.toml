@@ -19,3 +19,15 @@ title = "Immutable file in staging path {{file_meta.path}}"
 evidence_fields = ["path", "immutable", "mode", "uid"]
 attack = ["T1222"]
 rationale = "Immutable bits on files in writable staging directories may hinder incident cleanup."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "Immutable"
+
+[test.expect.evidence]
+path = "/tmp/immut"
+immutable = true

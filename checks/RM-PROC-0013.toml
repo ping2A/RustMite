@@ -19,3 +19,11 @@ title = "Process '{{process.comm}}' (pid {{process.pid}}) cwd {{process.cwd}}"
 evidence_fields = ["pid", "comm", "cwd", "exe", "root"]
 attack = ["T1059"]
 rationale = "Processes with working directories under staging paths are often dropper shells or malware."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "cwd"

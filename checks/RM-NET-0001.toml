@@ -14,3 +14,14 @@ title = "Hidden {{hidden_socket.protocol}} socket on port {{hidden_socket.local_
 evidence_fields = ["inode", "local_port", "protocol", "sources_present", "sources_absent", "confidence"]
 attack = ["T1014"]
 rationale = "Socket visible via sock_diag but absent from /proc/net (or vice versa) indicates socket hiding."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "Hidden"
+
+[test.expect.evidence]
+local_port = 31337

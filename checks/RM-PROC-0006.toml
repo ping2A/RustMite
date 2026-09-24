@@ -40,3 +40,11 @@ evidence_fields = ["pid", "comm", "exe", "cmdline"]
 attack = ["T1036"]
 rationale = "Comm diverging from exe basename outside trusted system paths may indicate masquerading. Ignores TASK_COMM_LEN truncation, systemd '(name)' comms, interpreter wrappers, and reverse-prefix renames (e.g. pipewire-pulse)."
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["memfd-exec"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "comm does not match"

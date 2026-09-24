@@ -14,3 +14,14 @@ title = "Expected log missing: {{log_integrity.path}}"
 evidence_fields = ["path", "issue", "detail"]
 attack = ["T1070.002"]
 rationale = "Missing expected log files may indicate deliberate removal."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Expected log missing"
+
+[test.expect.evidence]
+issue = "missing"

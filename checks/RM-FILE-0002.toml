@@ -16,3 +16,11 @@ title = "Packed or anomalous ELF at {{elf_info.path}}"
 evidence_fields = ["path", "has_rwx_segment", "packer_hints", "section_count", "machine"]
 attack = ["T1027.002"]
 rationale = "RWX segments and known packer section/name fingerprints indicate packed malware."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Packed"

@@ -50,13 +50,20 @@ This lets the decloak collector produce a `HiddenProcess` observation determinis
 An `xtask record` helper snapshots a live (clean) host's `/proc`/`/sys`/relevant `/etc` into a fixture (secrets scrubbed) to build realistic negative fixtures across distros/kernels.
 
 ## 3. Check-manifest tests
-Every check in the catalog (`11`) declares fixtures:
+Every check in the catalog declares fixtures:
 ```toml
 [test]
 fires_on = ["diamorphine-hidden-pid"]
-silent_on = ["clean-ubuntu2204","clean-centos7","clean-embedded-armv7"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"   # collector | correlate | inject
+
+[test.expect]
+title_contains = "Hidden process"
+
+[test.expect.evidence]
+pid = 31337
 ```
-CI asserts: the check fires on each positive fixture, and does **not** fire on any negative fixture. A new check without both is rejected. A change that makes a check fire on a clean fixture (false positive) fails CI.
+CI asserts: the check fires on each positive fixture with matching `[test.expect]`, and does **not** fire on any negative fixture. Prefer `source = "collector"` (fixture trees scanned by collectors). Use `correlate` for post-scan graph/drift rules and `inject` only when a collector cannot yet emit the observation — inject files require `allow_inject = true` and schema-validate through `Observation` serde. AnoMark post-scan is the exception for empty `fires_on`. A change that makes a check fire on a clean fixture (false positive) fails CI.
 
 ## 4. Property & fuzz testing (`proptest` + `cargo-fuzz`)
 Mandatory fuzz targets (attacker-controlled inputs):

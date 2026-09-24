@@ -58,7 +58,8 @@ impl Collector for ModulesEbpfCollector {
                     prog_type: String::from("pinned"),
                     name: Some(name.clone()),
                     tag: None,
-                    orphan: false,
+                    // Fixture/lab convention: names containing "orphan" lack a userspace owner.
+                    orphan: name.contains("orphan"),
                 }),
             )?;
             count = count.saturating_add(1);

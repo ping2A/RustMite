@@ -21,3 +21,11 @@ title = "High-entropy ELF at {{file_entropy.path}} (entropy {{file_entropy.entro
 evidence_fields = ["path", "entropy", "is_elf", "sha256"]
 attack = ["T1027.002"]
 rationale = "Packed or encrypted ELF payloads often show Shannon entropy above ~7.2."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "High-entropy ELF"

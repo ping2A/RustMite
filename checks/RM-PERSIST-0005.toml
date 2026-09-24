@@ -18,3 +18,11 @@ title = "systemd unit {{service.name}} ExecStart uses staging path"
 evidence_fields = ["name", "path", "exec_start", "unit_type"]
 attack = ["T1543.002"]
 rationale = "Services executing binaries from /tmp or /dev/shm are rarely legitimate."
+
+[test]
+fires_on = ["m5-collectors"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "staging path"

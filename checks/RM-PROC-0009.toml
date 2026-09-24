@@ -15,3 +15,11 @@ title = "Process '{{process.comm}}' (pid {{process.pid}}) has LD_PRELOAD/LD_AUDI
 evidence_fields = ["pid", "comm", "environ_flags", "exe"]
 attack = ["T1574.006"]
 rationale = "LD_PRELOAD/LD_AUDIT on a live process is a strong userland hooking signal."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "LD_PRELOAD"

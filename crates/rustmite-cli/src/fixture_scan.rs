@@ -149,6 +149,10 @@ where = "hidden_process.passes_confirmed >= 2"
 title = "Hidden process pid {{hidden_process.pid}}"
 evidence_fields = ["pid", "comm", "passes_confirmed"]
 attack = ["T1014"]
+
+[test]
+fires_on = ["diamorphine-hidden-pid"]
+silent_on = ["clean-ubuntu2204"]
 "#,
     )
     .context("seed RM-PROC-0001")

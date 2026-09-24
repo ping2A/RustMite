@@ -19,3 +19,11 @@ title = "ELF in staging path {{file_entropy.path}}"
 evidence_fields = ["path", "is_elf", "entropy", "sha256"]
 attack = ["T1105"]
 rationale = "ELF binaries dropped under /tmp or /dev/shm are a common staging pattern."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "ELF in staging"

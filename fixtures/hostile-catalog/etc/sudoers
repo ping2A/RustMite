@@ -1,0 +1,2 @@
+bob ALL=(ALL) NOPASSWD:ALL
+Defaults SETENV

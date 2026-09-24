@@ -1,16 +1,19 @@
-//! Dedicated AnoMark multi-model APIs: train, list, apply to hosts, auto-run after scan.
+//! Dedicated AnoMark multi-model APIs: train, list, apply to hosts.
+//! Post-scan scoring is driven by Rules catalog checks with `[anomark]` / `match = "anomark"`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use rustmite_proto::Observation;
+use rustmite_proto::{
+    CheckId, Finding, FindingId, FindingStatus, HostId as ProtoHostId, Observation, ObservationRef,
+    ScanId,
+};
 use rustmite_sift::{
     process_obs_to_raw, AnoMarkTrainRequest, CreateDatasetRequest, CreateRunRequest, DatasetKind,
     RawLogEntry, RunDetectorMode,
@@ -23,96 +26,11 @@ use uuid::Uuid;
 use crate::routes::{ApiError, AppState};
 use crate::sift_api::load_virtual_jsonl;
 
-fn auto_config_path() -> PathBuf {
-    PathBuf::from(".dev/anomark-auto.json")
-}
-
-/// Auto-run AnoMark after successful scans.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnoMarkAutoConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Training id to use; empty = platform default model path.
-    #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default = "default_suspect")]
-    pub suspect_percent: f64,
-    /// Only run when scan check_set is in this list (empty = any).
-    #[serde(default)]
-    pub check_sets: Vec<String>,
-    /// Max process lines to score per host (protect large inventories).
-    #[serde(default = "default_max_cmds")]
-    pub max_commands: usize,
-    /// If non-empty, only these host ids run auto AnoMark.
-    #[serde(default)]
-    pub host_ids: Vec<Uuid>,
-    /// Soft tag match (all must match host labels / tags). Empty = any.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Exact label matches (e.g. env=prod). Empty = any.
-    #[serde(default)]
-    pub labels: BTreeMap<String, String>,
-    /// Restrict to agent kind (`ssh` / `virtual`). Empty = any.
-    #[serde(default)]
-    pub agent_kind: Option<String>,
-}
-
 fn default_suspect() -> f64 {
     95.0
 }
 fn default_max_cmds() -> usize {
     5_000
-}
-
-impl Default for AnoMarkAutoConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            model_id: None,
-            suspect_percent: 95.0,
-            check_sets: vec![
-                "standard".into(),
-                "deep".into(),
-                "incident".into(),
-                "virtual-import".into(),
-            ],
-            max_commands: 5_000,
-            host_ids: vec![],
-            tags: vec![],
-            labels: BTreeMap::new(),
-            agent_kind: None,
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct AnoMarkAutoStore(Arc<Mutex<AnoMarkAutoConfig>>);
-
-impl AnoMarkAutoStore {
-    pub fn load() -> Self {
-        let cfg = fs::read_to_string(auto_config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Self(Arc::new(Mutex::new(cfg)))
-    }
-
-    pub fn get(&self) -> AnoMarkAutoConfig {
-        self.0.lock().map(|g| g.clone()).unwrap_or_default()
-    }
-
-    pub fn set(&self, cfg: AnoMarkAutoConfig) -> Result<AnoMarkAutoConfig, String> {
-        let _ = fs::create_dir_all(".dev");
-        fs::write(
-            auto_config_path(),
-            serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        if let Ok(mut g) = self.0.lock() {
-            *g = cfg.clone();
-        }
-        Ok(cfg)
-    }
 }
 
 pub fn anomark_routes() -> Router<AppState> {
@@ -123,7 +41,6 @@ pub fn anomark_routes() -> Router<AppState> {
         .route("/v1/anomark/models/{id}/inspect", get(inspect_model))
         .route("/v1/anomark/score", post(score_command))
         .route("/v1/anomark/apply", post(apply_to_hosts))
-        .route("/v1/anomark/auto", get(get_auto).put(put_auto))
         .route("/v1/anomark/availability", get(availability))
 }
 
@@ -444,7 +361,12 @@ pub async fn inspect_model(
 
 #[derive(Debug, Deserialize)]
 pub struct ScoreBody {
-    pub command: String,
+    /// Single command (legacy / simple try).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// One or more command lines (batch try). Takes precedence when non-empty.
+    #[serde(default)]
+    pub commands: Vec<String>,
     #[serde(default)]
     pub machine: Option<String>,
     #[serde(default)]
@@ -458,15 +380,45 @@ pub async fn score_command(
     Json(body): Json<ScoreBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.sift_platform.get()?;
-    let score = store
-        .score_anomark_command(
-            &body.command,
-            body.machine.as_deref(),
+    let mut lines: Vec<String> = body
+        .commands
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        if let Some(c) = body.command.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(c.to_string());
+        }
+    }
+    if lines.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "command or commands required".into(),
+        ));
+    }
+    let machine = body.machine.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let pairs: Vec<(Option<&str>, &str)> = lines
+        .iter()
+        .map(|c| (machine, c.as_str()))
+        .collect();
+    let scores = store
+        .score_anomark_commands(
+            &pairs,
             body.model_id.as_deref(),
             body.suspect_percent,
         )
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(score))
+    if scores.len() == 1 {
+        return Ok(Json(serde_json::to_value(&scores[0]).unwrap_or_default()));
+    }
+    let suspects = scores.iter().filter(|s| s.is_suspect).count();
+    Ok(Json(serde_json::json!({
+        "batch": true,
+        "count": scores.len(),
+        "suspects": suspects,
+        "results": scores,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,32 +477,39 @@ async fn apply_anomark_inner(
     for id in &body.host_ids {
         let host = state.store.get_host(HostId(*id)).await?;
         let cmds = collect_host_commands(state, &host, body.inventory.trim()).await?;
+        let limited: Vec<String> = cmds
+            .into_iter()
+            .filter(|c| !c.trim().is_empty())
+            .take(body.max_commands.max(1))
+            .collect();
+        let pairs: Vec<(Option<&str>, &str)> = limited
+            .iter()
+            .map(|c| (Some(host.display_name.as_str()), c.as_str()))
+            .collect();
+        let scores = match platform.score_anomark_commands(
+            &pairs,
+            model_id,
+            body.suspect_percent,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, host = %host.display_name, "anomark batch score failed");
+                Vec::new()
+            }
+        };
+        let scored = scores.len();
         let mut suspects = 0usize;
-        let mut scored = 0usize;
         let mut sample = Vec::new();
-        for cmd in cmds.into_iter().take(body.max_commands.max(1)) {
-            match platform.score_anomark_command(
-                &cmd,
-                Some(&host.display_name),
-                model_id,
-                body.suspect_percent,
-            ) {
-                Ok(score) => {
-                    scored += 1;
-                    if score.is_suspect {
-                        suspects += 1;
-                        if sample.len() < 25 {
-                            sample.push(serde_json::json!({
-                                "command": cmd,
-                                "log_likelihood": score.log_likelihood,
-                                "threshold": score.suspect_threshold_ln,
-                                "margin_ln": score.margin_ln,
-                            }));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, host = %host.display_name, "anomark score failed");
+        for (cmd, score) in limited.iter().zip(scores.iter()) {
+            if score.is_suspect {
+                suspects += 1;
+                if sample.len() < 25 {
+                    sample.push(serde_json::json!({
+                        "command": cmd,
+                        "log_likelihood": score.log_likelihood,
+                        "threshold": score.suspect_threshold_ln,
+                        "margin_ln": score.margin_ln,
+                    }));
                 }
             }
         }
@@ -689,41 +648,20 @@ async fn sync_and_run_anomark(
     Ok(serde_json::json!({ "dataset_id": dataset.id, "run": run }))
 }
 
-pub async fn get_auto(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.anomark_auto.get())
-}
-
-pub async fn put_auto(
-    State(state): State<AppState>,
-    Json(body): Json<AnoMarkAutoConfig>,
-) -> Result<impl IntoResponse, ApiError> {
-    let cfg = state
-        .anomark_auto
-        .set(body)
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    if let Some(ch) = state.clickhouse.as_ref() {
-        if let Ok(v) = serde_json::to_value(&cfg) {
-            crate::platform_ch::sync_anomark_auto(ch, &v).await;
-        }
-    }
-    Ok(Json(cfg))
-}
-
-/// Fire-and-forget AnoMark apply after a successful scan (if auto-config enabled).
-pub fn spawn_post_scan_anomark(state: AppState, host_id: Uuid, check_set: &str) {
-    let cfg = state.anomark_auto.get();
-    if !cfg.enabled {
-        return;
-    }
-    if !cfg.check_sets.is_empty()
-        && !cfg
-            .check_sets
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(check_set))
-    {
-        return;
-    }
+/// Fire-and-forget AnoMark apply after a successful scan when enabled Rules
+/// with `match = "anomark"` / `[anomark]` are present in the scan profile.
+pub fn spawn_post_scan_anomark(
+    state: AppState,
+    host_id: Uuid,
+    scan_id: Uuid,
+    check_set: &str,
+) {
+    let check_set = check_set.to_string();
     tokio::spawn(async move {
+        let engine = state.checks.snapshot().await;
+        let resolved = state.check_sets.resolve(&check_set, &engine).await;
+        let in_set: HashSet<&str> = resolved.check_ids.iter().map(|s| s.as_str()).collect();
+
         let host = match state.store.get_host(HostId(host_id)).await {
             Ok(h) => h,
             Err(e) => {
@@ -731,57 +669,167 @@ pub fn spawn_post_scan_anomark(state: AppState, host_id: Uuid, check_set: &str) 
                 return;
             }
         };
-        if !auto_host_in_scope(&cfg, &host) {
+
+        let rules: Vec<_> = engine
+            .manifests()
+            .iter()
+            .filter(|m| m.enabled && m.is_anomark_rule() && in_set.contains(m.id.as_str()))
+            .cloned()
+            .collect();
+        if rules.is_empty() {
             return;
         }
-        let body = ApplyBody {
-            model_id: cfg.model_id.clone(),
-            host_ids: vec![host_id],
-            inventory: "1".into(),
-            suspect_percent: cfg.suspect_percent,
-            max_commands: cfg.max_commands,
-            fleet_run: false,
-        };
-        match apply_anomark_inner(&state, &body).await {
-            Ok(v) => {
-                let suspects = v
-                    .get("total_suspects")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                info!(
-                    host_id = %host_id,
-                    suspects,
-                    "post-scan AnoMark complete"
-                );
+
+        for rule in rules {
+            let opts = match rule.anomark_options() {
+                Some(o) => o,
+                None => continue,
+            };
+            if !host_matches_tags(&host, &opts.tags) {
+                continue;
             }
-            Err(e) => {
-                warn!(host_id = %host_id, error = %e.1, "post-scan AnoMark failed");
+            let model_id = opts
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let body = ApplyBody {
+                model_id: model_id.clone(),
+                host_ids: vec![host_id],
+                inventory: "1".into(),
+                suspect_percent: opts.suspect_percent,
+                max_commands: opts.max_commands.max(1),
+                fleet_run: false,
+            };
+            match apply_anomark_inner(&state, &body).await {
+                Ok(v) => {
+                    let suspects = v
+                        .get("total_suspects")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let scored = v
+                        .get("total_scored")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    info!(
+                        host_id = %host_id,
+                        check_id = %rule.id.as_str(),
+                        suspects,
+                        scored,
+                        "post-scan AnoMark rule complete"
+                    );
+                    if suspects > 0 {
+                        if let Err(e) = insert_anomark_finding(
+                            &state,
+                            &rule,
+                            host_id,
+                            scan_id,
+                            &v,
+                            model_id.as_deref(),
+                            opts.suspect_percent,
+                        )
+                        .await
+                        {
+                            warn!(
+                                host_id = %host_id,
+                                check_id = %rule.id.as_str(),
+                                error = %e,
+                                "post-scan AnoMark finding insert failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        host_id = %host_id,
+                        check_id = %rule.id.as_str(),
+                        error = %e.1,
+                        "post-scan AnoMark rule failed"
+                    );
+                }
             }
         }
     });
 }
 
-fn auto_host_in_scope(cfg: &AnoMarkAutoConfig, host: &HostRecord) -> bool {
-    if !cfg.host_ids.is_empty() && !cfg.host_ids.iter().any(|id| *id == host.id.0) {
-        return false;
-    }
-    if let Some(kind) = cfg.agent_kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if !host.agent_kind.eq_ignore_ascii_case(kind) {
-            return false;
-        }
-    }
-    if !cfg.labels.is_empty()
-        && !cfg
-            .labels
-            .iter()
-            .all(|(k, v)| host.labels.get(k).map(|x| x == v).unwrap_or(false))
-    {
-        return false;
-    }
-    if !cfg.tags.is_empty() && !host_matches_tags(host, &cfg.tags) {
-        return false;
-    }
-    true
+async fn insert_anomark_finding(
+    state: &AppState,
+    rule: &rustmite_checks::CheckManifest,
+    host_id: Uuid,
+    scan_id: Uuid,
+    apply_result: &serde_json::Value,
+    model_id: Option<&str>,
+    suspect_percent: f64,
+) -> Result<(), String> {
+    let suspects = apply_result
+        .get("total_suspects")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let scored = apply_result
+        .get("total_scored")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let sample = apply_result
+        .get("hosts")
+        .and_then(|h| h.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|h| h.get("sample"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let now = crate::sys_metrics::utc_now_rfc3339();
+    let title = rule
+        .title
+        .replace("{{suspects}}", &suspects.to_string())
+        .replace("{{scored}}", &scored.to_string());
+    let title = if title.contains("{{") || title == rule.title {
+        format!(
+            "AnoMark: {suspects}/{scored} suspect commands ({})",
+            rule.name
+        )
+    } else {
+        title
+    };
+    let mut evidence = serde_json::Map::new();
+    evidence.insert("suspects".into(), serde_json::json!(suspects));
+    evidence.insert("scored".into(), serde_json::json!(scored));
+    evidence.insert(
+        "model_id".into(),
+        serde_json::json!(model_id.unwrap_or("platform-default")),
+    );
+    evidence.insert("suspect_percent".into(), serde_json::json!(suspect_percent));
+    evidence.insert("sample".into(), sample);
+    evidence.insert("check_id".into(), serde_json::json!(rule.id.as_str()));
+
+    let finding = Finding {
+        id: FindingId::new_v7(),
+        scan_id: ScanId(scan_id),
+        host_id: ProtoHostId(host_id),
+        check_id: CheckId::new(rule.id.as_str()),
+        check_version: rule.version,
+        check_type: rule.check_type,
+        severity: rule.severity,
+        confidence: rule.confidence,
+        title,
+        evidence,
+        observation_ref: ObservationRef {
+            scan_id: ScanId(scan_id),
+            seq: 0,
+            kind: "anomark".into(),
+        },
+        attack: rule.attack.clone(),
+        first_seen: now.clone(),
+        last_seen: now,
+        status: FindingStatus::New,
+        suppressed_by: None,
+        correlation_id: None,
+    };
+    state
+        .store
+        .insert_findings(vec![finding])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn host_matches_tags(h: &HostRecord, tags: &[String]) -> bool {

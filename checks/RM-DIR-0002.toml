@@ -14,3 +14,14 @@ title = "getdents hiding suspected at {{dir_anomaly.path}}"
 evidence_fields = ["path", "anomaly", "detail", "confidence"]
 attack = ["T1014"]
 rationale = "Disagreement between getdents metadata and entry counts may indicate magic-prefix hiding."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "inject"
+
+[test.expect]
+title_contains = "getdents"
+
+[test.expect.evidence]
+anomaly = "getdents_mismatch"

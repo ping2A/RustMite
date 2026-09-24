@@ -49,3 +49,11 @@ references = [
   "https://gtfobins.github.io/",
 ]
 collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "GTFOBins binary"

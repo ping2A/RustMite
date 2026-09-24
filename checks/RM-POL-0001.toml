@@ -14,3 +14,11 @@ title = "SSH host key changed ({{ssh_host_key.key_type}} {{ssh_host_key.fingerpr
 evidence_fields = ["path", "key_type", "fingerprint", "changed"]
 attack = []
 rationale = "A changed SSH host key blocks trust in scan results and may indicate MITM or host rebuild; always critical."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "host key changed"

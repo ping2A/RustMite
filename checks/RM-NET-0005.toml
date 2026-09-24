@@ -15,3 +15,14 @@ title = "Sniffer-class socket ({{socket.protocol}}) uid {{socket.uid}} inode {{s
 evidence_fields = ["protocol", "family", "uid", "owning_pid", "inode"]
 attack = ["T1040"]
 rationale = "Raw/packet sockets may indicate packet capture or L2 sniffing."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Sniffer"
+
+[test.expect.evidence]
+protocol = "RAW"

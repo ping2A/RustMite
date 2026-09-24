@@ -1,2 +1,2 @@
 name = "m5-collectors"
-expected_checks = []
+expected_checks = ["RM-PERSIST-0003", "RM-PERSIST-0005"]

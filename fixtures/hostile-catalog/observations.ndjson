@@ -1,0 +1,9 @@
+{"t":"hidden_socket","inode":"13","local_port":31337,"protocol":"TCP","sources_present":["sock_diag"],"sources_absent":["proc_net"],"confidence":"high"}
+{"t":"timestomp","path":{"s":"/tmp/stomped"},"btime":200,"mtime":100,"ctime":150}
+{"t":"file_meta","path":{"s":"/tmp/immut"},"mode":420,"uid":0,"gid":0,"size":"10","inode":"9","nlink":1,"setuid":false,"setgid":false,"immutable":true}
+{"t":"dir_anomaly","path":{"s":"/tmp"},"anomaly":"link_count_mismatch","detail":"nlink high","confidence":"high"}
+{"t":"dir_anomaly","path":{"s":"/tmp"},"anomaly":"getdents_mismatch","detail":"bytes","confidence":"high"}
+{"t":"dir_anomaly","path":{"s":"/tmp/hidden"},"anomaly":"unlisted_open_file","detail":"open","confidence":"high"}
+{"t":"policy","code":"RM-POL-0021","detail":"pure-command fallback","severity":"high"}
+{"t":"hidden_process","pid":4242,"sources_present":["proc"],"sources_absent":["pid_max"],"comm":"hidden","exe":null,"uid":0,"starttime":1,"cgroup":null,"passes_confirmed":1,"confidence":"medium","note":null}
+{"t":"process","pid":9003,"ppid":1,"comm":"sshd","exe":{"s":"/usr/sbin/sshd"},"exe_deleted":false,"exe_memfd":false,"cmdline":[],"cwd":{"s":"/"},"root":{"s":"/"},"uids":[0,0,0,0],"gids":[0,0,0,0],"username":"root","starttime":1,"num_threads":1,"tty":0,"state":"S","caps_eff":0,"ns":{},"rwx_maps":0,"unbacked_exec":0,"listen_ports":[22],"selinux":null,"environ_flags":[]}

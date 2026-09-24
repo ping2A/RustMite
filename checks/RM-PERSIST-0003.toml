@@ -17,3 +17,11 @@ title = "Suspicious scheduled task in {{scheduled_task.path}}: {{scheduled_task.
 evidence_fields = ["kind", "path", "user", "schedule", "command"]
 attack = ["T1053.003"]
 rationale = "Cron/at entries that fetch remote content or decode payloads are common persistence."
+
+[test]
+fires_on = ["m5-collectors"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "scheduled task"

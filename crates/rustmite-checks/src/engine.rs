@@ -48,6 +48,10 @@ impl CheckEngine {
             if !manifest.enabled {
                 continue;
             }
+            // Post-scan AnoMark rules never evaluate against observations.
+            if manifest.is_anomark_rule() {
+                continue;
+            }
             let expr = compile(&manifest.where_expr).map_err(|source| CheckError::Expr {
                 check_id: manifest.id.as_str().to_string(),
                 source,
@@ -89,6 +93,17 @@ impl CheckEngine {
     /// Alias for [`Self::load_dir`].
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self, CheckError> {
         Self::load_dir(dir)
+    }
+
+    /// Load a catalog with every non-AnoMark rule enabled (fixture coverage for disabled checks).
+    pub fn from_dir_for_catalog_test(dir: impl AsRef<Path>) -> Result<Self, CheckError> {
+        let mut manifests = load_dir(dir)?;
+        for m in &mut manifests {
+            if !m.is_anomark_rule() {
+                m.enabled = true;
+            }
+        }
+        Self::from_manifests(manifests)
     }
 
     pub fn len(&self) -> usize {

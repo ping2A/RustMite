@@ -25,3 +25,11 @@ title = "Suspicious shell startup hook in {{service.path}}"
 evidence_fields = ["name", "path", "exec_start"]
 attack = ["T1546.004"]
 rationale = "Profile/rc hooks that export LD_* or pull remote content are common userland persistence."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "shell startup"

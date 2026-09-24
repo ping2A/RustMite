@@ -14,3 +14,14 @@ title = "Suspicious dot-directory at {{dir_anomaly.path}}"
 evidence_fields = ["path", "anomaly", "detail"]
 attack = ["T1564.001"]
 rationale = "Hidden dot-directories directly under /, /tmp, or /dev are uncommon on production servers."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "dot-directory"
+
+[test.expect.evidence]
+anomaly = "dotdir_stash"

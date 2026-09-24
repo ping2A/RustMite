@@ -18,3 +18,11 @@ title = "Suspicious forced command in {{authorized_key.path}} for {{authorized_k
 evidence_fields = ["username", "path", "options", "fingerprint"]
 attack = ["T1098.004"]
 rationale = "Forced commands that invoke a shell may be backdoors disguised as restricted keys."
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "Suspicious forced command"
