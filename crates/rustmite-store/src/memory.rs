@@ -544,7 +544,7 @@ impl Store for InMemoryStore {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
+                .map(crate::types::normalize_agent_kind)
                 .or_else(|| prev.as_ref().map(|p| p.agent_kind.clone()))
                 .unwrap_or_else(|| "ssh".into()),
             ingest_token: req
@@ -682,12 +682,7 @@ impl Store for InMemoryStore {
             };
         }
         if let Some(kind) = req.agent_kind {
-            let k = kind.trim().to_ascii_lowercase();
-            host.agent_kind = if k == "virtual" {
-                "virtual".into()
-            } else {
-                "ssh".into()
-            };
+            host.agent_kind = crate::types::normalize_agent_kind(&kind);
         }
         if let Some(tok) = req.ingest_token {
             host.ingest_token = if tok.trim().is_empty() {
@@ -2250,5 +2245,50 @@ mod tests {
             meta.outcome,
             rustmite_proto::ScanOutcome::Complete
         ));
+    }
+
+    #[tokio::test]
+    async fn agentlite_kind_persists_on_upsert_and_update() {
+        let store = InMemoryStore::new();
+        let host = store
+            .upsert_host(UpsertHost {
+                id: None,
+                tenant_id: Uuid::nil(),
+                display_name: "lite-1".into(),
+                primary_addr: Some("10.0.0.9".into()),
+                ssh_port: Some(22),
+                labels: BTreeMap::new(),
+                timeouts: Default::default(),
+                agent_kind: Some("agent_lite".into()),
+                ingest_token: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(host.agent_kind, "agentlite");
+        assert!(crate::types::is_agentlite_kind(&host.agent_kind));
+
+        let updated = store
+            .update_host(
+                host.id,
+                UpdateHost {
+                    agent_kind: Some("ssh".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.agent_kind, "ssh");
+
+        let back = store
+            .update_host(
+                host.id,
+                UpdateHost {
+                    agent_kind: Some("ssh_commands".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(back.agent_kind, "agentlite");
     }
 }

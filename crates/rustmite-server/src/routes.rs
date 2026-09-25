@@ -2006,6 +2006,9 @@ pub struct CreateHostBody {
     pub tenant_id: Option<Uuid>,
     #[serde(default)]
     pub timeouts: rustmite_store::HostTimeouts,
+    /// `ssh` (default), `agentlite`, or `virtual`.
+    #[serde(default)]
+    pub agent_kind: Option<String>,
     /// Optional: persist last connectivity test result on create.
     #[serde(default)]
     pub auth_status: Option<String>,
@@ -2038,7 +2041,7 @@ async fn create_host(
             ssh_port: body.ssh_port,
             labels: body.labels,
             timeouts: body.timeouts,
-            agent_kind: None,
+            agent_kind: body.agent_kind,
             ingest_token: None,
         })
         .await?;
@@ -2091,6 +2094,8 @@ pub struct UpdateHostBody {
     pub auth_status: Option<String>,
     pub auth_detail: Option<String>,
     pub auth_checked_at: Option<String>,
+    #[serde(default)]
+    pub agent_kind: Option<String>,
 }
 
 async fn update_host(
@@ -2112,6 +2117,7 @@ async fn update_host(
                 auth_status: body.auth_status,
                 auth_detail: body.auth_detail,
                 auth_checked_at: body.auth_checked_at,
+                agent_kind: body.agent_kind,
                 ..Default::default()
             },
         )
@@ -2695,6 +2701,81 @@ async fn host_files(
             })
             .collect();
     }
+
+    // Enrich FileMeta rows: octal mode, flags, and owner/group from account observations
+    // on the same scan when the collector only stored numeric uid/gid.
+    if !files.is_empty() {
+        let uid_names = {
+            let (_, acct_rows) = host_kind_rows(
+                &state,
+                HostId(id),
+                "account",
+                50_000,
+                scan_id.or(q.scan_id),
+                q.inventory.as_deref(),
+            )
+            .await
+            .unwrap_or((None, Vec::new()));
+            let mut uids = std::collections::HashMap::<u32, String>::new();
+            for o in &acct_rows {
+                if let Observation::Account(a) = &o.data {
+                    uids.entry(a.uid).or_insert_with(|| a.username.clone());
+                }
+            }
+            uids
+        };
+        for f in &mut files {
+            let Some(obj) = f.as_object_mut() else {
+                continue;
+            };
+            if let Some(mode) = obj.get("mode").and_then(|v| v.as_u64()) {
+                obj.insert(
+                    "mode_octal".into(),
+                    serde_json::json!(format!("{:04o}", mode as u32 & 0o7777)),
+                );
+            }
+            let setuid = obj
+                .get("setuid")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let setgid = obj
+                .get("setgid")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let immutable = obj
+                .get("immutable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut flags: Vec<&str> = Vec::new();
+            if setuid {
+                flags.push("setuid");
+            }
+            if setgid {
+                flags.push("setgid");
+            }
+            if immutable {
+                flags.push("immutable");
+            }
+            if let Some(mode) = obj.get("mode").and_then(|v| v.as_u64()) {
+                if mode & 0o002 != 0 {
+                    flags.push("world_writable");
+                }
+            }
+            obj.insert("flags".into(), serde_json::json!(flags));
+            let owner_missing = obj
+                .get("owner")
+                .map(|v| v.is_null() || v.as_str().map(|s| s.is_empty()).unwrap_or(true))
+                .unwrap_or(true);
+            if owner_missing {
+                if let Some(uid) = obj.get("uid").and_then(|v| v.as_u64()) {
+                    if let Some(name) = uid_names.get(&(uid as u32)) {
+                        obj.insert("owner".into(), serde_json::json!(name));
+                    }
+                }
+            }
+        }
+    }
+
     let mut source = if !files.is_empty() { "scan" } else { "none" };
 
     let want_latest = q.scan_id.is_none()
@@ -3435,6 +3516,17 @@ async fn node_lease(
                 Some(r) => resolve_lease_cred_box(&state, r).await,
                 None => None,
             },
+            "scan_mode": host.as_ref().and_then(|h| {
+                h.labels.get("scan_mode").cloned().or_else(|| {
+                    if rustmite_store::is_agentlite_kind(&h.agent_kind) {
+                        Some("ssh_commands".into())
+                    } else {
+                        None
+                    }
+                })
+            }),
+            "agent_kind": host.as_ref().map(|h| h.agent_kind.clone()),
+            "collect_paths": host.as_ref().and_then(|h| h.labels.get("collect_paths").cloned()),
             "collectors": resolved.collectors,
             "check_ids": resolved.check_ids,
         }));

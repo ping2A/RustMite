@@ -10,7 +10,8 @@ use clap::Parser;
 use rustmite_notify::WebhookSink;
 use rustmite_server::{
     default_checks_dir, ensure_dev_certs, node_router, operator_router, seed_demo, serve_plain,
-    serve_tls, spawn_host_health_checker, spawn_scan_simulator, AppState, CheckCatalog, MetricsHub,
+    serve_tls, spawn_host_health_checker, spawn_scan_scheduler, spawn_scan_simulator, AppState,
+    CheckCatalog, MetricsHub,
     RuntimeSettings, TlsPaths,
     DEFAULT_SEED_HOSTS, DEFAULT_TLS_DIR,
 };
@@ -674,6 +675,7 @@ async fn main() -> anyhow::Result<()> {
         clickhouse_timeout_secs: args.clickhouse_timeout_secs,
         probe_limits: rustmite_proto::Limits::default(),
     });
+    spawn_scan_scheduler(store.clone(), settings.clone());
     let probe_limits = {
         let path = PathBuf::from(".dev/probe-limits.json");
         let limits = if path.is_file() {

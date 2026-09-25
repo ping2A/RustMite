@@ -50,7 +50,12 @@ pub struct Limits {
 }
 ```
 
-Operators set these from **Settings → Probe agent limits** (persisted in `.dev/probe-limits.json`). Each lease embeds `probe_limits`; the node writes them into `ScanRequest.limits` before pushing the probe. `deadline_ms` remains the wall-clock time limit (fleet `scan_timeout_secs` / check-set default).
+Operators set these from **Settings → Agent limits** (persisted in `.dev/probe-limits.json`). Each lease embeds `probe_limits`.
+
+- **Agentless probe:** the node writes them into `ScanRequest.limits` before pushing the probe (RLIMIT / nice / cooperative `Budget`).
+- **AgentLite:** the same envelope caps `max_observations` / `max_files_examined` / `max_output_bytes`, applies `nice`/`ionice`/`ulimit` on the remote shell, and paces SSH result transfer via `max_transfer_bps`.
+
+`deadline_ms` remains the wall-clock time limit (fleet `scan_timeout_secs` / check-set default).
 
 `issuer_sig` is optional and exists only so a host operator *can* verify what was asked of their machine (transparency, useful in regulated environments). It is not a security control for RustMite itself.
 

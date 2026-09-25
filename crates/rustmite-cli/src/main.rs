@@ -305,6 +305,8 @@ async fn run_remote_scan(
         limits: rustmite_proto::Limits::default(),
         timeouts: Default::default(),
         sudo: Default::default(),
+        force_pure_command: false,
+        collect_paths: None,
     })
     .await
     {

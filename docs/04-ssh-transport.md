@@ -66,6 +66,12 @@ Given the fingerprint (`01` §4), pick a delivery method. Attempt in order; each
 
 Method D is the honest fallback: it runs a curated set of read-only shell/`cat`/`readlink` equivalents *from the node* over SSH and parses them, accepting that it cannot do differential syscall checks. Mark all such results `confidence: low` and raise `RM-POL-0021` ("host could not be inspected with full-fidelity probe").
 
+Operators can also **force** Method D per host by setting `agent_kind=agentlite` (Add host → **AgentLite**). No probe ELF is transferred; sudo (when configured) wraps the remote shell so `/etc/shadow` and other users' keys remain readable. Use this when policy forbids running any foreign binary on the endpoint. Legacy host label `scan_mode=ssh_commands` is still honoured. AgentLite also appears under Settings → Build & versions.
+
+AgentLite inventories files via `stat`/`find` under a default set of roots (`/bin`, `/usr/bin`, `/etc`, `/tmp`, …). Operators can add more absolute files or directories with the host label `collect_paths` (comma- or newline-separated) on **Add hosts** / **Edit host**.
+
+Fleet **Settings → Agent limits** apply to AgentLite as well as the full probe (observation/file caps, remote nice/ionice/ulimit, transfer pacing).
+
 ## 4. The two-stage memfd loader (Method A, the core trick)
 
 Goal: get a multi-MB ELF into an anonymous memory file and `execveat` it, without ever creating a named file, using only what a stock `/bin/sh` can do.

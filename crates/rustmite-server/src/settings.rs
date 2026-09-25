@@ -176,7 +176,7 @@ pub const SETTINGS_CATALOG: &[SettingDescriptor] = &[
         env: "RUSTMITE_SCAN_INTERVAL",
         value_type: "duration",
         default: "1h",
-        description: "How often each enrolled machine is scheduled for a check (fleet cadence)",
+        description: "Fleet cadence used when a host enables automatic collection (hosts default to manual)",
         requires_restart: false,
         secret: false,
         options: Some(&["5m", "15m", "30m", "1h", "6h", "12h", "24h", "7d"]),

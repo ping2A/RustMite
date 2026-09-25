@@ -60,7 +60,8 @@ pub struct HostRecord {
     /// Distro version id (`22.04`, `9`, …).
     #[serde(default)]
     pub os_version: Option<String>,
-    /// `ssh` (default) = agentless SSH probe host; `virtual` = log-only ingest host.
+    /// `ssh` (default) = ephemeral probe over SSH; `agentlite` = SSH commands only (no binary);
+    /// `virtual` = log-only ingest host.
     #[serde(default = "default_agent_kind")]
     pub agent_kind: String,
     /// Bearer token for `POST /v1/ingest/logs` (virtual agents).
@@ -85,6 +86,22 @@ fn default_agent_kind() -> String {
     "ssh".into()
 }
 
+/// Normalize host agent kind to a canonical value.
+pub fn normalize_agent_kind(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "virtual" | "virt" | "ingest" => "virtual".into(),
+        "agentlite" | "agent_lite" | "lite" | "ssh_commands" | "pure_command" => {
+            "agentlite".into()
+        }
+        _ => "ssh".into(),
+    }
+}
+
+/// True when the host uses SSH-commands-only collection (no probe binary).
+pub fn is_agentlite_kind(kind: &str) -> bool {
+    normalize_agent_kind(kind) == "agentlite"
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpsertHost {
     pub id: Option<HostId>,
@@ -95,7 +112,7 @@ pub struct UpsertHost {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub timeouts: HostTimeouts,
-    /// `ssh` (default) or `virtual`.
+    /// `ssh` (default), `agentlite`, or `virtual`.
     #[serde(default)]
     pub agent_kind: Option<String>,
     #[serde(default)]

@@ -160,6 +160,12 @@ pub struct FileMetaObs {
     pub setuid: bool,
     pub setgid: bool,
     pub immutable: bool,
+    /// Resolved owner name when known (`stat %U` / passwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Resolved group name when known (`stat %G` / group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

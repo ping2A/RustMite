@@ -259,6 +259,15 @@ pub(crate) struct LeaseJob {
     ssh_sudo_password: Option<String>,
     #[serde(default)]
     ssh_sudo_password_box: Option<String>,
+    /// Host scan preference: `ssh_commands` forces Method D (no probe binary).
+    #[serde(default)]
+    scan_mode: Option<String>,
+    /// Host agent kind from the control plane (`ssh` | `agentlite` | `virtual`).
+    #[serde(default)]
+    agent_kind: Option<String>,
+    /// Extra absolute paths for AgentLite file inventory (`collect_paths` host label).
+    #[serde(default)]
+    collect_paths: Option<String>,
     /// Collector IDs resolved from the configured check-set plan (server).
     #[serde(default)]
     collectors: Vec<String>,

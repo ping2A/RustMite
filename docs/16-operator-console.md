@@ -40,7 +40,7 @@ Optional API auth: set `RUSTMITE_API_TOKEN` and paste the token in the sidebar. 
 |---|---|---|
 | Results viewer / alerts | **Findings** — severity filter, by-host / by-check grouping, detail drawer with evidence + raw JSON + ATT&CK links | `GET /v1/findings`, `GET /v1/summary` |
 | Hosts management / add hosts | **Hosts Management** — add by IP/hostname/CIDR, status presets, detail drawer, edit, bulk tag/scan/delete, CSV export | `GET/POST /v1/hosts`, `PATCH/DELETE /v1/hosts/{id}`, `POST /v1/hosts/delete`, `POST /v1/hosts/{id}/scan` |
-| Scan / schedules (manual) | **Scans** + top-bar **Manual scan** — job state + coverage drawer | `GET /v1/scans`, `GET /v1/scans/{id}/coverage` |
+| Scan / schedules | **Scans** + top-bar **Manual scan**; automatic collection is **opt-in** per host (Add/Edit → Enable scheduled collection). New hosts default to manual. | `GET /v1/scans`, `POST /v1/hosts/{id}/scan` |
 | Sandfly Hunter | **RPL Hunt** — fields sidebar, histogram/timechart, results table, inspector, guide, saved queries; legacy expr tab | `POST /v1/hunt/rpl` (+ compile/fields/histogram), `POST /v1/hunt` |
 | SSH Hunter | **SSH Hunter** — Summary, Security Zones, Key/User/Host Investigation, Tag Workbench + key graph | `GET /v1/ssh/*` |
 | Sandflies catalog | **Checks** — loaded manifests, enable flag, where clause | `GET /v1/checks` |

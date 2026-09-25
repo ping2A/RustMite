@@ -7,7 +7,7 @@ use rustmite_proto::{
 };
 use uuid::Uuid;
 
-use crate::delivery::{select_delivery_method, DeliveryOutcome, HostCapabilities};
+use crate::delivery::{select_delivery_method, DeliveryOutcome, DeliveryPlan, HostCapabilities};
 use crate::error::TransportError;
 use crate::fingerprint::{parse_uname_hint, HostFingerprint};
 use crate::framing::encode_probe_frame;
@@ -63,6 +63,11 @@ pub struct RemoteScanOpts<'a> {
     pub timeouts: crate::timeouts::SshTimeouts,
     /// Run the probe under `sudo` so collectors see root-level `/proc` (fd ownership, etc.).
     pub sudo: SudoEscalation<'a>,
+    /// Force Method D (SSH commands only — no probe binary on the host).
+    /// Used when the host label `scan_mode=ssh_commands` is set.
+    pub force_pure_command: bool,
+    /// Optional host `collect_paths` label (AgentLite file inventory extras).
+    pub collect_paths: Option<&'a str>,
 }
 
 pub struct RemoteScanResult {
@@ -104,9 +109,23 @@ fn build_request(opts: &RemoteScanOpts<'_>) -> ScanRequest {
 }
 
 async fn probe_capabilities(session: &SshSession) -> Result<(HostFingerprint, HostCapabilities), TransportError> {
+    probe_capabilities_inner(session, true).await
+}
+
+/// Lightweight fingerprint for SSH-commands-only mode (no staging-dir write probes).
+async fn probe_fingerprint_only(session: &SshSession) -> Result<HostFingerprint, TransportError> {
+    let (fp, _) = probe_capabilities_inner(session, false).await?;
+    Ok(fp)
+}
+
+async fn probe_capabilities_inner(
+    session: &SshSession,
+    discover_exec: bool,
+) -> Result<(HostFingerprint, HostCapabilities), TransportError> {
     // Sanctioned fingerprint + capability probes (docs/01 §4, docs/04 §3).
     // EXEC_DIR is discovered by actually writing a tiny script and executing it.
-    let cmd = r#"
+    let cmd = if discover_exec {
+        r#"
 uname -srm
 echo ---
 id -u
@@ -129,7 +148,19 @@ for d in /run/rustmite-exec /run/user/$(id -u) /tmp /home/$(id -un) /var/tmp /de
   fi
 done
 if [ -n "$EXEC_DIR" ]; then echo "EXEC_DIR=$EXEC_DIR"; else echo EXEC_DIR_NONE; fi
-"#;
+"#
+    } else {
+        r#"
+uname -srm
+echo ---
+id -u
+echo ---OS---
+cat /etc/os-release 2>/dev/null || true
+echo ---
+echo NO_BASE64
+echo EXEC_DIR_NONE
+"#
+    };
     let (out, err, code) = session.exec(cmd, None).await?;
     if code != 0 {
         return Err(TransportError::Ssh(format!(
@@ -166,7 +197,7 @@ fn kernel_supports_memfd(kernel: &str) -> bool {
 
 /// Connect, fingerprint, select the matching agentless binary, deliver, stream, disconnect.
 pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, TransportError> {
-    if opts.probe_catalog.is_none() && opts.probe_elf.is_empty() {
+    if !opts.force_pure_command && opts.probe_catalog.is_none() && opts.probe_elf.is_empty() {
         return Err(TransportError::Delivery(
             "empty probe elf (provide --probe or a probe catalog)".into(),
         ));
@@ -183,7 +214,12 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
     .await?;
     let presented_host_key = session.presented_host_key.clone();
 
-    let (fingerprint, caps) = probe_capabilities(&session).await?;
+    let (fingerprint, caps) = if opts.force_pure_command {
+        let fp = probe_fingerprint_only(&session).await?;
+        (fp, HostCapabilities::default())
+    } else {
+        probe_capabilities(&session).await?
+    };
 
     // Skip sudo when the SSH session is already root.
     let sudo = if fingerprint.euid == Some(0) {
@@ -195,10 +231,18 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
         verify_sudo(&session, &sudo).await?;
     }
 
-    let plan = select_delivery_method(&caps);
+    let plan = if opts.force_pure_command {
+        DeliveryPlan {
+            method: DeliveryMethod::PureCommand,
+            encoder: None,
+        }
+    } else {
+        select_delivery_method(&caps)
+    };
 
-    let (probe_elf, loader_elf, probe_arch, probe_triple) = if let Some(catalog) = opts.probe_catalog
-    {
+    let (probe_elf, loader_elf, probe_arch, probe_triple) = if opts.force_pure_command {
+        (&[][..], None, None, None)
+    } else if let Some(catalog) = opts.probe_catalog {
         let art = catalog.select(fingerprint.arch)?;
         (
             art.probe.as_slice(),
@@ -219,7 +263,11 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
     // Average-rate shaping for probe + ScanRequest bytes over SSH.
     let transfer_bytes = probe_elf.len()
         + loader_elf.map(|l| l.len()).unwrap_or(0)
-        + request_line.len();
+        + if matches!(plan.method, DeliveryMethod::PureCommand) {
+            0
+        } else {
+            request_line.len()
+        };
     pace_transfer(transfer_bytes, opts.limits.max_transfer_bps).await;
 
     let (stdout, stderr, method_used, fallback_reason) = match plan.method {
@@ -238,9 +286,21 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
                 Ok(v) => (v.0, v.1, DeliveryMethod::Memfd, None),
                 Err(e) => {
                     let reason = format!("memfd failed: {e}; falling back to tmpfs");
-                    let (o, e2) =
-                        deliver_method_b(&session, probe_elf, &request_line, &caps, &sudo).await?;
-                    (o, e2, DeliveryMethod::Tmpfs, Some(reason))
+                    match deliver_method_b(&session, probe_elf, &request_line, &caps, &sudo).await {
+                        Ok((o, e2)) => (o, e2, DeliveryMethod::Tmpfs, Some(reason)),
+                        Err(e2) => {
+                            let reason = format!("{reason}; tmpfs failed: {e2}");
+                            let (o, e3) = deliver_method_d(
+                                &session,
+                                &sudo,
+                                "host could not be inspected with full-fidelity probe (memfd/tmpfs failed)",
+                                opts.collect_paths,
+                                &opts.limits,
+                            )
+                            .await?;
+                            (o, e3, DeliveryMethod::PureCommand, Some(reason))
+                        }
+                    }
                 }
             }
         }
@@ -249,7 +309,14 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
                 Ok((o, e)) => (o, e, DeliveryMethod::Tmpfs, None),
                 Err(e) => {
                     let reason = format!("tmpfs failed: {e}; falling back to pure-command");
-                    let (o, e2) = deliver_method_d(&session).await?;
+                    let (o, e2) = deliver_method_d(
+                                &session,
+                                &sudo,
+                                "host could not be inspected with full-fidelity probe (no memfd/tmpfs exec)",
+                                opts.collect_paths,
+                                &opts.limits,
+                            )
+                    .await?;
                     (o, e2, DeliveryMethod::PureCommand, Some(reason))
                 }
             }
@@ -260,13 +327,18 @@ pub async fn remote_scan(opts: RemoteScanOpts<'_>) -> Result<RemoteScanResult, T
             ));
         }
         DeliveryMethod::PureCommand => {
-            let (o, e) = deliver_method_d(&session).await?;
-            (
-                o,
-                e,
-                DeliveryMethod::PureCommand,
-                Some("no exec-capable staging dir or memfd".into()),
-            )
+            let detail = if opts.force_pure_command {
+                "AgentLite: SSH commands-only scan (no probe binary on host)"
+            } else {
+                "host could not be inspected with full-fidelity probe (no memfd/tmpfs exec)"
+            };
+            let (o, e) = deliver_method_d(&session, &sudo, detail, opts.collect_paths, &opts.limits).await?;
+            let reason = if opts.force_pure_command {
+                Some("agentlite".into())
+            } else {
+                Some("no exec-capable staging dir or memfd".into())
+            };
+            (o, e, DeliveryMethod::PureCommand, reason)
         }
     };
 
@@ -456,53 +528,12 @@ fn wrap_sudo_exec(
 }
 
 /// Method D: read-only shell commands from the node; emit RM-POL-0021 policy observation.
-async fn deliver_method_d(session: &SshSession) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
-    use rustmite_proto::{
-        CapabilitySet, Envelope, Hello, Observation, PolicyObs, SCHEMA_VERSION, Severity, Summary,
-    };
-
-    let (uname_out, _, _) = session.exec("uname -srm; id -u; id -un", None).await?;
-    let text = String::from_utf8_lossy(&uname_out);
-    let fp = parse_uname_hint(&text);
-    let _ = session
-        .exec("head -n 50 /etc/passwd 2>/dev/null || true", None)
-        .await?;
-
-    let hello = Envelope::Hello(Hello {
-        schema: SCHEMA_VERSION,
-        probe_version: "pure-command".into(),
-        arch: fp.arch,
-        kernel: fp.kernel.clone(),
-        boot_id: "unknown".into(),
-        euid: fp.euid.unwrap_or(0),
-        pid: 0,
-        nonce: "00".repeat(32),
-        caps: CapabilitySet::default(),
-    });
-    let policy = Envelope::Obs {
-        c: "policy".into(),
-        n: 0,
-        d: Observation::Policy(PolicyObs {
-            code: "RM-POL-0021".into(),
-            detail: "host could not be inspected with full-fidelity probe (no memfd/tmpfs exec)"
-                .into(),
-            severity: Severity::High,
-        }),
-    };
-    let summary = Envelope::Summary(Summary {
-        outcome: "complete".into(),
-        collectors: vec![],
-        observation_count: 1,
-        bytes_out: 0,
-        elapsed_ms: 0,
-    });
-
-    let mut out = Vec::new();
-    for env in [hello, policy, summary] {
-        let line = serde_json::to_vec(&env)
-            .map_err(|e| TransportError::Delivery(format!("encode: {e}")))?;
-        out.extend_from_slice(&line);
-        out.push(b'\n');
-    }
-    Ok((out, Vec::new()))
+async fn deliver_method_d(
+    session: &SshSession,
+    sudo: &SudoEscalation<'_>,
+    reason: &str,
+    collect_paths: Option<&str>,
+    limits: &Limits,
+) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
+    crate::pure_command::collect_pure_command(session, sudo, reason, collect_paths, limits).await
 }

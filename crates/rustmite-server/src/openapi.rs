@@ -16,7 +16,7 @@ pub fn openapi_json() -> serde_json::Value {
             },
             "/v1/version": {
                 "get": {
-                    "summary": "Server and agentless (probe/loader) versions with SHA-256 digests per platform"
+                    "summary": "Server, AgentLite, and agentless (probe/loader) versions with SHA-256 digests per platform"
                 }
             },
             "/v1/hosts": {

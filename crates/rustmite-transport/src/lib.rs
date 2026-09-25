@@ -14,6 +14,8 @@ pub mod timeouts;
 pub mod throttle;
 
 #[cfg(feature = "ssh")]
+pub mod pure_command;
+#[cfg(feature = "ssh")]
 pub mod scan;
 #[cfg(feature = "ssh")]
 pub mod ssh;

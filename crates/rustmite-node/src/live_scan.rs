@@ -284,11 +284,31 @@ pub async fn run_live_job(
         }
     };
 
+    let force_pure_command = {
+        let kind = job
+            .agent_kind
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mode = job
+            .scan_mode
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(
+            kind.as_str(),
+            "agentlite" | "agent_lite" | "lite" | "ssh_commands" | "pure_command"
+        ) || matches!(
+            mode.as_str(),
+            "ssh_commands" | "pure_command" | "commands" | "agentless_commands" | "agentlite"
+        )
+    };
+
     let mut roots = rustmite_transport::default_search_roots();
     if let Some(dir) = &opts.probe_dir {
         roots.insert(0, dir.clone());
     }
-    let catalog = if opts.probe.is_none() {
+    let catalog = if opts.probe.is_none() && !force_pure_command {
         let cat = ProbeCatalog::discover(DEFAULT_LINUX_TARGETS, &roots);
         if cat.is_empty() {
             bail!(
@@ -367,7 +387,20 @@ pub async fn run_live_job(
         18,
     )
     .await;
-    report_progress(client, server, node_id, job.id, "deliver / exec agentless probe", 25).await;
+    if force_pure_command {
+        report_progress(
+            client,
+            server,
+            node_id,
+            job.id,
+            "AgentLite: SSH commands-only scan (no binary on host)",
+            25,
+        )
+        .await;
+    } else {
+        report_progress(client, server, node_id, job.id, "deliver / exec agentless probe", 25)
+            .await;
+    }
 
     let scan = match remote_scan(RemoteScanOpts {
         host: &host,
@@ -384,6 +417,8 @@ pub async fn run_live_job(
         limits,
         timeouts,
         sudo,
+        force_pure_command,
+        collect_paths: job.collect_paths.as_deref(),
     })
     .await
     {
@@ -429,7 +464,16 @@ pub async fn run_live_job(
         .map(|(_, _, o)| o.clone())
         .collect();
 
-    let delivery_label = format!("{:?}", scan.delivery.method).to_ascii_lowercase();
+    let delivery_method = serde_json::to_value(scan.delivery.method)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    let arch_wire = scan.probe_arch.clone().unwrap_or_else(|| {
+        serde_json::to_value(scan.fingerprint.arch)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into())
+    });
     let obs_n = observations.len();
     report_progress(
         client,
@@ -437,7 +481,7 @@ pub async fn run_live_job(
         node_id,
         job.id,
         &format!(
-            "evaluate checks ({obs_n} observations, delivery={delivery_label}{})",
+            "evaluate checks ({obs_n} observations, delivery={delivery_method}{})",
             scan
                 .delivery
                 .fallback_reason
@@ -464,7 +508,7 @@ pub async fn run_live_job(
             node_id,
             job.id,
             &format!(
-                "probe returned 0 observations (delivery={delivery_label}); stderr={}",
+                "probe returned 0 observations (delivery={delivery_method}); stderr={}",
                 if stderr_tail.is_empty() {
                     "(empty)"
                 } else {
@@ -475,7 +519,7 @@ pub async fn run_live_job(
         )
         .await;
         bail!(
-            "probe returned 0 observations (delivery={delivery_label}, stdout_bytes={}, stderr={})",
+            "probe returned 0 observations (delivery={delivery_method}, stdout_bytes={}, stderr={})",
             scan.raw_stdout.len(),
             if stderr_tail.is_empty() {
                 "(empty)"
@@ -532,7 +576,7 @@ pub async fn run_live_job(
     }
 
     let url = format!("{}/v1/nodes/results", server.trim_end_matches('/'));
-    client
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "scan_id": job.id,
@@ -551,7 +595,7 @@ pub async fn run_live_job(
                 "node_id": node_id,
                 "outcome": outcome_typed,
                 "delivery": {
-                    "method": delivery_label,
+                    "method": delivery_method,
                     "encoder": scan.delivery.encoder,
                     "bytes_transferred": scan.delivery.bytes_transferred,
                     "cleanup_ok": scan.delivery.cleanup_ok,
@@ -559,7 +603,7 @@ pub async fn run_live_job(
                     "fallback_reason": scan.delivery.fallback_reason,
                 },
                 "probe_version": hello.map(|h| h.probe_version.clone()).unwrap_or_default(),
-                "arch": scan.probe_arch.clone().unwrap_or_else(|| format!("{:?}", scan.fingerprint.arch).to_ascii_lowercase()),
+                "arch": arch_wire,
                 "kernel": hello.map(|h| h.kernel.clone()).unwrap_or_else(|| scan.fingerprint.kernel.clone()),
                 "os": scan.fingerprint.os.clone(),
                 "os_id": scan.fingerprint.os_id.clone(),
@@ -584,8 +628,12 @@ pub async fn run_live_job(
             },
         }))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("post results failed ({status}): {body}");
+    }
 
     // Must not post state=running after complete_scan — that re-opens the job
     // and blocks the next scan (one active scan per host).

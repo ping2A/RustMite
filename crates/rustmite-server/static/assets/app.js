@@ -715,7 +715,13 @@
     render();
   }
 
-  function openDrawer(title, html) {
+  function openDrawer(title, html, opts) {
+    const panel = $("#drawer .drawer-panel");
+    const mode = (opts && opts.mode) || "default";
+    if (panel) {
+      panel.classList.toggle("is-wide", mode === "wide");
+      panel.classList.toggle("is-fullscreen", mode === "fullscreen");
+    }
     $("#drawerTitle").textContent = title;
     $("#drawerBody").innerHTML = html;
     $("#drawer").classList.remove("hidden");
@@ -725,8 +731,14 @@
   function closeDrawer() {
     $("#drawer").classList.add("hidden");
     $("#drawer").setAttribute("aria-hidden", "true");
+    const panel = $("#drawer .drawer-panel");
+    if (panel) {
+      panel.classList.remove("is-wide", "is-fullscreen");
+    }
     state.selectedFinding = null;
-    if (String(location.hash || "").startsWith("#finding/")) {
+    const hash = String(location.hash || "");
+    // Scan detail is a full page that owns `#/scans/…` — don't clobber it when closing a drawer.
+    if (hash.startsWith("#finding/")) {
       const next = `#/${state.view || "findings"}`;
       history.replaceState(null, "", next);
     }
@@ -779,7 +791,11 @@
     state.view = view;
     const skipHash = opts && opts.skipHash;
     const isSsh = String(view).startsWith("ssh-");
-    $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+    $$(".nav-item").forEach((b) => {
+      const active = b.dataset.view === view
+        || (view === "scan-detail" && b.dataset.view === "scans");
+      b.classList.toggle("active", active);
+    });
     const group = $("#navSshHunter");
     if (group) {
       const toggle = group.querySelector(".nav-group-toggle");
@@ -792,6 +808,7 @@
       findings: ["Findings", "Alert events with forensic evidence — Sandfly Results Viewer equivalent"],
       hosts: ["Hosts Management", "Add, view, update, and delete monitored hosts"],
       scans: ["Scans", "Job history, outcomes, and coverage accounting"],
+      "scan-detail": ["Scan detail", "Full scan inventory, findings, and collectors"],
       queue: ["Task queue", "Active scan jobs and node workload — Sandfly Task Queues"],
       activity: ["Activity", "Streaming scan progress and operator events"],
       hunt: ["Hunt", "RPL queries over ClickHouse events"],
@@ -959,53 +976,349 @@
     return true;
   }
 
+  function formatScanOutcome(outcome) {
+    if (outcome == null || outcome === "") return "—";
+    if (typeof outcome === "string") return outcome;
+    if (typeof outcome === "object") {
+      const kind = outcome.kind || Object.keys(outcome)[0] || "";
+      if (!kind) return JSON.stringify(outcome);
+      const detail = outcome[kind] || outcome.reason || outcome.message || "";
+      if (detail && typeof detail === "object") {
+        return `${kind}: ${JSON.stringify(detail)}`;
+      }
+      return detail ? `${kind}: ${detail}` : String(kind);
+    }
+    return String(outcome);
+  }
+
+  function mergeScanFindings(scanId, statusFindings) {
+    const map = new Map();
+    for (const f of statusFindings || []) {
+      if (f && f.id != null) map.set(String(f.id), f);
+    }
+    for (const f of state.findings || []) {
+      if (String(f.scan_id || "") !== String(scanId)) continue;
+      if (f && f.id != null) map.set(String(f.id), f);
+    }
+    return [...map.values()].sort((a, b) => {
+      const sa = String(a.severity || "");
+      const sb = String(b.severity || "");
+      const order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+      const da = order[sa.toLowerCase()] ?? 9;
+      const db = order[sb.toLowerCase()] ?? 9;
+      if (da !== db) return da - db;
+      return String(b.last_seen || b.first_seen || "").localeCompare(String(a.last_seen || a.first_seen || ""));
+    });
+  }
+
+  function severityBreakdown(findings) {
+    const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0, other: 0 };
+    for (const f of findings || []) {
+      const s = String(f.severity || "").toLowerCase();
+      if (s in counts) counts[s] += 1;
+      else counts.other += 1;
+    }
+    return counts;
+  }
+
   async function openScanById(id, opts) {
     if (!id) return false;
-    if (!opts || !opts.skipView) setView("scans", { skipHash: true });
     const hash = `#/scans/${encodeURIComponent(id)}`;
     if (location.hash !== hash) history.replaceState(null, "", hash);
+    state.selectedScanId = id;
+    const keepTab = (opts && opts.tab) || state.scanDetail?.tab || "overview";
     try {
       const status = await api(`/v1/scans/${id}`);
+      const idx = (state.scans || []).findIndex((s) => String(s.job?.id || "") === String(id));
+      if (idx >= 0) state.scans[idx] = status;
+      else state.scans = [status, ...(state.scans || [])];
+
       const job = status.job || {};
       const meta = status.meta || {};
-      const findings = status.findings || [];
-      const when = meta.finished_at || meta.started_at || job.updated_at || "—";
-      openDrawer(`Scan ${shortId(id)}`, `
-        <dl class="kv">
-          <dt>Scan ID</dt><dd class="mono"><a class="finding-link" href="${esc(hash)}">${esc(id)}</a></dd>
-          <dt>Host</dt><dd><a class="finding-link" href="${esc(`#host/${encodeURIComponent(job.host_id || meta.host_id || "")}`)}" data-goto-host="${esc(job.host_id || meta.host_id || "")}">${esc(hostName(job.host_id || meta.host_id))}</a></dd>
-          <dt>Check set</dt><dd>${esc(job.check_set || "—")}</dd>
-          <dt>State</dt><dd><span class="pill neutral">${esc(scanDisplayState({ job, meta }))}</span></dd>
-          <dt>Started</dt><dd class="mono">${esc(fmtWhen(meta.started_at))}</dd>
-          <dt>Finished</dt><dd class="mono">${esc(fmtWhen(meta.finished_at || when))}</dd>
-          <dt>Duration</dt><dd class="mono">${meta.duration_ms != null ? esc(String(meta.duration_ms)) + " ms" : "—"}</dd>
-          <dt>Outcome</dt><dd class="mono">${esc(typeof meta.outcome === "string" ? meta.outcome : JSON.stringify(meta.outcome || "—"))}</dd>
-          <dt>Findings</dt><dd>${findings.length}</dd>
-          <dt>Link</dt><dd class="mono finding-permalink"><a href="${esc(hash)}">${esc(scanPermalink(id))}</a></dd>
-        </dl>
-        ${findings.length ? `
-          <h3 style="margin:1.25rem 0 0.5rem;font-size:0.95rem">Findings from this scan</h3>
-          ${findingsTable(findings.slice(0, 40))}
-        ` : `<div class="empty" style="margin-top:1rem">No findings in this scan</div>`}
-        <div class="form-actions" style="margin-top:1rem">
-          <button class="btn ghost" data-copy-finding="${esc(scanPermalink(id))}">Copy scan link</button>
-          <button class="btn ghost" data-goto-host="${esc(job.host_id || meta.host_id || "")}">Open host</button>
+      const hostId = job.host_id || meta.host_id || "";
+      const findings = mergeScanFindings(id, status.findings || []);
+      let invCounts = { processes: 0, files: 0, connections: 0 };
+      if (hostId) {
+        const q = hostInventoryScanQuery({ scanId: id });
+        const [procPack, filePack, connPack] = await Promise.all([
+          api(`/v1/hosts/${hostId}/processes?${q}`).catch(() => null),
+          api(`/v1/hosts/${hostId}/files?${q}`).catch(() => null),
+          api(`/v1/hosts/${hostId}/connections?${q}`).catch(() => null),
+        ]);
+        invCounts = {
+          processes: Number(procPack?.count ?? (procPack?.processes || []).length ?? 0),
+          files: Number(filePack?.count ?? (filePack?.files || []).length ?? 0),
+          connections: Number(connPack?.count ?? (connPack?.connections || []).length ?? 0),
+        };
+      }
+      const activity = (state.activity || []).filter((e) => {
+        if (hostId && e.host_id && String(e.host_id) !== String(hostId)) return false;
+        const msg = String(e.message || "");
+        return msg.includes(String(id)) || msg.includes(shortId(id));
+      }).slice(0, 80);
+
+      state.scanDetail = {
+        id: String(id),
+        status,
+        findings,
+        invCounts,
+        activity,
+        hostId: String(hostId || ""),
+        tab: keepTab,
+      };
+      // Remember as this host's selected inventory scan too.
+      if (hostId) {
+        if (!state._hostDetailScanByHost) state._hostDetailScanByHost = {};
+        state._hostDetailScanByHost[hostId] = String(id);
+        state._hostDetailScanId = String(id);
+      }
+      closeDrawer();
+      if (!opts || !opts.skipView) setView("scan-detail", { skipHash: true });
+      else {
+        state.view = "scan-detail";
+        render();
+      }
+      const hostLabel = hostId ? hostName(hostId) : "host";
+      $("#pageTitle").textContent = `Scan ${shortId(id)}`;
+      $("#pageSub").textContent = `${hostLabel} · ${job.check_set || "scan"} · full page`;
+      return true;
+    } catch (err) {
+      toast(err.message || "Scan not found");
+      return false;
+    }
+  }
+
+  function scanDetailPage() {
+    const pack = state.scanDetail;
+    if (!pack || !pack.status) {
+      return `<section class="panel scan-page">
+        <div class="empty">No scan selected. Open one from the Scans list or a host’s scan history.</div>
+        <div class="form-actions" style="justify-content:center;margin-top:1rem">
+          <button type="button" class="btn primary" data-goto="scans">Browse scans</button>
+          <button type="button" class="btn ghost" data-goto="hosts">Hosts</button>
         </div>
-      `);
-      $$("#drawerBody [data-fid]").forEach((tr) => {
+      </section>`;
+    }
+    const id = pack.id;
+    const status = pack.status;
+    const job = status.job || {};
+    const meta = status.meta || {};
+    const hostId = pack.hostId || job.host_id || meta.host_id || "";
+    const findings = pack.findings || [];
+    const collectors = meta.collectors || [];
+    const delivery = meta.delivery || {};
+    const caps = meta.caps || {};
+    const sevCounts = severityBreakdown(findings);
+    const fired = meta.fired ?? findings.length;
+    const applicable = meta.applicable_checks ?? 0;
+    const notApplicable = meta.not_applicable ?? 0;
+    const passed = applicable
+      ? Math.max(0, applicable - Number(fired || 0) - Number(notApplicable || 0))
+      : null;
+    const when = meta.finished_at || meta.started_at || job.updated_at || "";
+    const disp = scanDisplayState({ job, meta });
+    const abs = scanPermalink(id);
+    const hash = `#/scans/${encodeURIComponent(id)}`;
+    const hostHref = hostId ? `#host/${encodeURIComponent(hostId)}` : "#/hosts";
+    const invCounts = pack.invCounts || { processes: 0, files: 0, connections: 0 };
+    const activity = pack.activity || [];
+    const capOn = Object.entries(caps).filter(([, v]) => !!v).map(([k]) => k);
+    const outcomeLabel = formatScanOutcome(meta.outcome);
+    const tab = pack.tab || "overview";
+    const pane = (name) => (tab === name ? "" : "hidden");
+    const tabCls = (name) => (tab === name ? "tab active" : "tab");
+
+    return `<section class="panel scan-page">
+      <div class="scan-detail">
+        <div class="scan-detail-head">
+          <div>
+            <div class="scan-detail-title">Scan ${esc(shortId(id))}</div>
+            <div class="scan-detail-meta">
+              <span class="pill neutral">${esc(disp)}</span>
+              <span class="muted">${esc(job.check_set || "—")}</span>
+              <span class="sep">·</span>
+              <a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(hostId)}">${esc(hostName(hostId))}</a>
+              <span class="sep">·</span>
+              <span class="mono muted">${esc(fmtWhen(when))}</span>
+              ${meta.duration_ms != null ? `<span class="sep">·</span><span class="mono muted">${esc(fmtDuration(meta.duration_ms))}</span>` : ""}
+            </div>
+          </div>
+          <div class="scan-detail-actions">
+            <button type="button" class="btn ghost tiny" data-goto="scans">All scans</button>
+            <button type="button" class="btn ghost tiny" data-copy-scan-link="${esc(abs)}">Copy link</button>
+            <button type="button" class="btn ghost tiny" data-goto-host="${esc(hostId)}">Open host</button>
+            ${hostId ? `<button type="button" class="btn primary tiny" data-rescan-host="${esc(hostId)}">Rescan</button>` : ""}
+          </div>
+        </div>
+
+        ${scanPagePickerHtml(hostId, id)}
+
+        <div class="scan-stat-grid">
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(meta.observation_count ?? "—"))}</div><div class="scan-stat-label">Observations</div></div>
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(fired))}${applicable ? `<span class="muted">/${esc(String(applicable))}</span>` : ""}</div><div class="scan-stat-label">Checks fired</div></div>
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(findings.length))}</div><div class="scan-stat-label">Findings</div></div>
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(invCounts.connections))}</div><div class="scan-stat-label">Connections</div></div>
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(invCounts.processes))}</div><div class="scan-stat-label">Processes</div></div>
+          <div class="scan-stat"><div class="scan-stat-val">${esc(String(collectors.length))}</div><div class="scan-stat-label">Collectors</div></div>
+        </div>
+
+        <div class="host-detail-tabs scan-detail-tabs" role="tablist">
+          <button type="button" class="${tabCls("overview")}" data-scan-tab="overview">Overview</button>
+          <button type="button" class="${tabCls("findings")}" data-scan-tab="findings">Findings (${findings.length})</button>
+          <button type="button" class="${tabCls("processes")}" data-scan-tab="processes">Processes (${invCounts.processes})</button>
+          <button type="button" class="${tabCls("files")}" data-scan-tab="files">Files (${invCounts.files})</button>
+          <button type="button" class="${tabCls("connections")}" data-scan-tab="connections">Connections (${invCounts.connections})</button>
+          <button type="button" class="${tabCls("collectors")}" data-scan-tab="collectors">Collectors (${collectors.length})</button>
+          <button type="button" class="${tabCls("activity")}" data-scan-tab="activity">Activity (${activity.length})</button>
+          <button type="button" class="${tabCls("raw")}" data-scan-tab="raw">Raw JSON</button>
+        </div>
+
+        <div data-scan-pane="overview" class="${pane("overview")}">
+          <div class="scan-overview-grid">
+            <dl class="kv">
+              <dt>Scan ID</dt><dd class="mono"><a class="finding-link" href="${esc(hash)}">${esc(id)}</a></dd>
+              <dt>Host</dt><dd><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(hostId)}">${esc(hostName(hostId))}</a>
+                <div class="mono muted" style="font-size:0.75rem">${esc(hostId || "—")}</div></dd>
+              <dt>Check set</dt><dd>${esc(job.check_set || "—")}</dd>
+              <dt>State / outcome</dt><dd><span class="pill neutral">${esc(disp)}</span>
+                <span class="mono muted"> · ${esc(outcomeLabel)}</span></dd>
+              <dt>Started</dt><dd class="mono">${esc(fmtWhen(meta.started_at))}</dd>
+              <dt>Finished</dt><dd class="mono">${esc(fmtWhen(meta.finished_at || when))}</dd>
+              <dt>Duration</dt><dd class="mono">${meta.duration_ms != null ? esc(fmtDuration(meta.duration_ms)) : "—"}
+                ${meta.duration_ms != null ? `<span class="muted"> (${esc(String(meta.duration_ms))} ms)</span>` : ""}</dd>
+              <dt>Coverage</dt><dd class="mono">fired ${esc(String(fired))}
+                · applicable ${esc(String(applicable || "—"))}
+                · N/A ${esc(String(notApplicable))}
+                ${passed != null ? ` · pass ${esc(String(passed))}` : ""}</dd>
+              <dt>Delivery</dt><dd><span class="tag">${esc(delivery.method || "—")}</span>
+                ${delivery.fallback_reason ? `<span class="muted"> · fallback ${esc(delivery.fallback_reason)}</span>` : ""}
+                <div class="muted" style="font-size:0.75rem">cleanup ${delivery.cleanup_ok === false ? "failed" : "ok"}${delivery.cleanup_forced ? " (forced)" : ""}
+                  · bytes ${esc(String(delivery.bytes_transferred ?? meta.bytes_from_probe ?? 0))}</div></dd>
+              <dt>Probe</dt><dd class="mono">${esc(meta.probe_version || "—")}
+                ${meta.arch ? ` · ${esc(meta.arch)}` : ""}</dd>
+              <dt>OS / kernel</dt><dd>${esc(meta.os || "—")}
+                <div class="mono muted" style="font-size:0.78rem">${esc([meta.os_id, meta.os_version].filter(Boolean).join(" ") || "—")}
+                  · ${esc(meta.kernel || "—")}</div></dd>
+              <dt>Boot ID</dt><dd class="mono">${esc(meta.boot_id || "—")}</dd>
+              <dt>Node</dt><dd class="mono">${esc(meta.node_id || job.leased_by || "—")}</dd>
+              <dt>Attempts</dt><dd class="mono">${esc(String(job.attempts ?? "—"))}
+                ${job.priority != null ? ` · priority ${esc(String(job.priority))}` : ""}</dd>
+              <dt>Capabilities</dt><dd>${capOn.length
+                ? capOn.map((c) => `<span class="tag">${esc(c)}</span>`).join(" ")
+                : `<span class="muted">none reported</span>`}</dd>
+              <dt>Link</dt><dd class="mono finding-permalink"><a href="${esc(hash)}">${esc(abs)}</a></dd>
+            </dl>
+            <div class="scan-sev-panel">
+              <h3 class="scan-pane-title">Findings by severity</h3>
+              <div class="scan-sev-bars">
+                ${["critical", "high", "medium", "low", "info"].map((s) => {
+                  const n = sevCounts[s] || 0;
+                  const max = Math.max(1, findings.length);
+                  const pct = Math.round((n / max) * 100);
+                  return `<div class="scan-sev-row">
+                    <span class="sev ${esc(s)}">${esc(s)}</span>
+                    <div class="scan-sev-track"><div class="scan-sev-fill sev-${esc(s)}" style="width:${pct}%"></div></div>
+                    <span class="mono">${n}</span>
+                  </div>`;
+                }).join("")}
+              </div>
+              <h3 class="scan-pane-title" style="margin-top:1.25rem">Inventory snapshot</h3>
+              <dl class="kv">
+                <dt>Processes</dt><dd class="mono">${esc(String(invCounts.processes))}</dd>
+                <dt>Files</dt><dd class="mono">${esc(String(invCounts.files))}</dd>
+                <dt>Connections</dt><dd class="mono">${esc(String(invCounts.connections))}</dd>
+                <dt>Observations</dt><dd class="mono">${esc(String(meta.observation_count ?? "—"))}</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+
+        <div data-scan-pane="findings" class="${pane("findings")}">
+          <div class="toolbar" style="margin-bottom:0.65rem;gap:0.45rem">
+            <input id="scanFindingQ" type="search" placeholder="Filter findings…" style="min-width:16rem" />
+            <span class="muted" style="font-size:0.78rem" id="scanFindingCount">${findings.length.toLocaleString()} findings
+              ${Number(fired) > findings.length ? ` · meta fired=${esc(String(fired))}` : ""}</span>
+          </div>
+          <div id="scanFindingsPane">${findings.length
+            ? findingsTable(findings, { hideScan: true })
+            : `<div class="empty">No findings stored for this scan${Number(fired) > 0 ? ` (meta reports ${esc(String(fired))} fired)` : ""}.</div>`}</div>
+        </div>
+
+        <div data-scan-pane="processes" class="${pane("processes")}">
+          <div class="muted" style="margin-bottom:0.65rem">Process inventory collected during this scan.</div>
+          <div id="hostProcessesPane"><div class="empty">Loading…</div></div>
+        </div>
+        <div data-scan-pane="files" class="${pane("files")}">
+          <div class="muted" style="margin-bottom:0.65rem">File inventory collected during this scan.</div>
+          <div id="hostFilesPane"><div class="empty">Loading…</div></div>
+        </div>
+        <div data-scan-pane="connections" class="${pane("connections")}">
+          <div class="muted" style="margin-bottom:0.65rem">Open sockets collected during this scan.</div>
+          <div id="hostConnectionsPane"><div class="empty">Loading…</div></div>
+        </div>
+
+        <div data-scan-pane="collectors" class="${pane("collectors")}">
+          ${!collectors.length ? `<div class="empty">No collector reports on this scan.</div>` : `
+          <table class="data"><thead><tr>
+            <th>Collector</th><th>Status</th><th>Observations</th><th>Elapsed</th><th>Reason</th>
+          </tr></thead><tbody>
+            ${collectors.map((c) => `<tr>
+              <td class="mono">${esc(c.id || "—")}</td>
+              <td><span class="pill neutral">${esc(c.status || "—")}</span></td>
+              <td class="mono">${esc(String(c.observations ?? 0))}</td>
+              <td class="mono">${c.elapsed_ms != null ? esc(fmtDuration(c.elapsed_ms)) : "—"}</td>
+              <td class="muted">${esc(c.reason || "—")}</td>
+            </tr>`).join("")}
+          </tbody></table>`}
+        </div>
+
+        <div data-scan-pane="activity" class="${pane("activity")}">
+          ${!activity.length ? `<div class="empty">No activity log lines matched this scan id.</div>` : `
+          <div class="live-log host-scan-log">${activity.map((e) => {
+            const lvl = (e.level || "info").toLowerCase();
+            return `<div class="live-log-line ${esc(lvl)}">
+              <span class="mono muted">${esc(fmtWhen(e.ts || e.time || e.created_at))}</span>
+              <span class="live-log-msg">${esc(e.message || "")}</span>
+            </div>`;
+          }).join("")}</div>`}
+        </div>
+
+        <div data-scan-pane="raw" class="${pane("raw")}">
+          <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
+            <button type="button" class="btn ghost" id="btnCopyScanJson">Copy JSON</button>
+          </div>
+          <pre class="json scan-raw-json" id="scanRawJson">${esc(JSON.stringify(status, null, 2))}</pre>
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function bindScanDetailPage() {
+    if (state.view !== "scan-detail") return;
+    const pack = state.scanDetail;
+    if (!pack || !pack.status) return;
+    const id = pack.id;
+    const hostId = pack.hostId;
+    const findings = pack.findings || [];
+    const job = pack.status.job || {};
+    const abs = scanPermalink(id);
+    const root = $("#content");
+
+    const wireFindingRows = (scope) => {
+      $$("[data-fid]", scope).forEach((tr) => {
         tr.addEventListener("click", (e) => {
           if (e.target.closest("a, button, [data-stop]")) return;
           openFindingById(tr.getAttribute("data-fid"));
         });
       });
-      $$("#drawerBody [data-fid-link]").forEach((a) => {
+      $$("[data-fid-link]", scope).forEach((a) => {
         a.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
           openFindingById(a.getAttribute("data-fid-link"));
         });
       });
-      $$("#drawerBody [data-copy-finding]").forEach((btn) => {
+      $$("[data-copy-finding]", scope).forEach((btn) => {
         btn.addEventListener("click", async (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -1018,7 +1331,7 @@
           }
         });
       });
-      $$("#drawerBody [data-goto-host]").forEach((btn) => {
+      $$("[data-goto-host]", scope).forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.preventDefault();
           const hid = btn.getAttribute("data-goto-host");
@@ -1026,11 +1339,114 @@
           else setView("hosts");
         });
       });
-      return true;
-    } catch (err) {
-      toast(err.message || "Scan not found");
-      return false;
+    };
+
+    wireFindingRows(root);
+
+    const scanSel = $("#scanPageSelect");
+    if (scanSel) {
+      scanSel.addEventListener("change", () => {
+        const sid = scanSel.value || "";
+        if (sid && sid !== String(id)) {
+          openScanById(sid, { tab: state.scanDetail?.tab || "overview" }).catch((err) => toast(err.message));
+        }
+      });
     }
+
+    const findQ = $("#scanFindingQ");
+    if (findQ) {
+      findQ.addEventListener("input", () => {
+        const q = String(findQ.value || "").toLowerCase().trim();
+        const shown = !q ? findings : findings.filter((f) => {
+          const hay = [
+            f.title, f.check_id, f.severity, f.confidence, f.status,
+            ...(f.attack || []),
+            JSON.stringify(f.evidence || {}),
+          ].join(" ").toLowerCase();
+          return hay.includes(q);
+        });
+        const paneEl = $("#scanFindingsPane");
+        const count = $("#scanFindingCount");
+        if (paneEl) {
+          paneEl.innerHTML = shown.length
+            ? findingsTable(shown, { hideScan: true })
+            : `<div class="empty">No findings match “${esc(q)}”.</div>`;
+          wireFindingRows(paneEl);
+        }
+        if (count) {
+          count.textContent = `${shown.length.toLocaleString()} / ${findings.length.toLocaleString()} findings`;
+        }
+      });
+    }
+
+    const loadTab = (tab) => {
+      if (!hostId) return;
+      const invOpts = { scanId: id };
+      if (tab === "processes") loadHostProcesses(hostId, invOpts);
+      if (tab === "files") loadHostFiles(hostId, invOpts);
+      if (tab === "connections") loadHostConnections(hostId, invOpts);
+    };
+
+    $$("[data-scan-tab]", root).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.scanTab;
+        if (state.scanDetail) state.scanDetail.tab = tab;
+        $$("[data-scan-tab]", root).forEach((b) => b.classList.toggle("active", b === btn));
+        $$("[data-scan-pane]", root).forEach((p) => {
+          p.classList.toggle("hidden", p.getAttribute("data-scan-pane") !== tab);
+        });
+        loadTab(tab);
+      });
+    });
+
+    // Auto-load inventory if we restored onto an inventory tab.
+    loadTab(pack.tab || "overview");
+
+    $$("[data-copy-scan-link]", root).forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        const url = btn.getAttribute("data-copy-scan-link") || abs;
+        try {
+          await navigator.clipboard.writeText(url);
+          toast("Scan link copied");
+        } catch (_) {
+          toast(url);
+        }
+      });
+    });
+
+    $$("[data-rescan-host]", root).forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const hid = btn.getAttribute("data-rescan-host");
+        if (!hid) return;
+        try {
+          await api(`/v1/hosts/${hid}/scan`, {
+            method: "POST",
+            body: { check_set: job.check_set || "standard", priority: 200 },
+          });
+          toast("Rescan queued");
+          await loadLive();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+
+    const copyJson = $("#btnCopyScanJson");
+    if (copyJson) {
+      copyJson.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(pack.status, null, 2));
+          toast("Scan JSON copied");
+        } catch (_) {
+          toast("Clipboard unavailable");
+        }
+      });
+    }
+
+    $$("[data-goto]", root).forEach((b) => {
+      b.addEventListener("click", () => setView(b.dataset.goto));
+    });
   }
 
   function applyLocationHash() {
@@ -1097,7 +1513,7 @@
   function render() {
     const root = $("#content");
     const views = {
-      dashboard, findings, hosts, scans, queue, activity, hunt, "fleet-sift": fleetSift, anomark, checks, data, settings,
+      dashboard, findings, hosts, scans, "scan-detail": scanDetailPage, queue, activity, hunt, "fleet-sift": fleetSift, anomark, checks, data, settings,
       "ssh-summary": sshSummary,
       "ssh-graph": sshGraphPage,
       "ssh-zones": sshZones,
@@ -1108,6 +1524,46 @@
     };
     root.innerHTML = (views[state.view] || dashboard)();
     bindView();
+  }
+
+  function hostScansFor(hostId) {
+    if (!hostId) return [];
+    return (state.scans || [])
+      .filter((s) => {
+        const hid = s.job?.host_id || s.meta?.host_id;
+        return hid && String(hid) === String(hostId);
+      })
+      .sort((a, b) => {
+        const ta = String(b.meta?.finished_at || b.job?.created_at || b.job?.id || "");
+        const tb = String(a.meta?.finished_at || a.job?.created_at || a.job?.id || "");
+        return ta.localeCompare(tb);
+      });
+  }
+
+  function scanPagePickerHtml(hostId, selectedScanId) {
+    const hostScans = hostScansFor(hostId);
+    if (!hostScans.length) {
+      return `<div class="scan-page-picker muted">No other retained scans for this host.</div>`;
+    }
+    const opts = hostScans.map((s, i) => {
+      const j = s.job || {};
+      const m = s.meta || {};
+      const sid = String(j.id || m.scan_id || "");
+      if (!sid) return "";
+      const when = m.finished_at || j.created_at || "";
+      const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
+      const label = `#${i + 1} · ${fmtWhen(when)} · ${setLabel} · ${shortId(sid)}`;
+      const sel = String(selectedScanId || "") === sid ? "selected" : "";
+      return `<option value="${esc(sid)}" ${sel}>${esc(label)}</option>`;
+    }).filter(Boolean).join("");
+    return `<div class="scan-page-picker">
+      <label>Scan for this host
+        <select id="scanPageSelect" class="ml-select" title="Switch to another retained scan for this host">
+          ${opts}
+        </select>
+      </label>
+      <span class="muted" style="font-size:0.75rem">${hostScans.length} retained · choose to open that scan’s full page</span>
+    </div>`;
   }
 
   function dashboard() {
@@ -1527,11 +1983,13 @@
 
   function findingsTable(rows, opts) {
     const compact = !!(opts && opts.compact);
+    const hideScan = !!(opts && opts.hideScan);
+    const hideHost = !!(opts && opts.hideHost);
     if (!rows.length) {
       return `<div class="empty">${compact ? "No occurrences" : "No findings match these filters. Adjust search, severity, host, or tag."}</div>`;
     }
     return `<table class="data findings-table ${compact ? "findings-table-compact" : ""}"><thead><tr>
-      <th>When</th><th>Severity</th><th>Title</th><th>Check</th><th>Host</th>${compact ? "" : "<th>Tags</th>"}<th>Scan</th><th>ATT&CK</th><th></th>
+      <th>When</th><th>Severity</th><th>Title</th><th>Check</th>${hideHost ? "" : "<th>Host</th>"}${compact || hideHost ? "" : "<th>Tags</th>"}${hideScan ? "" : "<th>Scan</th>"}<th>ATT&CK</th><th></th>
     </tr></thead><tbody>
       ${rows.map((f) => {
         const href = `#finding/${encodeURIComponent(f.id)}`;
@@ -1545,11 +2003,11 @@
         <td>${sev(f.severity)}</td>
         <td><a class="finding-link" href="${esc(href)}" data-fid-link="${esc(f.id)}">${esc(f.title)}</a></td>
         <td><span class="pill">${esc(f.check_id)}</span></td>
-        <td><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(f.host_id)}">${esc(hostName(f.host_id))}</a></td>
-        ${compact ? "" : `<td class="findings-tags">${tags.length ? tags.slice(0, 4).map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "—"}</td>`}
-        <td class="mono">${scanHref
+        ${hideHost ? "" : `<td><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(f.host_id)}">${esc(hostName(f.host_id))}</a></td>`}
+        ${compact || hideHost ? "" : `<td class="findings-tags">${tags.length ? tags.slice(0, 4).map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "—"}</td>`}
+        ${hideScan ? "" : `<td class="mono">${scanHref
           ? `<a class="finding-link" href="${esc(scanHref)}" data-open-scan="${esc(f.scan_id)}">${esc(shortId(f.scan_id))}</a>`
-          : "—"}</td>
+          : "—"}</td>`}
         <td>${(f.attack || []).map((a) =>
           `<a class="tag" href="${esc(attackUrl(a))}" target="_blank" rel="noreferrer" data-stop>${esc(a)}</a>`
         ).join(" ") || "—"}</td>
@@ -1668,6 +2126,90 @@
     }).join("")}</div>`;
   }
 
+  function isAgentLiteHost(h) {
+    const kind = String(h?.agent_kind || "").toLowerCase();
+    return kind === "agentlite" || kind === "agent_lite" || kind === "lite"
+      || String(h?.labels?.scan_mode || "").toLowerCase() === "ssh_commands";
+  }
+
+  const SCAN_INTERVAL_OPTIONS = ["5m", "15m", "30m", "1h", "6h", "12h", "24h", "7d"];
+
+  function isManualScanInterval(v) {
+    const s = String(v || "").trim().toLowerCase();
+    return !s || s === "manual" || s === "off" || s === "none" || s === "disabled" || s === "0";
+  }
+
+  function hostScanIntervalLabel(h) {
+    const v = h?.labels?.scan_interval;
+    if (isManualScanInterval(v)) return "Manual only";
+    return String(v).trim();
+  }
+
+  function scanIntervalOptionsHtml(selected, { includeManual = true, fleetHint = "" } = {}) {
+    const cur = String(selected || "").trim();
+    const manualSel = includeManual && isManualScanInterval(cur) ? "selected" : "";
+    const fleet = fleetHint || state.settings?.effective?.scan_interval || "1h";
+    let html = includeManual
+      ? `<option value="manual" ${manualSel}>Manual only (Scan now)</option>`
+      : "";
+    for (const v of SCAN_INTERVAL_OPTIONS) {
+      html += `<option value="${esc(v)}" ${cur === v ? "selected" : ""}>${esc(v)}${v === fleet ? " (fleet cadence)" : ""}</option>`;
+    }
+    return html;
+  }
+
+  function autoCollectFieldsHtml({ labels = {}, idPrefix = "autoCollect", showCheckbox = true } = {}) {
+    const interval = String(labels.scan_interval || "manual").trim() || "manual";
+    const enabled = !isManualScanInterval(interval);
+    const fleet = state.settings?.effective?.scan_interval || "1h";
+    const selectVal = enabled ? interval : fleet;
+    return `
+      <fieldset class="ssh-auth-fields" style="border:0;margin:0 0 0.85rem;padding:0">
+        <legend style="font-size:0.85rem;margin-bottom:0.25rem;font-weight:600">Automatic collection</legend>
+        ${showCheckbox ? `
+        <label class="rules-enable" style="display:flex;gap:0.5rem;align-items:center;margin:0.25rem 0">
+          <input type="checkbox" name="auto_collect" id="${esc(idPrefix)}Enable" ${enabled ? "checked" : ""} />
+          Enable scheduled collection
+        </label>` : ""}
+        <div id="${esc(idPrefix)}IntervalWrap" class="${enabled || !showCheckbox ? "" : "hidden"}" style="margin-top:0.45rem">
+          <label>Collection interval
+            <select name="scan_interval" id="${esc(idPrefix)}Interval">
+              ${showCheckbox
+                ? SCAN_INTERVAL_OPTIONS.map((v) => `<option value="${esc(v)}" ${selectVal === v ? "selected" : ""}>${esc(v)}${v === fleet ? " (fleet cadence)" : ""}</option>`).join("")
+                : scanIntervalOptionsHtml(interval, { includeManual: true, fleetHint: fleet })}
+            </select>
+          </label>
+        </div>
+        <p class="muted" style="margin:0.35rem 0 0;font-size:0.75rem">
+          New hosts stay <strong>manual</strong> until you enable this. Use <strong>Scan now</strong> anytime.
+        </p>
+      </fieldset>`;
+  }
+
+  function wireAutoCollectToggle(idPrefix = "autoCollect") {
+    const enable = $(`#${idPrefix}Enable`);
+    const wrap = $(`#${idPrefix}IntervalWrap`);
+    if (!enable || !wrap) return;
+    const sync = () => wrap.classList.toggle("hidden", !enable.checked);
+    enable.addEventListener("change", sync);
+    sync();
+  }
+
+  function applyAutoCollectFromForm(fd, labelsOut, { checkboxMode = false } = {}) {
+    const fleet = state.settings?.effective?.scan_interval || "1h";
+    if (checkboxMode) {
+      if (fd.get("auto_collect")) {
+        const v = String(fd.get("scan_interval") || fleet).trim();
+        labelsOut.scan_interval = isManualScanInterval(v) ? fleet : v;
+      } else {
+        labelsOut.scan_interval = "manual";
+      }
+      return;
+    }
+    const v = String(fd.get("scan_interval") || "manual").trim();
+    labelsOut.scan_interval = isManualScanInterval(v) ? "manual" : v;
+  }
+
   function isVirtualHost(h) {
     return String(h?.agent_kind || "").toLowerCase() === "virtual"
       || String(h?.auth_status || "").toLowerCase() === "virtual";
@@ -1759,12 +2301,19 @@
     const preset = state._hostPreset || "";
     const osId = state._hostOs || "";
     const arch = state._hostArch || "";
+    const agent = String(state._hostAgent || "").toLowerCase();
     return (state.hosts || []).filter((h) => {
       if (preset) {
         const st = hostStatus(h);
         if (preset === "active" && st.key !== "active") return false;
         if (preset === "inactive" && st.key !== "inactive") return false;
         if (preset === "offline" && st.key !== "offline") return false;
+      }
+      if (agent) {
+        const a = hostAgentInfo(h).id;
+        if (agent === "ssh" && a !== "ssh") return false;
+        if (agent === "agentlite" && a !== "agentlite") return false;
+        if (agent === "virtual" && a !== "virtual") return false;
       }
       if (env && h.labels?.env !== env) return false;
       if (profile && h.labels?.profile !== profile) return false;
@@ -1788,6 +2337,8 @@
         h.arch || "",
         h.kernel || "",
         h.agent_kind || "",
+        hostAgentInfo(h).title,
+        hostAgentInfo(h).detail,
         tagBits.join(" "),
       ].join(" ").toLowerCase();
       return tokens.every((t) => hay.includes(t));
@@ -1874,6 +2425,12 @@
                 <option value="inactive" ${state._hostPreset === "inactive" ? "selected" : ""}>Inactive only</option>
                 <option value="offline" ${state._hostPreset === "offline" ? "selected" : ""}>Offline only</option>
               </select>
+              <select id="hostAgent">
+                <option value="">All agents</option>
+                <option value="ssh" ${state._hostAgent === "ssh" ? "selected" : ""}>SSH probe</option>
+                <option value="agentlite" ${state._hostAgent === "agentlite" ? "selected" : ""}>AgentLite</option>
+                <option value="virtual" ${state._hostAgent === "virtual" ? "selected" : ""}>Virtual</option>
+              </select>
               <select id="hostOs">
                 <option value="">All OS</option>
                 ${osIds.map((e) => `<option value="${esc(e)}" ${state._hostOs === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
@@ -1906,10 +2463,11 @@
           ${!rows.length ? `<div class="empty">No hosts match filters. Use <strong>Add hosts</strong> to register endpoints.</div>` : `
           <table class="data hosts-table"><thead><tr>
             <th class="col-check"><input type="checkbox" id="hostCheckAll" ${allPageSelected ? "checked" : ""} /></th>
-            <th>Status</th><th>Host</th><th>Target</th><th>OS</th><th>Arch / kernel</th><th>Tags</th><th>Auth / last outcome</th><th>Last scan</th><th></th>
+            <th>Status</th><th>Host</th><th>Agent</th><th>Target</th><th>OS</th><th>Arch / kernel</th><th>Tags</th><th>Auth / last outcome</th><th>Last scan</th><th></th>
           </tr></thead><tbody>
             ${pageRows.map((h) => {
               const st = hostStatus(h);
+              const agent = hostAgentInfo(h);
               const tags = hostTags(h);
               const checked = selected.has(h.id) ? "checked" : "";
               const href = `#host/${encodeURIComponent(h.id)}`;
@@ -1923,6 +2481,10 @@
                   <a class="finding-link host-name-link" href="${esc(href)}" data-host-detail="${esc(h.id)}"><strong>${esc(h.display_name)}</strong></a>
                   <div class="mono muted host-id-line">${esc(shortId(h.id))}</div>
                 </td>
+                <td>
+                  <div><span class="tag">${esc(agent.title)}</span></div>
+                  <div class="muted" style="font-size:0.72rem;margin-top:0.15rem">${esc(agent.detail)}</div>
+                </td>
                 <td class="mono">${esc(h.primary_addr || "—")}:${h.ssh_port || 22}</td>
                 <td>
                   <div>${esc(osLabel)}</div>
@@ -1934,7 +2496,7 @@
                 <td class="mono muted">${esc(fmtWhen(h.last_scan_at))}</td>
                 <td class="hosts-actions" data-stop>
                   <button type="button" class="btn ghost tiny" data-copy-host-link="${esc(abs)}" title="Copy host link">Link</button>
-                  ${String(h.agent_kind || "").toLowerCase() === "virtual" || String(h.auth_status || "").toLowerCase() === "virtual"
+                  ${agent.id === "virtual"
                     ? `<button class="btn ghost tiny" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name)}" title="Update ingest from file">Update</button>
                        <button class="btn ghost tiny" data-copy-ingest="${esc(h.ingest_token || "")}" title="Copy ingest token">Token</button>`
                     : `<button class="btn ghost tiny" data-test-host="${esc(h.id)}">Test</button>
@@ -1971,7 +2533,9 @@
     if (!state.scans.length) return `<section class="panel"><div class="empty">No scan jobs yet.</div></section>`;
     const start = state.scanPage * state.pageSize;
     const pageRows = state.scans.slice(start, start + state.pageSize);
-    return `<section class="panel"><div class="panel-head"><h3>Scan jobs <span class="muted">(${state.scans.length.toLocaleString()})</span></h3></div>
+    return `<section class="panel"><div class="panel-head"><h3>Scan jobs <span class="muted">(${state.scans.length.toLocaleString()})</span></h3>
+      <span class="muted" style="font-size:0.8rem">Click a row to open the full scan page (inventory, findings, collectors).</span>
+    </div>
       <table class="data"><thead><tr>
         <th>When</th><th>Scan</th><th>Host</th><th>Set</th><th>State</th><th>Coverage</th><th>Findings</th>
       </tr></thead><tbody>
@@ -1984,7 +2548,7 @@
           const hostHref = j.host_id ? `#host/${encodeURIComponent(j.host_id)}` : "#/hosts";
           const scanHref = `#/scans/${encodeURIComponent(j.id)}`;
           const disp = scanDisplayState(s);
-          return `<tr data-scan="${esc(j.id)}">
+          return `<tr data-scan="${esc(j.id)}" class="scan-history-row" title="Open full scan page">
             <td class="mono muted">${esc(fmtWhen(when))}</td>
             <td class="mono"><a class="finding-link" href="${esc(scanHref)}" data-open-scan="${esc(j.id)}">${esc(shortId(j.id))}</a></td>
             <td><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(j.host_id || "")}">${esc(hostName(j.host_id))}</a></td>
@@ -2606,7 +3170,11 @@
 
     const out = [];
     for (const h of state.hosts || []) {
-      if (kind && String(h.agent_kind || "ssh").toLowerCase() !== kind) continue;
+      if (kind === "agentlite") {
+        if (!isAgentLiteHost(h)) continue;
+      } else if (kind === "ssh") {
+        if (isAgentLiteHost(h) || isVirtualHost(h)) continue;
+      } else if (kind && String(h.agent_kind || "ssh").toLowerCase() !== kind) continue;
       if (env && (h.labels?.env || "") !== env) continue;
       if (tokens.length) {
         const hay = siftHostSearchHay(h);
@@ -3281,6 +3849,7 @@
                   <select id="siftKind">
                     <option value="">All kinds</option>
                     <option value="ssh" ${state._siftKind === "ssh" ? "selected" : ""}>SSH</option>
+                    <option value="agentlite" ${state._siftKind === "agentlite" ? "selected" : ""}>AgentLite</option>
                     <option value="virtual" ${state._siftKind === "virtual" ? "selected" : ""}>Virtual</option>
                   </select>
                 </label>
@@ -4022,7 +4591,11 @@
     const tag = String(opts.tag ?? state._anomarkHostTag ?? "").trim().toLowerCase();
     const out = [];
     for (const h of state.hosts || []) {
-      if (kind && String(h.agent_kind || "ssh").toLowerCase() !== kind) continue;
+      if (kind === "agentlite") {
+        if (!isAgentLiteHost(h)) continue;
+      } else if (kind === "ssh") {
+        if (isAgentLiteHost(h) || isVirtualHost(h)) continue;
+      } else if (kind && String(h.agent_kind || "ssh").toLowerCase() !== kind) continue;
       if (env && (h.labels?.env || "") !== env) continue;
       if (tag) {
         const tags = fleetSiftHostTags(h).join(" ").toLowerCase();
@@ -4065,6 +4638,7 @@
         <select id="${esc(p)}HostKind">
           <option value="">All kinds</option>
           <option value="ssh" ${state[kindKey] === "ssh" ? "selected" : ""}>SSH</option>
+          <option value="agentlite" ${state[kindKey] === "agentlite" ? "selected" : ""}>AgentLite</option>
           <option value="virtual" ${state[kindKey] === "virtual" ? "selected" : ""}>Virtual</option>
         </select>
       </label>
@@ -6779,7 +7353,6 @@
     const labels = h.labels || {};
     const timeouts = h.timeouts || {};
     const fleetSet = state.settings?.effective?.default_check_set || "standard";
-    const fleetInterval = state.settings?.effective?.scan_interval || "1h";
     const fleetHistory = state.settings?.effective?.scan_history_per_host ?? 3;
     return `
       <form class="form" id="hostSettingsForm">
@@ -6792,8 +7365,7 @@
           </label>
           <label>Scan interval
             <select name="scan_interval">
-              <option value="">Fleet default (${esc(fleetInterval)})</option>
-              ${["5m","15m","30m","1h","6h","12h","24h","7d"].map((v) => `<option value="${esc(v)}" ${labels.scan_interval === v ? "selected" : ""}>${esc(v)}</option>`).join("")}
+              ${scanIntervalOptionsHtml(labels.scan_interval || "manual")}
             </select>
           </label>
           <label>Scan history keep
@@ -7861,6 +8433,92 @@
       </div>`;
   }
 
+  function hostAgentInfo(h) {
+    if (isVirtualHost(h)) {
+      return {
+        id: "virtual",
+        title: "Virtual",
+        short: "virtual",
+        detail: "log ingest · no SSH",
+      };
+    }
+    if (isAgentLiteHost(h)) {
+      return {
+        id: "agentlite",
+        title: "AgentLite",
+        short: "agentlite",
+        detail: "SSH commands only · no binary",
+      };
+    }
+    return {
+      id: "ssh",
+      title: "SSH probe",
+      short: "ssh",
+      detail: "ephemeral binary over SSH",
+    };
+  }
+
+  function agentDetailCardsHtml(pack) {
+    const info = pack?.agentless_info || {};
+    const lite = pack?.agentlite || {};
+    const platforms = (pack?.agentless || [])
+      .map((p) => {
+        const probeOk = !!p.probe?.present;
+        const loaderOk = !!p.loader?.present;
+        return `${p.label || p.arch || p.triple}: probe ${probeOk ? "✓" : "✗"} · loader ${loaderOk ? "✓" : "✗"}`;
+      })
+      .join(" · ") || "—";
+    const list = (items) =>
+      `<ul style="margin:0.35rem 0 0;padding-left:1.15rem;font-size:0.82rem;line-height:1.45">${
+        (items || []).map((x) => `<li>${esc(x)}</li>`).join("")
+      }</ul>`;
+    return `
+      <div class="settings-grid" style="padding:0 1.1rem 1rem;gap:0.85rem">
+        <section class="panel" style="margin:0;box-shadow:none;border:1px solid var(--line)">
+          <div class="panel-head" style="padding:0.75rem 0.95rem">
+            <h3 style="font-size:0.95rem;margin:0">Agentless (SSH probe)</h3>
+            <span class="tag">preferred</span>
+          </div>
+          <div style="padding:0 0.95rem 0.95rem;font-size:0.88rem">
+            <p class="muted" style="margin:0 0 0.65rem">${esc(info.description || "Ephemeral Linux probe delivered over SSH.")}</p>
+            <div class="settings-kv">
+              <div><dt>Binary</dt><dd class="mono">${esc(info.name || "rustmite-probe")}</dd></div>
+              <div><dt>Version</dt><dd class="mono">${esc(info.version || pack?.agentless_version || "?")}</dd></div>
+              <div><dt>Host footprint</dt><dd>${esc(info.host_footprint || "Ephemeral; no persistent install")}</dd></div>
+              <div><dt>Privilege</dt><dd>${esc(info.privilege || "SSH user (+ optional sudo)")}</dd></div>
+              <div><dt>Coverage</dt><dd>${esc(info.coverage || "Full catalog when collectors succeed")}</dd></div>
+              <div><dt>Platform artifacts</dt><dd class="mono" style="font-size:0.78rem">${esc(platforms)}</dd></div>
+            </div>
+            <p style="margin:0.75rem 0 0;font-weight:600;font-size:0.82rem">Delivery (attempt order)</p>
+            ${list(info.delivery_methods)}
+            <p style="margin:0.75rem 0 0;font-weight:600;font-size:0.82rem">Binaries</p>
+            ${list(info.binaries)}
+          </div>
+        </section>
+        <section class="panel" style="margin:0;box-shadow:none;border:1px solid var(--line)">
+          <div class="panel-head" style="padding:0.75rem 0.95rem">
+            <h3 style="font-size:0.95rem;margin:0">AgentLite</h3>
+            <span class="tag">no binary on host</span>
+          </div>
+          <div style="padding:0 0.95rem 0.95rem;font-size:0.88rem">
+            <p class="muted" style="margin:0 0 0.65rem">${esc(lite.description || "SSH commands-only collection.")}</p>
+            <div class="settings-kv">
+              <div><dt>Component</dt><dd class="mono">${esc(lite.name || "rustmite-agentlite")}</dd></div>
+              <div><dt>Version</dt><dd class="mono">${esc(lite.version || pack?.agentless_version || "?")}</dd></div>
+              <div><dt>Delivery</dt><dd class="mono">${esc(lite.delivery || "ssh_commands")} (Method D)</dd></div>
+              <div><dt>Host footprint</dt><dd>${esc(lite.host_footprint || "None — shell commands only")}</dd></div>
+              <div><dt>Privilege</dt><dd>${esc(lite.privilege || "SSH user (+ optional sudo)")}</dd></div>
+              <div><dt>Coverage</dt><dd>${esc(lite.coverage || "Degraded vs full probe")}</dd></div>
+              <div><dt>Policy finding</dt><dd class="mono">${esc(lite.policy_finding || "RM-POL-0021")}</dd></div>
+              <div><dt>Select when</dt><dd>Add hosts → Agent → AgentLite · or Edit host → Agent</dd></div>
+            </div>
+            <p style="margin:0.75rem 0 0;font-weight:600;font-size:0.82rem">Collectors (SSH shell)</p>
+            ${list(lite.collectors)}
+          </div>
+        </section>
+      </div>`;
+  }
+
   function versionRowsHtml(pack) {
     if (!pack) {
       return `<div class="empty">Version inventory not loaded</div>`;
@@ -7895,8 +8553,23 @@
         });
       });
     });
+    const lite = pack.agentlite || {};
+    rows.push({
+      kind: "AgentLite",
+      platform: "SSH commands only",
+      name: lite.name || "rustmite-agentlite",
+      version: lite.version || pack.agentless_version || "?",
+      sha256: null,
+      present: lite.present !== false,
+      path: null,
+      size: null,
+      error: null,
+      note: lite.description || "No probe binary on host (Method D)",
+      delivery: lite.delivery || "ssh_commands",
+    });
     const presentWithSha = rows.filter((r) => r.sha256);
     return `
+      ${agentDetailCardsHtml(pack)}
       <div class="version-hero">
         <div class="version-hero-item">
           <label>Control plane SHA-256</label>
@@ -7904,7 +8577,7 @@
         </div>
         <div class="version-hero-item">
           <label>Digests available</label>
-          <div><strong>${presentWithSha.length}</strong> <span class="muted">of ${rows.length} components</span></div>
+          <div><strong>${presentWithSha.length}</strong> <span class="muted">of ${rows.filter((r) => r.kind !== "AgentLite").length} hashed components</span></div>
           <div class="muted" style="font-size:0.78rem;margin-top:0.25rem">Full SHA-256 shown below — click Copy to clipboard</div>
         </div>
       </div>
@@ -7912,11 +8585,15 @@
         <th>Component</th><th>Platform</th><th>Version</th><th>SHA-256</th><th>Status</th>
       </tr></thead><tbody>
         ${rows.map((r) => `<tr class="${r.present ? "" : "row-missing"}">
-          <td><strong>${esc(r.kind)}</strong><div class="muted mono" style="font-size:0.72rem">${esc(r.name)}</div></td>
-          <td>${esc(r.platform)}${r.bits ? `<div class="muted" style="font-size:0.72rem">${esc(String(r.bits))}-bit</div>` : ""}</td>
+          <td><strong>${esc(r.kind)}</strong><div class="muted mono" style="font-size:0.72rem">${esc(r.name)}</div>
+            ${r.note ? `<div class="muted" style="font-size:0.72rem;margin-top:0.2rem">${esc(r.note)}</div>` : ""}
+          </td>
+          <td>${esc(r.platform)}${r.bits ? `<div class="muted" style="font-size:0.72rem">${esc(String(r.bits))}-bit</div>` : ""}${r.delivery ? `<div class="muted mono" style="font-size:0.72rem">${esc(r.delivery)}</div>` : ""}</td>
           <td class="mono">${esc(r.version)}</td>
           <td class="sha-cell">
-            ${shaCellHtml(r.sha256, r.error)}
+            ${r.kind === "AgentLite"
+              ? `<span class="muted" style="font-size:0.82rem">n/a — no binary artifact</span>`
+              : shaCellHtml(r.sha256, r.error)}
             ${r.path ? `<div class="muted" style="font-size:0.7rem;max-width:28rem;overflow:hidden;text-overflow:ellipsis;margin-top:0.25rem" title="${esc(r.path)}">${esc(r.path)}</div>` : ""}
           </td>
           <td>${r.present
@@ -7927,8 +8604,9 @@
       </tbody></table>
       <p class="muted" style="margin:0.75rem 1.1rem 1rem;font-size:0.8rem">
         Agentless package version <span class="mono">${esc(pack.agentless_version || "?")}</span>.
+        AgentLite is compiled into the scanner node (no separate ELF).
         Probe search roots: ${(pack.probe_search_roots || []).map((r) => `<span class="mono">${esc(r)}</span>`).join(" · ") || "—"}.
-        Build with <span class="mono">cargo xtask build-probes --target &lt;triple&gt;</span>.
+        Build probes with <span class="mono">cargo xtask build-probes --target &lt;triple&gt;</span>.
       </p>`;
   }
 
@@ -8322,7 +9000,9 @@
     const eff = pack.effective || {};
     const catalog = pack.catalog || [];
     const ver = state.version;
-    const tab = state._settingsTab || "overview";
+    let tab = state._settingsTab || "overview";
+    if (tab === "agentlite") tab = "overview";
+    state._settingsTab = tab;
     const tabs = [
       ["overview", "Overview"],
       ["scanning", "Scanning"],
@@ -8411,10 +9091,12 @@
         </section>
       </div>
       <section class="panel">
-        <div class="panel-head"><h3>Probe agent limits</h3></div>
+        <div class="panel-head"><h3>Agent limits</h3></div>
         <form class="form" id="probeLimitsForm" style="padding:0 1.1rem 1.1rem;margin:0">
           <p class="muted" style="margin:0 0 0.75rem;font-size:0.78rem">
-            Applied to every agentless probe pushed to hosts (memory, CPU nice, bandwidth, observation caps).
+            Applied to <strong>both</strong> agents on every scan:
+            the agentless probe (RLIMIT / nice / budget inside the ELF) and
+            <strong>AgentLite</strong> (SSH commands — observation/file caps, nice/ionice/ulimit on the remote shell, transfer pacing).
             See <span class="mono">docs/03-probe-runtime.md</span>.
           </p>
           <div class="form-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem">
@@ -8447,7 +9129,7 @@
             <input name="io_idle" type="checkbox" ${eff.probe_io_idle !== false ? "checked" : ""} />
             Idle I/O priority
           </label>
-          <button type="submit" class="btn primary">Save probe limits</button>
+          <button type="submit" class="btn primary">Save agent limits</button>
         </form>
       </section>`;
 
@@ -8780,7 +9462,7 @@
         else delete labelsOut[k];
       };
       setLabel("check_set", fd.get("check_set"));
-      setLabel("scan_interval", fd.get("scan_interval"));
+      applyAutoCollectFromForm(fd, labelsOut, { checkboxMode: false });
       setLabel("scan_history", fd.get("scan_history"));
       delete labelsOut.default_check_set;
       delete labelsOut.scan_history_per_host;
@@ -8809,11 +9491,11 @@
     const clearBtn = $("#btnClearHostOverrides");
     if (clearBtn) {
       clearBtn.addEventListener("click", async () => {
-        if (!window.confirm(`Clear check-set / interval / timeout overrides for ${h.display_name}?`)) return;
+        if (!window.confirm(`Reset overrides for ${h.display_name}? Scan schedule returns to Manual only.`)) return;
         const labelsOut = { ...(h.labels || {}) };
         delete labelsOut.check_set;
         delete labelsOut.default_check_set;
-        delete labelsOut.scan_interval;
+        labelsOut.scan_interval = "manual";
         delete labelsOut.scan_history;
         delete labelsOut.scan_history_per_host;
         try {
@@ -9092,7 +9774,7 @@
         };
         try {
           state.settings = await api("/v1/settings", { method: "PUT", body });
-          toast("Probe agent limits saved");
+          toast("Agent limits saved");
           render();
         } catch (err) {
           toast(err.message);
@@ -9182,6 +9864,7 @@
     const hostEnv = $("#hostEnv");
     const hostProfile = $("#hostProfile");
     const hostPreset = $("#hostPreset");
+    const hostAgent = $("#hostAgent");
     const hostOs = $("#hostOs");
     const hostArch = $("#hostArch");
     const applyHostFilters = (opts = {}) => {
@@ -9190,11 +9873,13 @@
       const envEl = $("#hostEnv") || hostEnv;
       const profileEl = $("#hostProfile") || hostProfile;
       const presetEl = $("#hostPreset") || hostPreset;
+      const agentEl = $("#hostAgent") || hostAgent;
       const osEl = $("#hostOs") || hostOs;
       const archEl = $("#hostArch") || hostArch;
       if (envEl) state._hostEnv = envEl.value || "";
       if (profileEl) state._hostProfile = profileEl.value || "";
       if (presetEl) state._hostPreset = presetEl.value || "";
+      if (agentEl) state._hostAgent = agentEl.value || "";
       if (osEl) state._hostOs = osEl.value || "";
       if (archEl) state._hostArch = archEl.value || "";
       state.hostPage = 0;
@@ -9230,6 +9915,7 @@
     if (hostEnv) hostEnv.addEventListener("change", onHostSelectChange);
     if (hostProfile) hostProfile.addEventListener("change", onHostSelectChange);
     if (hostPreset) hostPreset.addEventListener("change", onHostSelectChange);
+    if (hostAgent) hostAgent.addEventListener("change", onHostSelectChange);
     if (hostOs) hostOs.addEventListener("change", onHostSelectChange);
     if (hostArch) hostArch.addEventListener("change", onHostSelectChange);
 
@@ -10077,6 +10763,7 @@ title_contains = "Custom rule"
         setView("hunt");
       });
     });
+    bindScanDetailPage();
   }
 
   async function showHostDetail(id) {
@@ -10172,7 +10859,14 @@ title_contains = "Custom rule"
             <dt>Tags</dt><dd>${tags.length ? tags.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ") : "—"}</dd>
             <dt>OS</dt><dd>${esc(h.os || "—")}${h.os_id || h.os_version ? ` <span class="mono muted">(${esc([h.os_id, h.os_version].filter(Boolean).join(" "))})</span>` : ""}</dd>
             <dt>Arch / kernel</dt><dd>${esc(h.arch || "—")} / ${esc(h.kernel || "—")}</dd>
-            <dt>Agent</dt><dd>${esc(h.agent_kind || "ssh")}${h.ingest_token ? ` · ingest <span class="mono">${esc(shortId(h.ingest_token))}</span>` : ""}${virt && h.labels?.virtual_agent ? ` · profile <span class="mono">${esc(h.labels.virtual_agent)}</span>` : ""}</dd>
+            <dt>Agent</dt><dd><span class="tag">${esc(hostAgentInfo(h).title)}</span>
+              <div class="muted" style="font-size:0.8rem;margin-top:0.2rem">${esc(hostAgentInfo(h).detail)}</div>
+              ${isAgentLiteHost(h) && (h.labels?.collect_paths || "").trim()
+                ? `<div class="mono muted" style="font-size:0.78rem;margin-top:0.25rem;white-space:pre-wrap">collect_paths:\n${esc(String(h.labels.collect_paths).trim())}</div>`
+                : (isAgentLiteHost(h) ? `<div class="muted" style="font-size:0.75rem;margin-top:0.2rem">File inventory: defaults (/bin, /etc, /tmp, …). Edit host to add paths.</div>` : "")}
+              ${h.ingest_token ? `<div class="mono muted" style="font-size:0.78rem">ingest ${esc(shortId(h.ingest_token))}</div>` : ""}
+              ${virt && h.labels?.virtual_agent ? `<div class="mono muted" style="font-size:0.78rem">profile ${esc(h.labels.virtual_agent)}</div>` : ""}
+            </dd>
             <dt>Link</dt><dd class="mono finding-permalink"><a href="${esc(hostHash)}">${esc(hostAbs)}</a></dd>
           </dl>
           <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
@@ -10256,8 +10950,8 @@ title_contains = "Custom rule"
                 <td class="mono">${esc(String(fired))}/${esc(String(applicable))}</td>
                 <td>${(s.findings || []).length}</td>
                 <td class="row-actions">
-                  <button type="button" class="btn ghost tiny" data-use-inventory-scan="${esc(sid)}" title="Show Processes / Files / Connections from this scan">Inventory</button>
-                  <button type="button" class="btn ghost tiny" data-open-scan="${esc(sid)}">Open</button>
+                  <button type="button" class="btn ghost tiny" data-use-inventory-scan="${esc(sid)}" title="Show Processes / Files / Connections from this scan">Use for inventory</button>
+                  <button type="button" class="btn primary tiny" data-open-scan="${esc(sid)}">View scan</button>
                 </td>
               </tr>`;
             }).join("")}
@@ -10317,6 +11011,7 @@ title_contains = "Custom rule"
             <dt>Sudo</dt><dd>${["1","true","yes","on"].includes(String(h.labels?.ssh_sudo || "").toLowerCase())
               ? `enabled · ${esc(h.labels?.ssh_sudo_mode || "ssh_password")}`
               : "off"}</dd>
+            <dt>Scan method</dt><dd>${esc(hostAgentInfo(h).detail)}</dd>
             <dt>Auth status</dt><dd><span class="host-status ${st.key}">${esc(st.label)}</span> ${esc(h.auth_status || "never")}
               <div class="muted" style="font-size:0.8rem">${esc(h.auth_detail || "")}</div>
               <div class="muted" style="font-size:0.75rem">Checked ${esc(fmtWhen(h.auth_checked_at) || "never")}</div>
@@ -10325,7 +11020,7 @@ title_contains = "Custom rule"
             <dt>Auth timeout</dt><dd>${esc(h.timeouts?.auth_timeout_secs ?? "fleet default")}s</dd>
             <dt>Scan timeout</dt><dd>${esc(h.timeouts?.scan_timeout_secs ?? "fleet default")}s</dd>
             <dt>Preferred check set</dt><dd>${esc(h.labels?.check_set || h.labels?.default_check_set || "fleet default")}</dd>
-            <dt>Scan interval</dt><dd>${esc(h.labels?.scan_interval || "fleet default")}</dd>
+            <dt>Scan interval</dt><dd>${esc(hostScanIntervalLabel(h))}</dd>
             <dt>Scan history keep</dt><dd>${esc(h.labels?.scan_history || h.labels?.scan_history_per_host || "fleet default")}</dd>
             <dt>Connect delay</dt><dd>${esc(h.timeouts?.connect_delay_ms ?? 0)}ms</dd>
           </dl>
@@ -10336,7 +11031,7 @@ title_contains = "Custom rule"
           </div>
           <pre class="json" id="hostRawJson">${esc(JSON.stringify(pack, null, 2))}</pre>
         </div>
-      `);
+      `, { mode: "wide" });
       $$("[data-feed-virtual]", $("#drawerBody")).forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.preventDefault();
@@ -10398,6 +11093,19 @@ title_contains = "Custom rule"
           else if (active === "files") loadHostFiles(h.id, { virtual: virt });
           else if (active === "connections") loadHostConnections(h.id, { virtual: virt });
           toast(`Inventory scan → ${shortId(sid) || "latest"}`);
+        });
+      }
+      const btnViewScan = $("#btnViewSelectedScan");
+      if (btnViewScan) {
+        btnViewScan.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const sid = ($("#hostDetailScanSelect")?.value || state._hostDetailScanId || "").trim();
+          if (!sid) {
+            toast("No scan selected");
+            return;
+          }
+          openScanById(sid).catch((err) => toast(err.message));
         });
       }
 
@@ -10534,7 +11242,8 @@ title_contains = "Custom rule"
           ${opts.join("")}
         </select>
       </label>
-      <span class="muted" style="font-size:0.75rem">Applies to Processes, Files, and Connections</span>
+      <button type="button" class="btn primary tiny" id="btnViewSelectedScan" title="Open the selected scan as a full page">View scan</button>
+      <span class="muted" style="font-size:0.75rem">Applies to Processes, Files, and Connections · View scan opens the full page</span>
     </div>`;
   }
 
@@ -10667,29 +11376,46 @@ title_contains = "Custom rule"
         const shown = !q ? rows : rows.filter((f) => {
           const hay = [
             pathBytes(f.path) || f.path,
-            f.owner, f.group, f.mode, f.permissions, f.machine_id,
-            String(f.uid ?? ""), String(f.size ?? ""),
+            f.owner, f.group, f.mode, f.mode_octal, f.permissions,
+            f.machine_id, ...(f.flags || []),
+            String(f.uid ?? ""), String(f.gid ?? ""), String(f.size ?? ""),
+            String(f.inode?.s || f.inode || ""),
           ].join(" ").toLowerCase();
           return hay.includes(q);
         });
         return `
         <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem">
-          <input id="hostFileQ" type="search" placeholder="Filter by path, owner…" value="${esc(filterQ)}" style="min-width:14rem" />
+          <input id="hostFileQ" type="search" placeholder="Filter by path, owner, mode…" value="${esc(filterQ)}" style="min-width:14rem" />
           <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()} · ${esc(src)}</span>
         </div>
         <table class="data"><thead><tr>
-          <th>Path</th><th>Size</th><th>Mode</th><th>UID</th><th>Owner</th><th>Group</th><th>Mtime</th>
+          <th>Path</th><th>Size</th><th>Mode</th><th>Owner</th><th>Group</th><th>UID</th><th>GID</th><th>Inode</th><th>Flags</th>
         </tr></thead><tbody>
           ${shown.slice(0, 5000).map((f) => {
             const p = pathBytes(f.path) || f.path || "—";
+            const modeDisp = f.mode_octal
+              || (typeof f.mode === "number" ? (f.mode & 0o7777).toString(8).padStart(4, "0") : (f.mode ?? f.permissions ?? "—"));
+            const sizeVal = f.size?.s ?? f.size ?? "—";
+            const inodeVal = f.inode?.s ?? f.inode ?? "—";
+            const owner = f.owner || (f.uid != null ? `uid:${f.uid}` : "—");
+            const group = f.group
+              || (f.gid === 0 ? "root" : null)
+              || (f.gid != null ? `gid:${f.gid}` : "—");
+            const flags = Array.isArray(f.flags) ? f.flags : [
+              f.setuid ? "setuid" : null,
+              f.setgid ? "setgid" : null,
+              f.immutable ? "immutable" : null,
+            ].filter(Boolean);
             return `<tr>
-              <td class="mono" title="${esc(p)}">${esc(String(p).length > 80 ? String(p).slice(0, 80) + "…" : p)}</td>
-              <td class="mono">${esc(f.size ?? "—")}</td>
-              <td class="mono">${esc(f.mode ?? f.permissions ?? "—")}</td>
+              <td class="mono" title="${esc(p)}">${esc(String(p).length > 72 ? String(p).slice(0, 72) + "…" : p)}</td>
+              <td class="mono">${esc(sizeVal)}</td>
+              <td class="mono">${esc(modeDisp)}</td>
+              <td class="mono">${esc(owner)}</td>
+              <td class="mono">${esc(group)}</td>
               <td class="mono">${esc(f.uid ?? "—")}</td>
-              <td class="mono">${esc(f.owner || "—")}</td>
-              <td class="mono">${esc(f.group || "—")}</td>
-              <td class="mono muted">${esc(f.mtime || "—")}</td>
+              <td class="mono">${esc(f.gid ?? "—")}</td>
+              <td class="mono">${esc(inodeVal)}</td>
+              <td>${flags.length ? flags.map((x) => `<span class="tag">${esc(x)}</span>`).join(" ") : "—"}</td>
             </tr>`;
           }).join("")}
         </tbody></table>
@@ -10799,6 +11525,16 @@ title_contains = "Custom rule"
           sudoMode: labels.ssh_sudo_mode || (labels.ssh_password_file ? "ssh_password" : "nopasswd"),
           sudoPasswordFileValue: labels.ssh_sudo_password_file || "",
         })}
+        ${String(h.agent_kind || "").toLowerCase() !== "virtual" ? `
+        <label>Agent
+          <select name="agent_kind">
+            <option value="ssh" ${!isAgentLiteHost(h) ? "selected" : ""}>SSH probe (ephemeral binary)</option>
+            <option value="agentlite" ${isAgentLiteHost(h) ? "selected" : ""}>AgentLite (SSH commands only, no binary)</option>
+          </select>
+        </label>
+        <p class="muted" style="margin:0.25rem 0 0.75rem;font-size:0.75rem">
+          AgentLite never copies a probe onto the host — collection uses read-only SSH shell commands (sudo when configured). Coverage is lower; scans raise RM-POL-0021.
+        </p>` : ""}
         <div class="form-row">
           <label>Env
             <input name="env" value="${esc(labels.env || "")}" />
@@ -10820,10 +11556,9 @@ title_contains = "Custom rule"
               ${CHECK_SETS.map((s) => `<option value="${esc(s.id)}" ${(labels.check_set || labels.default_check_set) === s.id ? "selected" : ""}>${esc(s.title)}</option>`).join("")}
             </select>
           </label>
-          <label>Scan interval override
+          <label>Scan interval
             <select name="scan_interval">
-              <option value="">Fleet default (${esc(state.settings?.effective?.scan_interval || "1h")})</option>
-              ${["5m","15m","30m","1h","6h","12h","24h","7d"].map((v) => `<option value="${esc(v)}" ${labels.scan_interval === v ? "selected" : ""}>${esc(v)}</option>`).join("")}
+              ${scanIntervalOptionsHtml(labels.scan_interval || "manual")}
             </select>
           </label>
           <label>Scan history keep
@@ -10860,6 +11595,15 @@ title_contains = "Custom rule"
             <input name="connect_delay_ms" type="number" min="0" value="${esc(timeouts.connect_delay_ms ?? "")}" />
           </label>
         </div>
+        ${String(h.agent_kind || "").toLowerCase() !== "virtual" ? `
+        <div id="editHostCollectPaths" class="${isAgentLiteHost(h) ? "" : "hidden"}">
+          <label>Extra file paths to inventory (AgentLite)
+            <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh">${esc(labels.collect_paths || "")}</textarea>
+          </label>
+          <p class="muted" style="margin:0.25rem 0 0.75rem;font-size:0.75rem">
+            Absolute files or directories (one per line, or comma-separated). Merged with AgentLite defaults (/bin, /usr/bin, /etc, /tmp, …). Directories are walked shallowly (depth ≤3).
+          </p>
+        </div>` : ""}
         <div class="form-actions">
           <button type="button" class="btn ghost" data-close-modal>Cancel</button>
           <button class="btn primary" type="submit">Save</button>
@@ -10870,6 +11614,15 @@ title_contains = "Custom rule"
     wireIdentityPicker("ssh_identity", "editHostIdentityFile");
     wireSshAuthMethodToggle(editForm);
     wireSshSudoToggle(editForm);
+    const editAgentSel = editForm?.querySelector('select[name="agent_kind"]');
+    const editPaths = $("#editHostCollectPaths");
+    if (editAgentSel && editPaths) {
+      const syncEditPaths = () => {
+        editPaths.classList.toggle("hidden", String(editAgentSel.value || "") !== "agentlite");
+      };
+      editAgentSel.addEventListener("change", syncEditPaths);
+      syncEditPaths();
+    }
     editForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -10886,8 +11639,9 @@ title_contains = "Custom rule"
       setLabel("credential", fd.get("credential"));
       setLabel("ssh_user", fd.get("ssh_user"));
       setLabel("check_set", fd.get("check_set"));
-      setLabel("scan_interval", fd.get("scan_interval"));
+      applyAutoCollectFromForm(fd, labelsOut, { checkboxMode: false });
       setLabel("scan_history", fd.get("scan_history"));
+      setLabel("collect_paths", fd.get("collect_paths"));
       delete labelsOut.default_check_set;
       delete labelsOut.scan_history_per_host;
       const auth = readSshAuthFromForm(fd);
@@ -10911,6 +11665,13 @@ title_contains = "Custom rule"
         toast(err.message);
         return;
       }
+      const agentKind = String(fd.get("agent_kind") || h.agent_kind || "ssh").trim().toLowerCase();
+      if (agentKind === "agentlite") {
+        labelsOut.scan_mode = "ssh_commands";
+      } else {
+        delete labelsOut.scan_mode;
+        delete labelsOut.collect_paths;
+      }
       const numOrUndef = (v) => {
         const s = String(v ?? "").trim();
         if (!s) return undefined;
@@ -10924,6 +11685,9 @@ title_contains = "Custom rule"
             display_name: String(fd.get("display_name") || "").trim(),
             primary_addr: String(fd.get("primary_addr") || "").trim(),
             ssh_port: Number(fd.get("ssh_port") || 22),
+            agent_kind: String(h.agent_kind || "").toLowerCase() === "virtual"
+              ? undefined
+              : (agentKind === "agentlite" ? "agentlite" : "ssh"),
             labels: labelsOut,
             timeouts: {
               connect_timeout_secs: numOrUndef(fd.get("connect_timeout_secs")),
@@ -11094,13 +11858,16 @@ title_contains = "Custom rule"
 
   function exportHostsCsv() {
     const rows = filteredHosts();
-    const header = ["id", "display_name", "primary_addr", "ssh_port", "os", "os_id", "os_version", "arch", "kernel", "status", "last_outcome", "last_scan_at", "env", "profile", "region", "tags"];
+    const header = ["id", "display_name", "agent", "agent_detail", "primary_addr", "ssh_port", "os", "os_id", "os_version", "arch", "kernel", "status", "last_outcome", "last_scan_at", "env", "profile", "region", "tags"];
     const lines = [header.join(",")];
     for (const h of rows) {
       const st = hostStatus(h);
+      const agent = hostAgentInfo(h);
       const cells = [
         h.id,
         h.display_name,
+        agent.title,
+        agent.detail,
         h.primary_addr || "",
         h.ssh_port || 22,
         h.os || "",
@@ -11252,10 +12019,10 @@ title_contains = "Custom rule"
       <div class="ssh-sudo-fields" style="margin-top:0.75rem;padding-top:0.65rem;border-top:1px solid var(--line)">
         <label style="display:flex;align-items:center;gap:0.45rem;font-weight:600">
           <input type="checkbox" name="ssh_sudo" value="1" ${enabled ? "checked" : ""} data-ssh-sudo-toggle />
-          Escalate probe with sudo (root)
+          Escalate with sudo (root)
         </label>
         <p class="muted" style="margin:0.35rem 0 0.5rem;font-size:0.75rem">
-          Required for reliable listener ownership and other root-only <span class="mono">/proc</span> reads when SSH is a non-root user.
+          Required for <span class="mono">/etc/shadow</span>, other users' keys, and reliable <span class="mono">/proc</span> reads when SSH is a non-root user (applies to SSH probe and AgentLite scans).
         </p>
         <div data-ssh-sudo-pane class="${enabled ? "" : "hidden"}">
           <label>Sudo mode
@@ -11398,17 +12165,36 @@ title_contains = "Custom rule"
     openModal("Add hosts", `
       <form class="form" id="addHostForm">
         <p class="muted" style="margin:0 0 0.75rem;font-size:0.88rem">
-          Paste hostnames, IPs, or IPv4 CIDR netblocks (one per line). Use <strong>Test connection</strong>
-          on the first host to verify SSH reachability and credentials before Finish.
+          Choose an agent, then paste hostnames, IPs, or IPv4 CIDR netblocks.
+          Use <strong>Test connection</strong> on the first host to verify SSH before Finish.
         </p>
-        <label>Type
+        <fieldset class="ssh-auth-fields" style="border:0;margin:0 0 0.85rem;padding:0">
+          <legend style="font-size:0.85rem;margin-bottom:0.25rem;font-weight:600">Agent</legend>
+          <div class="ssh-auth-method" role="radiogroup" aria-label="Agent">
+            <label title="Ephemeral probe binary over SSH (highest fidelity)">
+              <input type="radio" name="agent_kind" value="ssh" checked data-add-agent />
+              SSH probe
+            </label>
+            <label title="SSH shell commands only — no binary on the host">
+              <input type="radio" name="agent_kind" value="agentlite" data-add-agent />
+              AgentLite
+            </label>
+            <label title="Log ingest only — no SSH">
+              <input type="radio" name="agent_kind" value="virtual" data-add-agent />
+              Virtual
+            </label>
+          </div>
+          <p id="addHostAgentHint" class="muted" style="margin:0.45rem 0 0;font-size:0.78rem">
+            Ephemeral probe delivered over SSH (memfd/tmpfs). Highest fidelity.
+          </p>
+        </fieldset>
+        <div id="addHostSshFields">
+        <label>Input
           <select name="add_type" id="addHostType">
-            <option value="list">IP / Hostname list (SSH agent)</option>
+            <option value="list">Hostname / IP list</option>
             <option value="cidr">IP netblock list (CIDR)</option>
-            <option value="virtual">Virtual agent (log ingest, no SSH)</option>
           </select>
         </label>
-        <div id="addHostSshFields">
         <label id="addHostListLabel">Hosts (one hostname or IP per line)
           <textarea name="hosts" placeholder="vm&#10;web-01.internal&#10;10.0.0.12" rows="6"></textarea>
         </label>
@@ -11487,6 +12273,15 @@ title_contains = "Custom rule"
         <label>Tags (optional, comma-separated)
           <input name="tags" placeholder="linux, pci" />
         </label>
+        ${autoCollectFieldsHtml({ labels: { scan_interval: "manual" }, idPrefix: "addHostAuto", showCheckbox: true })}
+        <div id="addHostCollectPaths" class="hidden" style="margin-top:0.65rem">
+          <label>Extra file paths to inventory (AgentLite)
+            <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh"></textarea>
+          </label>
+          <p class="muted" style="margin:0.25rem 0 0;font-size:0.75rem">
+            Absolute files or directories (one per line, or comma-separated). Always merged with defaults (/bin, /usr/bin, /etc, /tmp, …).
+          </p>
+        </div>
         <div id="addHostTestResult"></div>
         <div class="form-actions" style="justify-content:space-between;flex-wrap:wrap">
           <button type="button" class="btn ghost" id="btnTestHostConn">Test connection</button>
@@ -11501,37 +12296,55 @@ title_contains = "Custom rule"
     const listLabel = $("#addHostListLabel");
     const sshFields = $("#addHostSshFields");
     const virtFields = $("#addHostVirtualFields");
+    const agentHint = $("#addHostAgentHint");
+    const collectPathsBox = $("#addHostCollectPaths");
     const testBtn = $("#btnTestHostConn");
+    const form = $("#addHostForm");
+    const agentHints = {
+      ssh: "Ephemeral probe delivered over SSH (memfd/tmpfs). Highest fidelity.",
+      agentlite: "SSH shell commands only — nothing is copied onto the host. Lower coverage; scans raise RM-POL-0021. Enable sudo when the SSH user is not root. Optionally add extra file paths at the bottom.",
+      virtual: "Log ingest only — no SSH. Create a host, then push JSONL/CSV or import a day folder.",
+    };
+    const selectedAgent = () => {
+      const checked = form?.querySelector('input[name="agent_kind"]:checked');
+      return String(checked?.value || "ssh");
+    };
     wireVirtualUploadPickers("#addHostVirtualFiles", "#addHostVirtualDir", "#addHostVirtualPickStatus", {
       idPrefix: "addVirt",
     });
     wireTreeHostFromFields("addVirt", "#addVirtDisplayNameWrap");
     const syncAddType = () => {
-      const v = typeSel?.value || "list";
-      const isVirt = v === "virtual";
+      const agent = selectedAgent();
+      const isVirt = agent === "virtual";
+      const inputType = typeSel?.value || "list";
       if (sshFields) sshFields.classList.toggle("hidden", isVirt);
       if (virtFields) virtFields.classList.toggle("hidden", !isVirt);
+      if (collectPathsBox) collectPathsBox.classList.toggle("hidden", agent !== "agentlite");
+      if (agentHint) agentHint.textContent = agentHints[agent] || agentHints.ssh;
       if (testBtn) {
         testBtn.classList.toggle("hidden", isVirt);
         testBtn.disabled = isVirt;
       }
       if (listLabel && !isVirt) {
-        listLabel.firstChild.textContent = v === "cidr"
+        listLabel.firstChild.textContent = inputType === "cidr"
           ? "IP netblocks (CIDR, one per line)"
           : "Hosts (one hostname or IP per line)";
       }
     };
+    form?.querySelectorAll("[data-add-agent]").forEach((el) => {
+      el.addEventListener("change", syncAddType);
+    });
     if (typeSel) typeSel.addEventListener("change", syncAddType);
     syncAddType();
-    const form = $("#addHostForm");
     const resultEl = $("#addHostTestResult");
     let lastTest = null;
     wireIdentityPicker("identity", "addHostIdentityFile");
     wireSshAuthMethodToggle(form);
     wireSshSudoToggle(form);
+    wireAutoCollectToggle("addHostAuto");
 
     $("#btnTestHostConn").addEventListener("click", async () => {
-      if (($("#addHostType")?.value || "") === "virtual") {
+      if (selectedAgent() === "virtual") {
         toast("Virtual agents do not use SSH — Finish to create, then push logs");
         return;
       }
@@ -11583,7 +12396,7 @@ title_contains = "Custom rule"
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      if (String(fd.get("add_type") || "") === "virtual") {
+      if (String(fd.get("agent_kind") || "ssh") === "virtual") {
         const labels = {};
         ["env", "profile", "region", "tags"].forEach((k) => {
           const v = String(fd.get(k) || "").trim();
@@ -11788,6 +12601,7 @@ title_contains = "Custom rule"
         if (v) labels[k] = v;
       });
       if (sshUser) labels.ssh_user = sshUser;
+      applyAutoCollectFromForm(fd, labels, { checkboxMode: true });
 
       try {
         if (auth.method === "password") {
@@ -11813,6 +12627,19 @@ title_contains = "Custom rule"
       } catch (err) {
         toast(err.message);
         return;
+      }
+
+      const agentKind = String(fd.get("agent_kind") || "ssh").trim().toLowerCase() === "agentlite"
+        ? "agentlite"
+        : "ssh";
+      if (agentKind === "agentlite") {
+        labels.scan_mode = "ssh_commands";
+        const paths = String(fd.get("collect_paths") || "").trim();
+        if (paths) labels.collect_paths = paths;
+        else delete labels.collect_paths;
+      } else {
+        delete labels.scan_mode;
+        delete labels.collect_paths;
       }
 
       const hasCred = !!(
@@ -11857,6 +12684,7 @@ title_contains = "Custom rule"
               display_name: line,
               primary_addr: line,
               ssh_port: port,
+              agent_kind: agentKind,
               labels,
               auth_status,
               auth_detail,
@@ -11866,7 +12694,7 @@ title_contains = "Custom rule"
           if (submitBtn && n % 25 === 0) submitBtn.textContent = `Adding ${n}/${lines.length}…`;
         }
         closeModal();
-        toast(`Added ${n} host(s)${!hasCred ? " · marked inactive (no credential)" : ""}`);
+        toast(`Added ${n} ${agentKind === "agentlite" ? "AgentLite " : ""}host(s)${!hasCred ? " · marked inactive (no credential)" : ""}`);
         await loadAll();
         setView("hosts");
       } catch (err) {

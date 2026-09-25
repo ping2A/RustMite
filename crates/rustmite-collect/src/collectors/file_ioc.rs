@@ -204,6 +204,8 @@ fn file_meta_if_interesting(rel: &str, st: &Statx) -> Option<FileMetaObs> {
         setuid,
         setgid,
         immutable: false,
+        owner: None,
+        group: None,
     })
 }
 

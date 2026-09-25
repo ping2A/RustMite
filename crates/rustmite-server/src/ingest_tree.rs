@@ -469,6 +469,8 @@ fn file_obs_from_raw(e: &RawFileEntry) -> Observation {
         setuid: mode & 0o4000 != 0,
         setgid: mode & 0o2000 != 0,
         immutable: false,
+        owner: e.owner.clone(),
+        group: e.group.clone(),
     })
 }
 
