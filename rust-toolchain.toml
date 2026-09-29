@@ -6,4 +6,3 @@ targets = [
     "aarch64-unknown-linux-musl",
 ]
 profile = "minimal"
-g more 
