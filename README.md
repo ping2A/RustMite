@@ -59,6 +59,7 @@ Local console (see `./dev.sh help`):
 
 ```bash
 ./dev.sh start
+# → http://127.0.0.1:8080/  (sign in admin / admin; enable MFA under Settings → Account)
 ```
 
 ## Docker

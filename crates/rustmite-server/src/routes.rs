@@ -19,8 +19,9 @@ use rustmite_store::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::bearer_auth;
+use crate::auth::{require_auth, AuthGate};
 use crate::clickhouse::ClickHouseClient;
+use crate::operator_auth::OperatorAuth;
 use crate::openapi::openapi_json;
 use crate::settings::RuntimeSettings;
 use crate::ssh_hunter;
@@ -53,10 +54,15 @@ pub struct AppState {
     pub sift_platform: crate::sift_platform::SiftPlatform,
     /// Named virtual-agent profiles (JSONL field mappings).
     pub virtual_agents: crate::virtual_agents::VirtualAgentStore,
+    /// Operator console users / sessions / MFA (Mobipwn-style).
+    pub operator_auth: Arc<OperatorAuth>,
 }
 
 pub fn operator_router(state: AppState) -> Router {
-    let token = state.api_token.clone();
+    let gate = AuthGate {
+        auth: state.operator_auth.clone(),
+        api_token: state.api_token.clone(),
+    };
     Router::new()
         .route("/", get(ui::index))
         .route("/ui", get(ui::index))
@@ -66,6 +72,7 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/version", get(version_inventory))
         .route("/v1/openapi.json", get(openapi))
+        .merge(crate::routes_auth::auth_routes())
         .route("/v1/summary", get(summary))
         .route("/v1/checks", get(list_checks).post(create_check))
         .route("/v1/checks/reload", axum::routing::post(reload_checks))
@@ -217,8 +224,8 @@ pub fn operator_router(state: AppState) -> Router {
         .merge(crate::virtual_agents::virtual_agent_routes())
         .merge(crate::anomark_api::anomark_routes())
         .layer(middleware::from_fn(move |req, next| {
-            let token = token.clone();
-            async move { bearer_auth(token, req, next).await }
+            let gate = gate.clone();
+            async move { require_auth(gate, req, next).await }
         }))
         .with_state(state)
 }

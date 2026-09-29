@@ -231,6 +231,9 @@ fn fnv1a_host(id: HostId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustmite_store::HostRecord;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     #[test]
     fn manual_intervals_are_off() {
@@ -241,5 +244,97 @@ mod tests {
         assert_eq!(parse_interval_secs("1h"), Some(3600));
         assert_eq!(parse_interval_secs("15m"), Some(900));
         assert_eq!(parse_interval_secs("7d"), Some(7 * 86400));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+    }
+
+    fn host_with(interval: Option<&str>, auth: Option<&str>) -> HostRecord {
+        let mut labels = BTreeMap::new();
+        if let Some(v) = interval {
+            labels.insert("scan_interval".into(), v.into());
+        }
+        labels.insert("ssh_identity".into(), "id_ed25519".into());
+        HostRecord {
+            id: HostId::new_v4(),
+            tenant_id: Uuid::nil(),
+            display_name: "h".into(),
+            primary_addr: Some("10.0.0.1".into()),
+            ssh_port: 22,
+            arch: None,
+            kernel: None,
+            os: None,
+            os_id: None,
+            os_version: None,
+            agent_kind: "ssh".into(),
+            ingest_token: None,
+            labels,
+            last_scan_at: None,
+            last_outcome: None,
+            timeouts: Default::default(),
+            auth_status: auth.map(|s| s.into()),
+            auth_detail: None,
+            auth_checked_at: None,
+        }
+    }
+
+    #[test]
+    fn auto_interval_requires_concrete_duration() {
+        assert_eq!(host_auto_interval_secs(&host_with(None, Some("ok"))), None);
+        assert_eq!(
+            host_auto_interval_secs(&host_with(Some("manual"), Some("ok"))),
+            None
+        );
+        assert_eq!(
+            host_auto_interval_secs(&host_with(Some("off"), Some("ok"))),
+            None
+        );
+        assert_eq!(
+            host_auto_interval_secs(&host_with(Some("1h"), Some("ok"))),
+            Some(3600)
+        );
+        assert_eq!(
+            host_auto_interval_secs(&host_with(Some("30m"), Some("ok"))),
+            Some(1800)
+        );
+    }
+
+    #[test]
+    fn host_can_scan_requires_cred_and_reachable_auth() {
+        let ok = host_with(Some("1h"), Some("ok"));
+        assert!(host_can_scan(&ok));
+
+        let mut no_cred = ok.clone();
+        no_cred.labels.remove("ssh_identity");
+        assert!(!host_can_scan(&no_cred));
+
+        let mut unreachable = ok.clone();
+        unreachable.auth_status = Some("unreachable".into());
+        assert!(!host_can_scan(&unreachable));
+
+        let mut no_cred_status = ok.clone();
+        no_cred_status.auth_status = Some("no_credential".into());
+        assert!(!host_can_scan(&no_cred_status));
+    }
+
+    #[test]
+    fn never_scanned_auto_host_is_due() {
+        let h = host_with(Some("1h"), Some("ok"));
+        let now = OffsetDateTime::now_utc();
+        assert!(host_is_due(&h, 3600, 0, now));
+    }
+
+    #[test]
+    fn recently_scanned_host_is_not_due() {
+        let mut h = host_with(Some("1h"), Some("ok"));
+        let now = OffsetDateTime::now_utc();
+        h.last_scan_at = Some(now.to_string());
+        assert!(!host_is_due(&h, 3600, 0, now));
+    }
+
+    #[test]
+    fn virtual_agent_kind_skipped_by_interval_helper_still_parses() {
+        let mut h = host_with(Some("1h"), Some("ok"));
+        h.agent_kind = "virtual".into();
+        // Interval helper is kind-agnostic; scheduler loop skips virtuals separately.
+        assert_eq!(host_auto_interval_secs(&h), Some(3600));
     }
 }

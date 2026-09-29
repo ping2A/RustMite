@@ -22,7 +22,31 @@
 <body>
   <div id="nyanOverlay" class="nyan-overlay" aria-hidden="true"></div>
 
-  <div id="app" class="shell">
+  <div id="loginOverlay" class="login-overlay" aria-hidden="false">
+    <form class="login-card" id="loginForm">
+      <img class="login-logo" src="/ui/assets/logo-mark.png" width="56" height="56" alt="" />
+      <h1>RustMite</h1>
+      <p class="muted login-lead">Sign in to the operator console</p>
+      <p id="loginError" class="login-error hidden"></p>
+      <div id="loginCredFields">
+        <label>Username
+          <input name="username" autocomplete="username" value="admin" />
+        </label>
+        <label>Password
+          <input name="password" type="password" autocomplete="current-password" value="admin" />
+        </label>
+      </div>
+      <div id="loginMfaFields" class="hidden">
+        <label>Authenticator code
+          <input name="mfa_code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" />
+        </label>
+      </div>
+      <button class="btn primary" type="submit" id="loginSubmit">Sign in</button>
+      <p class="muted login-hint">Default account: admin / admin · enable MFA under Settings → Account</p>
+    </form>
+  </div>
+
+  <div id="app" class="shell hidden">
     <aside class="sidebar">
       <div class="brand">
         <img class="brand-logo" src="/ui/assets/logo-mark.png" width="64" height="64" alt="RustMite" />
@@ -62,8 +86,10 @@
       </nav>
       <div class="sidebar-foot">
         <div class="health" id="healthPill">connecting…</div>
-        <label class="token-label">API token
-          <input id="apiToken" type="password" placeholder="optional Bearer" autocomplete="off" />
+        <div id="sessionUser" class="session-user muted" style="font-size:0.78rem;margin:0.35rem 0"></div>
+        <button type="button" class="btn ghost hidden" id="btnLogout" style="width:100%;margin-bottom:0.35rem">Sign out</button>
+        <label class="token-label">Legacy API token
+          <input id="apiToken" type="password" placeholder="optional shared Bearer" autocomplete="off" />
         </label>
       </div>
     </aside>

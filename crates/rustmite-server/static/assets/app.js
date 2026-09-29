@@ -32,7 +32,12 @@
     ssh: null,
     _selectedSshKeys: [],
     virtualAgents: [],
+    authUser: null,
+    requireAuth: true,
+    _authReady: false,
   };
+
+  const SESSION_KEY = "rustmite_session";
 
   let _hostFilterTimer = 0;
   let _siftFilterTimer = 0;
@@ -71,13 +76,172 @@
   const $ = (sel, el = document) => el.querySelector(sel);
   const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 
+  function sessionToken() {
+    return localStorage.getItem(SESSION_KEY) || "";
+  }
+
+  function setSessionToken(v) {
+    if (v) localStorage.setItem(SESSION_KEY, v);
+    else localStorage.removeItem(SESSION_KEY);
+  }
+
   function token() {
-    return localStorage.getItem("rustmite_api_token") || $("#apiToken").value.trim();
+    return sessionToken()
+      || localStorage.getItem("rustmite_api_token")
+      || ($("#apiToken")?.value || "").trim();
   }
 
   function saveToken(v) {
     if (v) localStorage.setItem("rustmite_api_token", v);
     else localStorage.removeItem("rustmite_api_token");
+  }
+
+  function showLogin(show) {
+    const overlay = $("#loginOverlay");
+    const app = $("#app");
+    if (overlay) {
+      overlay.classList.toggle("hidden", !show);
+      overlay.setAttribute("aria-hidden", show ? "false" : "true");
+    }
+    if (app) app.classList.toggle("hidden", !!show);
+  }
+
+  function updateSessionChrome() {
+    const el = $("#sessionUser");
+    const logout = $("#btnLogout");
+    if (el) {
+      el.textContent = state.authUser
+        ? `${state.authUser.username} · ${state.authUser.role}${state.authUser.totp_enabled ? " · MFA" : ""}`
+        : (state.requireAuth ? "" : "auth off");
+    }
+    if (logout) logout.classList.toggle("hidden", !state.authUser && !sessionToken());
+  }
+
+  async function fetchAuthStatus() {
+    const res = await fetch("/v1/auth/status", { headers: { Accept: "application/json" } });
+    if (!res.ok) return { require_auth: true };
+    return res.json();
+  }
+
+  async function fetchMe() {
+    const t = sessionToken();
+    if (!t) return null;
+    try {
+      const res = await fetch("/v1/auth/me", {
+        headers: { Accept: "application/json", Authorization: `Bearer ${t}` },
+      });
+      if (res.status === 401) {
+        setSessionToken(null);
+        return null;
+      }
+      if (!res.ok) return null;
+      return res.json();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function ensureAuth() {
+    const st = await fetchAuthStatus().catch(() => ({ require_auth: true }));
+    state.requireAuth = !!st.require_auth;
+    if (!state.requireAuth) {
+      state.authUser = { username: "anonymous", role: "admin", totp_enabled: false };
+      state._authReady = true;
+      showLogin(false);
+      updateSessionChrome();
+      return true;
+    }
+    const me = await fetchMe();
+    if (me) {
+      state.authUser = me;
+      state._authReady = true;
+      showLogin(false);
+      updateSessionChrome();
+      return true;
+    }
+    state.authUser = null;
+    state._authReady = false;
+    showLogin(true);
+    updateSessionChrome();
+    return false;
+  }
+
+  function wireLoginForm() {
+    const form = $("#loginForm");
+    if (!form || form.dataset.wired) return;
+    form.dataset.wired = "1";
+    let challengeId = null;
+    const errEl = $("#loginError");
+    const cred = $("#loginCredFields");
+    const mfa = $("#loginMfaFields");
+    const submit = $("#loginSubmit");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      if (errEl) {
+        errEl.textContent = "";
+        errEl.classList.add("hidden");
+      }
+      if (submit) submit.disabled = true;
+      try {
+        if (challengeId) {
+          const res = await fetch("/v1/auth/mfa", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({
+              challenge_id: challengeId,
+              code: String(fd.get("mfa_code") || "").trim(),
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.message || data.detail || (typeof data === "string" ? data : "invalid code"));
+          setSessionToken(data.token);
+          state.authUser = data.user;
+          challengeId = null;
+          showLogin(false);
+          updateSessionChrome();
+          await loadAll();
+          startPolling();
+          render();
+          return;
+        }
+        const res = await fetch("/v1/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            username: String(fd.get("username") || "").trim(),
+            password: String(fd.get("password") || ""),
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const msg = typeof data === "string" ? data : (data.message || data.detail || "invalid credentials");
+          throw new Error(msg);
+        }
+        if (data.mfa_required) {
+          challengeId = data.challenge_id;
+          if (cred) cred.classList.add("hidden");
+          if (mfa) mfa.classList.remove("hidden");
+          if (submit) submit.textContent = "Verify MFA";
+          form.querySelector('[name="mfa_code"]')?.focus();
+          return;
+        }
+        setSessionToken(data.token);
+        state.authUser = data.user;
+        showLogin(false);
+        updateSessionChrome();
+        await loadAll();
+        startPolling();
+        render();
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = err.message || String(err);
+          errEl.classList.remove("hidden");
+        }
+      } finally {
+        if (submit) submit.disabled = false;
+      }
+    });
   }
 
   async function api(path, opts = {}) {
@@ -98,6 +262,13 @@
           ? `Network error talking to ${path} (server overloaded, timed out, or restarted). Try Import tree for day folders, or retry with a smaller path.`
           : msg
       );
+    }
+    if (res.status === 401 && state.requireAuth && !path.startsWith("/v1/auth/")) {
+      setSessionToken(null);
+      state.authUser = null;
+      showLogin(true);
+      updateSessionChrome();
+      throw new Error("Session expired — sign in again");
     }
     if (!res.ok) {
       let detail = "";
@@ -9005,6 +9176,8 @@
     state._settingsTab = tab;
     const tabs = [
       ["overview", "Overview"],
+      ["account", "Account"],
+      ["users", "Users"],
       ["scanning", "Scanning"],
       ["infra", "Infrastructure"],
       ["virtual", "Virtual agents"],
@@ -9013,6 +9186,9 @@
     ];
     const pane = (id, html) =>
       `<div data-settings-pane="${id}" class="${tab === id ? "" : "hidden"}">${html}</div>`;
+
+    const accountHtml = settingsAccountHtml();
+    const usersHtml = settingsUsersHtml();
 
     const overviewHtml = `
       <section class="panel">
@@ -9232,12 +9408,88 @@
           ).join("")}
         </div>
         ${pane("overview", overviewHtml)}
+        ${pane("account", accountHtml)}
+        ${pane("users", usersHtml)}
         ${pane("scanning", scanningHtml)}
         ${pane("infra", infraHtml)}
         ${pane("virtual", virtualHtml)}
         ${pane("hosts", hostsHtml)}
         ${pane("catalog", catalogHtml)}
       </div>`;
+  }
+
+  function settingsAccountHtml() {
+    const u = state.authUser;
+    if (!u || u.username === "anonymous") {
+      return `<section class="panel"><div class="empty">Sign in to manage MFA for your account.</div></section>`;
+    }
+    const mfaOn = !!u.totp_enabled;
+    const setup = state._mfaSetup || null;
+    return `
+      <section class="panel">
+        <div class="panel-head"><h3>Account</h3>
+          <span class="muted">${esc(u.username)} · ${esc(u.role)}${mfaOn ? " · MFA on" : " · MFA off"}</span>
+        </div>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          Multi-factor authentication (TOTP) — Google Authenticator, 1Password, Authy, etc.
+        </p>
+        ${mfaOn ? `
+          <button type="button" class="btn ghost" id="btnMfaDisable">Disable MFA</button>
+        ` : `
+          ${!setup ? `<button type="button" class="btn primary" id="btnMfaSetup">Set up MFA</button>` : `
+            <div class="mfa-setup-box">
+              <p class="muted" style="margin:0;font-size:0.82rem">Add this account in your authenticator app (scan URI or enter secret).</p>
+              <p class="mono mfa-secret">${esc(setup.secret)}</p>
+              <details><summary class="muted" style="cursor:pointer;font-size:0.8rem">otpauth URI</summary>
+                <p class="mono mfa-secret">${esc(setup.uri)}</p>
+              </details>
+              <label>6-digit code
+                <input id="mfaEnableCode" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" />
+              </label>
+              <button type="button" class="btn primary" id="btnMfaEnable">Enable MFA</button>
+            </div>
+          `}
+        `}
+      </section>`;
+  }
+
+  function settingsUsersHtml() {
+    const u = state.authUser;
+    if (!u || u.role !== "admin") {
+      return `<section class="panel"><div class="empty">Admin role required to manage users.</div></section>`;
+    }
+    const users = state._authUsers || [];
+    return `
+      <section class="panel">
+        <div class="panel-head"><h3>Users</h3>
+          <button type="button" class="btn ghost" id="btnReloadUsers">Refresh</button>
+        </div>
+        <form class="form" id="createUserForm" style="margin-bottom:1rem">
+          <div class="form-row">
+            <label>Username <input name="username" required autocomplete="off" /></label>
+            <label>Password <input name="password" type="password" required minlength="4" /></label>
+            <label>Role
+              <select name="role">
+                <option value="analyst">analyst</option>
+                <option value="viewer">viewer</option>
+                <option value="admin">admin</option>
+              </select>
+            </label>
+          </div>
+          <button class="btn primary" type="submit">Create user</button>
+        </form>
+        ${!users.length ? `<div class="empty">No users loaded</div>` : `
+          <table class="data"><thead><tr>
+            <th>User</th><th>Role</th><th>MFA</th><th></th>
+          </tr></thead><tbody>
+            ${users.map((x) => `<tr>
+              <td>${esc(x.username)}</td>
+              <td>${esc(x.role)}</td>
+              <td>${x.totp_enabled ? "on" : "off"}</td>
+              <td><button type="button" class="btn ghost tiny" data-del-user="${esc(x.id)}" ${x.id === u.id ? "disabled" : ""}>Delete</button></td>
+            </tr>`).join("")}
+          </tbody></table>`}
+      </section>`;
   }
 
   function downloadSettings() {
@@ -9438,6 +9690,100 @@
         toast(err.message);
       }
     });
+  }
+
+  async function loadAuthUsers() {
+    if (!state.authUser || state.authUser.role !== "admin") return;
+    try {
+      state._authUsers = await api("/v1/auth/users");
+    } catch (_) {
+      state._authUsers = [];
+    }
+  }
+
+  function wireAuthSettings() {
+    $("#btnMfaSetup")?.addEventListener("click", async () => {
+      try {
+        state._mfaSetup = await api("/v1/auth/totp/setup", { method: "POST", body: {} });
+        toast("Scan or enter the secret in your authenticator");
+        render();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $("#btnMfaEnable")?.addEventListener("click", async () => {
+      const code = ($("#mfaEnableCode")?.value || "").trim();
+      try {
+        await api("/v1/auth/totp/enable", { method: "POST", body: { code } });
+        state._mfaSetup = null;
+        state.authUser = await fetchMe();
+        toast("MFA enabled");
+        render();
+      } catch (err) {
+        toast(err.message || "Invalid code");
+      }
+    });
+    $("#btnMfaDisable")?.addEventListener("click", async () => {
+      if (!confirm("Disable MFA for your account?")) return;
+      try {
+        await api("/v1/auth/totp/disable", { method: "POST", body: {} });
+        state.authUser = await fetchMe();
+        toast("MFA disabled");
+        render();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $("#btnReloadUsers")?.addEventListener("click", async () => {
+      await loadAuthUsers();
+      render();
+    });
+    $("#createUserForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      try {
+        await api("/v1/auth/users", {
+          method: "POST",
+          body: {
+            username: String(fd.get("username") || "").trim(),
+            password: String(fd.get("password") || ""),
+            role: String(fd.get("role") || "analyst"),
+          },
+        });
+        toast("User created");
+        await loadAuthUsers();
+        render();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $$("[data-del-user]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-del-user");
+        if (!id || !confirm("Delete this user?")) return;
+        try {
+          await api(`/v1/auth/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+          toast("User deleted");
+          await loadAuthUsers();
+          render();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+    if (
+      state._settingsTab === "users"
+      && state.authUser?.role === "admin"
+      && state._authUsers == null
+      && !state._authUsersLoading
+    ) {
+      state._authUsersLoading = true;
+      loadAuthUsers()
+        .finally(() => {
+          state._authUsersLoading = false;
+          if (state._settingsTab === "users") render();
+        });
+    }
   }
 
   function wireHostSettingsForm() {
@@ -9642,6 +9988,11 @@
         $$("[data-settings-pane]").forEach((p) => {
           p.classList.toggle("hidden", p.getAttribute("data-settings-pane") !== id);
         });
+        if (id === "users" && state.authUser?.role === "admin") {
+          loadAuthUsers().then(() => {
+            if (state._settingsTab === "users") render();
+          });
+        }
       });
     });
     const exportBtn = $("#btnExportSettings");
@@ -9682,6 +10033,7 @@
       });
     }
     wireHostSettingsForm();
+    wireAuthSettings();
     wireDataPage();
     wireFleetSift();
     wireAnoMark();
@@ -12764,10 +13116,24 @@ title_contains = "Custom rule"
 
   function boot() {
     const saved = localStorage.getItem("rustmite_api_token") || "";
-    $("#apiToken").value = saved;
-    $("#apiToken").addEventListener("change", (e) => {
+    if ($("#apiToken")) $("#apiToken").value = saved;
+    $("#apiToken")?.addEventListener("change", (e) => {
       saveToken(e.target.value.trim());
       loadAll().catch((err) => toast(err.message));
+    });
+    wireLoginForm();
+    $("#btnLogout")?.addEventListener("click", async () => {
+      try {
+        await fetch("/v1/auth/logout", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${sessionToken()}` },
+        });
+      } catch (_) {}
+      setSessionToken(null);
+      state.authUser = null;
+      showLogin(true);
+      updateSessionChrome();
+      toast("Signed out");
     });
     setTheme(state.theme);
     const themeBtn = $("#themeBtn");
@@ -12861,9 +13227,14 @@ title_contains = "Custom rule"
     } else {
       setView("dashboard");
     }
-    startPolling();
-    loadAll().then(() => {
-      applyLocationHash();
+    ensureAuth().then((ok) => {
+      if (!ok) {
+        $("#healthPill").textContent = "sign in";
+        $("#healthPill").className = "health warn";
+        return;
+      }
+      startPolling();
+      return loadAll().then(() => applyLocationHash());
     }).catch((err) => {
       $("#healthPill").textContent = "API error";
       $("#healthPill").className = "health bad";

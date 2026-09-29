@@ -23,10 +23,11 @@ Operator and node share the same cert/key by default; override with `--node-tls-
 - OpenAPI 3.1 document served at `/v1/openapi.json`, generated from types (e.g. `utoipa`).
 
 ## 2. AuthN / AuthZ
-- **Operators**: session cookie (after password + optional TOTP) or bearer JWT; `argon2` password hashing.
-- **API tokens**: opaque, hashed at rest (`api_tokens.hash`), carry scopes; sent as `Authorization: Bearer`.
+- **Operators (default on)**: password login + optional per-user TOTP MFA → opaque session Bearer (`Authorization: Bearer …`). Passwords hashed with Argon2. Store: file-backed users/sessions (see `16-operator-console.md`). Disable with `RUSTMITE_REQUIRE_AUTH=0` for local open mode.
+- **Auth endpoints**: `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/mfa`, `POST /v1/auth/logout`, `GET /v1/auth/me`, `POST /v1/auth/totp/{setup,enable,disable}`, `GET|POST /v1/auth/users`, `PATCH|DELETE /v1/auth/users/{id}` (admin).
+- **Legacy API token**: optional `RUSTMITE_API_TOKEN` shared Bearer (admin-equivalent) for scripts.
 - **Nodes**: mutual TLS. Node client cert fingerprint is registered in `nodes.cert_fingerprint`. Node endpoints are on a **separate listener/port** (8443) from the operator API (443), so operator credentials can never be used on node endpoints and vice-versa.
-- **RBAC roles**: `viewer` (read findings/hosts), `analyst` (ack/suppress, create checks, trigger scans), `responder` (approve/execute response actions), `admin` (credentials, nodes, users, baselines), `auditor` (read audit log only). Enforced by a `tower` middleware layer mapping route→required scope. Multi-tenant: every query scoped by `tenant_id` (RLS backstop in DB).
+- **RBAC roles**: `viewer`, `analyst`, `admin` (console today); design also reserves `responder` / `auditor`. Admin-only: user CRUD.
 
 ## 3. Host & scan endpoints
 

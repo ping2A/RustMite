@@ -635,6 +635,29 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let api_token = std::env::var("RUSTMITE_API_TOKEN").ok();
+    let require_auth = rustmite_server::operator_auth::require_auth_from_env();
+    let operator_auth = Arc::new(
+        rustmite_server::operator_auth::OperatorAuth::open(
+            rustmite_server::operator_auth::OperatorAuth::default_path(),
+            require_auth,
+        )
+        .expect("open operator auth store"),
+    );
+    let (admin_user, admin_pass) = rustmite_server::operator_auth::bootstrap_admin_from_env();
+    if let Err(e) = operator_auth
+        .ensure_bootstrap_admin(&admin_user, &admin_pass)
+        .await
+    {
+        tracing::warn!(error = %e, "bootstrap admin failed");
+    } else if require_auth {
+        tracing::info!(
+            require_auth,
+            path = %operator_auth.path().display(),
+            "operator auth enabled (default admin user if store was empty)"
+        );
+    } else {
+        tracing::warn!("operator auth DISABLED (RUSTMITE_REQUIRE_AUTH=0) — console is open");
+    }
     let settings = Arc::new(RuntimeSettings {
         listen: args.listen,
         node_listen: args.node_listen,
@@ -706,6 +729,7 @@ async fn main() -> anyhow::Result<()> {
         virtual_agents: rustmite_server::virtual_agents::VirtualAgentStore::load_or_create(
             ".dev/virtual-agents.json",
         ),
+        operator_auth,
     };
 
     let _ = rustmite_server::credentials::import_filesystem_credentials(&state).await;

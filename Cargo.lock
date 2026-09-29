@@ -188,6 +188,18 @@ dependencies = [
 
 [[package]]
 name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2 0.10.6",
+ "cpufeatures 0.2.17",
+ "password-hash 0.5.0",
+]
+
+[[package]]
+name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
@@ -195,7 +207,7 @@ dependencies = [
  "base64ct",
  "blake2 0.11.0",
  "cpufeatures 0.3.1",
- "password-hash",
+ "password-hash 0.6.1",
 ]
 
 [[package]]
@@ -409,6 +421,12 @@ name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
+
+[[package]]
+name = "base32"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "022dfe9eb35f19ebbcb51e0b40a5ab759f46ad60cadf7297e0bd085afb50e076"
 
 [[package]]
 name = "base64"
@@ -2745,6 +2763,17 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "password-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
@@ -3758,15 +3787,19 @@ name = "rustmite-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2 0.5.3",
  "async-trait",
  "axum 0.8.9",
  "axum-server",
+ "base32",
  "base64 0.22.1",
  "clap",
  "csv",
  "hex",
  "include_dir",
  "mime_guess",
+ "password-hash 0.5.0",
+ "rand 0.8.8",
  "rcgen",
  "reqwest",
  "rustls 0.23.45",
@@ -3787,10 +3820,12 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "totp-lite",
  "tower",
  "tower-http 0.6.11",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
  "zeroize",
 ]
@@ -4529,7 +4564,7 @@ version = "0.7.0-rc.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "bcrypt-pbkdf",
  "ctutils",
  "ed25519-dalek 3.0.0",
@@ -4857,6 +4892,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
+name = "totp-lite"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8e43134db17199f7f721803383ac5854edd0d3d523cc34dba321d6acfbe76c3"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5120,6 +5167,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8_iter"

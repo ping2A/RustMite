@@ -102,6 +102,26 @@ pub fn is_agentlite_kind(kind: &str) -> bool {
     normalize_agent_kind(kind) == "agentlite"
 }
 
+#[cfg(test)]
+mod agent_kind_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_agent_kind_aliases() {
+        for raw in ["agentlite", "AgentLite", "agent_lite", "lite", "ssh_commands", "pure_command"] {
+            assert_eq!(normalize_agent_kind(raw), "agentlite", "{raw}");
+            assert!(is_agentlite_kind(raw));
+        }
+        for raw in ["virtual", "virt", "ingest", "VIRTUAL"] {
+            assert_eq!(normalize_agent_kind(raw), "virtual", "{raw}");
+            assert!(!is_agentlite_kind(raw));
+        }
+        for raw in ["ssh", "", "probe", "full"] {
+            assert_eq!(normalize_agent_kind(raw), "ssh", "{raw}");
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpsertHost {
     pub id: Option<HostId>,

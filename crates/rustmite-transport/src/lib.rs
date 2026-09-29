@@ -40,6 +40,8 @@ pub use probes::{
 pub use timeouts::SshTimeouts;
 
 #[cfg(feature = "ssh")]
+pub use pure_command::{assemble_pure_command_ndjson, collect_pure_command, resolve_collect_paths};
+#[cfg(feature = "ssh")]
 pub use scan::{remote_scan, RemoteScanOpts, RemoteScanResult, SudoEscalation};
 #[cfg(feature = "ssh")]
 pub use ssh::{ConnectOpts, SshCredential, SshSession};

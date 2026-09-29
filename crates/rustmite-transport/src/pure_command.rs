@@ -727,7 +727,6 @@ pub async fn collect_pure_command(
 ) -> Result<(Vec<u8>, Vec<u8>), TransportError> {
     let paths = resolve_collect_paths(collect_paths_raw);
     let file_cap = file_meta_cap(limits);
-    let max_obs = limits.max_observations.max(1);
     let prefix = script_resource_prefix(limits);
     let collect_script = format!("{prefix}{COLLECT_SCRIPT}");
     let net_script = format!("{prefix}{NET_COLLECT_SCRIPT}");
@@ -755,7 +754,31 @@ pub async fn collect_pure_command(
         }
     }
 
-    let meta = section(&stdout, "META");
+    let out = assemble_pure_command_ndjson(
+        &stdout,
+        &net_stdout,
+        &file_stdout,
+        reason,
+        limits,
+    )?;
+    Ok((out, stderr.into_bytes()))
+}
+
+/// Build AgentLite NDJSON from remote script stdout (no SSH — unit-testable).
+///
+/// Applies the same `Limits` envelope as the full probe: observation caps,
+/// file-meta soft/hard caps, and `max_output_bytes` on the encoded stream.
+pub fn assemble_pure_command_ndjson(
+    stdout: &str,
+    net_stdout: &str,
+    file_stdout: &str,
+    reason: &str,
+    limits: &Limits,
+) -> Result<Vec<u8>, TransportError> {
+    let file_cap = file_meta_cap(limits);
+    let max_obs = limits.max_observations.max(1);
+
+    let meta = section(stdout, "META");
     let fp = parse_uname_hint(meta);
     let boot_id = meta
         .lines()
@@ -783,16 +806,16 @@ pub async fn collect_pure_command(
 
     // Accounts
     {
-        let body = section(&stdout, "PASSWD");
+        let body = section(stdout, "PASSWD");
         let mut n = 0u32;
         for e in parse_passwd(body) {
             if !push_obs_capped(
-                    &mut envelopes,
-                    CollectorId::PERSISTENCE_ACCOUNTS.as_str(),
-                    &mut n,
-                    &mut obs_n,
-                    max_obs,
-                    Observation::Account(AccountObs {
+                &mut envelopes,
+                CollectorId::PERSISTENCE_ACCOUNTS.as_str(),
+                &mut n,
+                &mut obs_n,
+                max_obs,
+                Observation::Account(AccountObs {
                     username: e.username,
                     uid: e.uid,
                     gid: e.gid,
@@ -800,10 +823,10 @@ pub async fn collect_pure_command(
                     shell: PathBytes::from(e.shell),
                     gecos: e.gecos,
                 }),
-                ) {
-                    truncated = true;
-                    break;
-                }
+            ) {
+                truncated = true;
+                break;
+            }
         }
 
         reports.push(CollectorReport::complete(
@@ -815,7 +838,7 @@ pub async fn collect_pure_command(
 
     // Shadow (may be empty without sudo)
     {
-        let body = section(&stdout, "SHADOW");
+        let body = section(stdout, "SHADOW");
         let mut n = 0u32;
         if body.trim().is_empty() {
             reports.push(CollectorReport::unsupported(
@@ -849,8 +872,8 @@ pub async fn collect_pure_command(
 
     // Modules — compare /proc/modules vs loadable /sys/module (initstate present).
     {
-        let proc_body = section(&stdout, "MODULES");
-        let sys_body = section(&stdout, "SYSMODULES");
+        let proc_body = section(stdout, "MODULES");
+        let sys_body = section(stdout, "SYSMODULES");
         let mut n = 0u32;
         for (m, hidden) in parse_modules(proc_body, sys_body) {
             let obs = if hidden {
@@ -876,7 +899,7 @@ pub async fn collect_pure_command(
 
     // Preload
     {
-        let body = section(&stdout, "PRELOAD");
+        let body = section(stdout, "PRELOAD");
         let present = body.lines().any(|l| l.trim() == "PRESENT=1");
         let entries: Vec<PathBytes> = body
             .lines()
@@ -909,7 +932,7 @@ pub async fn collect_pure_command(
 
     // Processes
     {
-        let body = section(&stdout, "PROCESSES");
+        let body = section(stdout, "PROCESSES");
         let mut n = 0u32;
         for line in body.lines() {
             if let Some(p) = parse_process_line(line) {
@@ -936,7 +959,7 @@ pub async fn collect_pure_command(
 
     // Network sockets (/proc/net/tcp{,6} udp{,6}) — from dedicated NET_COLLECT_SCRIPT.
     {
-        let owners = parse_sock_owners(section(&net_stdout, "SOCKOWNERS"));
+        let owners = parse_sock_owners(section(net_stdout, "SOCKOWNERS"));
         let mut pid_comms: std::collections::HashMap<i32, String> =
             std::collections::HashMap::new();
         for env in &envelopes {
@@ -955,7 +978,7 @@ pub async fn collect_pure_command(
             ("NET_UDP", "ipv4", "udp"),
             ("NET_UDP6", "ipv6", "udp"),
         ] {
-            for mut sock in parse_proc_net(section(&net_stdout, sec), family, protocol) {
+            for mut sock in parse_proc_net(section(net_stdout, sec), family, protocol) {
                 if let Some(pid) = owners.get(&sock.inode.0).copied() {
                     sock.owning_pid = Some(pid);
                     sock.owning_comm = pid_comms.get(&pid).cloned();
@@ -974,7 +997,7 @@ pub async fn collect_pure_command(
             }
         }
 
-        if n == 0 && section(&net_stdout, "NET_TCP").trim().is_empty() {
+        if n == 0 && section(net_stdout, "NET_TCP").trim().is_empty() {
             reports.push(CollectorReport::unsupported(
                 CollectorId::NET_SOCKETS,
                 "/proc/net/tcp unreadable",
@@ -986,10 +1009,15 @@ pub async fn collect_pure_command(
 
     // File inventory (defaults + host collect_paths).
     {
-        let body = section(&file_stdout, "FILEMETA");
+        let body = section(file_stdout, "FILEMETA");
         let mut n = 0u32;
         for line in body.lines() {
-            if n as usize >= file_cap || obs_n >= max_obs {
+            if n as usize >= file_cap {
+                truncated = true;
+                break;
+            }
+            if obs_n >= max_obs {
+                truncated = true;
                 break;
             }
             if let Some(f) = parse_file_meta_line(line) {
@@ -1019,7 +1047,7 @@ pub async fn collect_pure_command(
 
     // Authorized keys + host keys
     {
-        let body = section(&stdout, "AUTHKEYS");
+        let body = section(stdout, "AUTHKEYS");
         let mut n = 0u32;
         let mut cur_user = String::new();
         let mut cur_path = String::new();
@@ -1057,7 +1085,7 @@ pub async fn collect_pure_command(
             }
         }
 
-        let host_body = section(&stdout, "HOSTKEYS");
+        let host_body = section(stdout, "HOSTKEYS");
         let mut cur_hk = String::new();
         for line in host_body.lines() {
             if let Some(rest) = line.strip_prefix("@@PATH=") {
@@ -1137,20 +1165,19 @@ pub async fn collect_pure_command(
     }));
 
     let mut out = Vec::new();
-    for env in &envelopes {
+    for (i, env) in envelopes.iter().enumerate() {
         let line = serde_json::to_vec(env)
             .map_err(|e| TransportError::Delivery(format!("encode: {e}")))?;
-        if limits.max_output_bytes > 0
-            && (out.len() as u64).saturating_add(line.len() as u64 + 1) > limits.max_output_bytes
-        {
-            // Drop remaining envelopes; observation stream is already marked partial
-            // when collector budget was hit. Output-cap alone still yields usable NDJSON.
+        let would = (out.len() as u64).saturating_add(line.len() as u64 + 1);
+        // Always keep Hello (index 0) so the stream remains parseable even under a
+        // very tight max_output_bytes; drop later envelopes when the cap bites.
+        if i > 0 && limits.max_output_bytes > 0 && would > limits.max_output_bytes {
             break;
         }
         out.extend_from_slice(&line);
         out.push(b'\n');
     }
-    Ok((out, stderr.into_bytes()))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1253,6 +1280,269 @@ mod tests {
 
     #[test]
     fn sh_quote_escapes_single_quotes() {
+        assert_eq!(sh_escape_single("a'b"), "a'\\''b");
         assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    fn sample_agentlite_stdout() -> String {
+        let mut procs = String::new();
+        for i in 1..=40 {
+            procs.push_str(&format!("{i}|0|0|0|S|proc{i}|/bin/proc{i}\n"));
+        }
+        format!(
+            "===META===\nLinux x86_64 6.8.0\n0\nroot\nboot-id-1\n\
+===PASSWD===\nroot:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n\
+===SHADOW===\n\
+===MODULES===\nac97_bus 16384 1 - Live 0x0\nfuse 163840 1 - Live 0x0\n\
+===SYSMODULES===\nOK=1\nac97_bus\nfuse\n\
+===PRELOAD===\nPRESENT=0\n\
+===PROCESSES===\n{procs}\
+===AUTHKEYS===\n\
+===HOSTKEYS===\n\
+===END===\n"
+        )
+    }
+
+    fn sample_file_stdout(n: usize) -> String {
+        let mut files = String::from("===FILEMETA===\n");
+        for i in 1..=n {
+            files.push_str(&format!("/tmp/f{i}|644|0|0|10|{i}|1|root|root\n"));
+        }
+        files.push_str("===END===\n");
+        files
+    }
+
+    fn decode_ndjson(raw: &[u8]) -> Vec<Envelope> {
+        raw.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice::<Envelope>(l).expect("envelope json"))
+            .collect()
+    }
+
+    fn obs_kinds(envs: &[Envelope]) -> Vec<&str> {
+        envs.iter()
+            .filter_map(|e| match e {
+                Envelope::Obs { d, .. } => Some(match d {
+                    Observation::Account(_) => "account",
+                    Observation::Module(_) => "module",
+                    Observation::HiddenModule(_) => "hidden_module",
+                    Observation::Process(_) => "process",
+                    Observation::FileMeta(_) => "file",
+                    Observation::Policy(p) => {
+                        if p.code == "RM-POL-0021" {
+                            "policy_0021"
+                        } else {
+                            "policy"
+                        }
+                    }
+                    Observation::Preload(_) => "preload",
+                    Observation::Socket(_) => "socket",
+                    _ => "other",
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn script_resource_prefix_applies_agent_limits() {
+        let limits = Limits {
+            nice: 19,
+            io_idle: true,
+            max_open_files: 128,
+            max_rss_bytes: 16 * 1024 * 1024,
+            ..Limits::default()
+        };
+        let prefix = script_resource_prefix(&limits);
+        assert!(prefix.contains("renice 19 $$"), "{prefix}");
+        assert!(prefix.contains("ionice -c3"), "{prefix}");
+        assert!(prefix.contains("ulimit -n 128"), "{prefix}");
+        // 16 MiB → 16384 KiB
+        assert!(prefix.contains("ulimit -v 16384"), "{prefix}");
+    }
+
+    #[test]
+    fn script_resource_prefix_skips_zero_caps() {
+        let limits = Limits {
+            io_idle: false,
+            max_open_files: 0,
+            max_rss_bytes: 0,
+            nice: 0,
+            ..Limits::default()
+        };
+        let prefix = script_resource_prefix(&limits);
+        assert!(prefix.contains("renice 0 $$"));
+        assert!(!prefix.contains("ionice"));
+        assert!(!prefix.contains("ulimit -n"));
+        assert!(!prefix.contains("ulimit -v"));
+    }
+
+    #[test]
+    fn file_meta_cap_respects_fleet_and_soft_ceiling() {
+        assert_eq!(
+            file_meta_cap(&Limits {
+                max_files_examined: 100,
+                ..Limits::default()
+            }),
+            100
+        );
+        assert_eq!(
+            file_meta_cap(&Limits {
+                max_files_examined: 50_000,
+                ..Limits::default()
+            }),
+            MAX_FILE_META_SOFT
+        );
+        assert_eq!(
+            file_meta_cap(&Limits {
+                max_files_examined: 0,
+                ..Limits::default()
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn file_collect_script_embeds_path_and_max() {
+        let script = build_file_collect_script(
+            &["/opt/app".into(), "/tmp".into()],
+            20,
+        );
+        assert!(script.contains("===FILEMETA==="));
+        assert!(script.contains("p='/opt/app'"));
+        assert!(script.contains("p='/tmp'"));
+        assert!(script.contains("head -n "));
+        assert!(script.contains("[ \"$n\" -lt 20 ]") || script.contains("[ \"$n\" -ge 20 ]"));
+    }
+
+    #[test]
+    fn agentlite_always_emits_policy_and_modules_without_fp() {
+        let limits = Limits {
+            max_observations: 500_000,
+            max_output_bytes: 8 * 1024 * 1024,
+            max_files_examined: 1_000,
+            ..Limits::default()
+        };
+        let raw = assemble_pure_command_ndjson(
+            &sample_agentlite_stdout(),
+            "===NET_TCP===\n===END===\n",
+            &sample_file_stdout(5),
+            "method D",
+            &limits,
+        )
+        .expect("assemble");
+        let envs = decode_ndjson(&raw);
+        let kinds = obs_kinds(&envs);
+        assert!(kinds.contains(&"policy_0021"), "{kinds:?}");
+        assert!(kinds.contains(&"module"), "{kinds:?}");
+        assert!(!kinds.contains(&"hidden_module"), "no module FP: {kinds:?}");
+        assert!(kinds.iter().filter(|k| **k == "process").count() >= 10);
+        assert!(kinds.iter().filter(|k| **k == "file").count() == 5);
+        let summary = envs
+            .iter()
+            .find_map(|e| match e {
+                Envelope::Summary(s) => Some(s),
+                _ => None,
+            })
+            .expect("summary");
+        assert_eq!(summary.outcome, "complete");
+    }
+
+    #[test]
+    fn agentlite_obs_budget_truncates_and_marks_partial() {
+        let limits = Limits {
+            max_observations: 5,
+            max_output_bytes: 8 * 1024 * 1024,
+            max_files_examined: 1_000,
+            ..Limits::default()
+        };
+        let raw = assemble_pure_command_ndjson(
+            &sample_agentlite_stdout(),
+            "===NET_TCP===\n===END===\n",
+            &sample_file_stdout(20),
+            "method D",
+            &limits,
+        )
+        .expect("assemble");
+        let envs = decode_ndjson(&raw);
+        let kinds = obs_kinds(&envs);
+        // Budget is 5 (+1 reserved for policy) — must still raise RM-POL-0021.
+        assert!(kinds.contains(&"policy_0021"), "{kinds:?}");
+        let obs_count = kinds.len();
+        assert!(obs_count <= 6, "obs_count={obs_count} kinds={kinds:?}");
+        let summary = envs
+            .iter()
+            .find_map(|e| match e {
+                Envelope::Summary(s) => Some(s),
+                _ => None,
+            })
+            .expect("summary");
+        assert_eq!(summary.outcome, "partial");
+        let policy = envs.iter().find_map(|e| match e {
+            Envelope::Obs {
+                d: Observation::Policy(p),
+                ..
+            } => Some(p),
+            _ => None,
+        }).expect("policy");
+        assert!(
+            policy.detail.contains("truncated by agent limits"),
+            "{}",
+            policy.detail
+        );
+        assert!(policy.detail.contains("max_observations=5"));
+    }
+
+    #[test]
+    fn agentlite_file_cap_truncates_file_meta_rows() {
+        let limits = Limits {
+            max_observations: 500_000,
+            max_output_bytes: 8 * 1024 * 1024,
+            max_files_examined: 3,
+            ..Limits::default()
+        };
+        let raw = assemble_pure_command_ndjson(
+            &sample_agentlite_stdout(),
+            "===NET_TCP===\n===END===\n",
+            &sample_file_stdout(20),
+            "method D",
+            &limits,
+        )
+        .expect("assemble");
+        let envs = decode_ndjson(&raw);
+        let file_n = obs_kinds(&envs).iter().filter(|k| **k == "file").count();
+        assert_eq!(file_n, 3, "file_meta_cap should stop at 3");
+        let summary = envs
+            .iter()
+            .find_map(|e| match e {
+                Envelope::Summary(s) => Some(s),
+                _ => None,
+            })
+            .expect("summary");
+        assert_eq!(summary.outcome, "partial");
+    }
+
+    #[test]
+    fn agentlite_output_byte_cap_keeps_hello() {
+        let limits = Limits {
+            max_observations: 500_000,
+            // Tiny vs full stream — Hello must still be emitted.
+            max_output_bytes: 200,
+            max_files_examined: 1_000,
+            ..Limits::default()
+        };
+        let raw = assemble_pure_command_ndjson(
+            &sample_agentlite_stdout(),
+            "===NET_TCP===\n===END===\n",
+            &sample_file_stdout(5),
+            "method D",
+            &limits,
+        )
+        .expect("assemble");
+        assert!(!raw.is_empty());
+        let envs = decode_ndjson(&raw);
+        assert!(matches!(envs.first(), Some(Envelope::Hello(_))));
+        // Cap bites before full stream (complete assemble has dozens of envelopes).
+        assert!(envs.len() < 15, "expected truncated NDJSON, got {} envs", envs.len());
     }
 }

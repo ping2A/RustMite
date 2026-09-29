@@ -38,17 +38,24 @@ pub fn summary_outcome(reports: &[CollectorReport], plan_failed: bool) -> &'stat
 
 /// Clamp / validate limits before applying (server may send zeros).
 pub fn sanitize_limits(mut limits: Limits) -> Limits {
-    if limits.max_rss_bytes > 0 && limits.max_rss_bytes < 4 * 1024 * 1024 {
-        limits.max_rss_bytes = 4 * 1024 * 1024;
+    // Same floors as Settings → Agent limits (PUT /v1/settings probe_limits).
+    if limits.max_rss_bytes > 0 {
+        limits.max_rss_bytes = limits.max_rss_bytes.max(4 * 1024 * 1024);
     }
     if limits.max_observations == 0 {
         limits.max_observations = 1_000;
+    } else {
+        limits.max_observations = limits.max_observations.max(1_000);
     }
     if limits.max_output_bytes == 0 {
         limits.max_output_bytes = 1024 * 1024;
+    } else {
+        limits.max_output_bytes = limits.max_output_bytes.max(1024 * 1024);
     }
     if limits.max_files_examined == 0 {
         limits.max_files_examined = 1_000;
+    } else {
+        limits.max_files_examined = limits.max_files_examined.max(1_000);
     }
     if limits.max_open_files == 0 {
         limits.max_open_files = 64;
@@ -107,9 +114,45 @@ mod tests {
         });
         assert!(l.max_rss_bytes >= 4 * 1024 * 1024);
         assert_eq!(l.max_observations, 1_000);
+        assert_eq!(l.max_output_bytes, 1024 * 1024);
+        assert_eq!(l.max_files_examined, 1_000);
         assert_eq!(l.nice, 19);
         assert_eq!(l.max_cpu_pct, 100);
         assert_eq!(l.max_open_files, 64);
+    }
+
+    #[test]
+    fn sanitize_limits_preserves_sane_values() {
+        let src = Limits {
+            max_rss_bytes: 32 * 1024 * 1024,
+            max_observations: 50_000,
+            max_output_bytes: 8 * 1024 * 1024,
+            max_files_examined: 10_000,
+            max_bytes_hashed: 1 << 30,
+            nice: 10,
+            io_idle: false,
+            max_transfer_bps: 256 * 1024,
+            max_cpu_pct: 25,
+            max_open_files: 128,
+        };
+        let l = sanitize_limits(src.clone());
+        assert_eq!(l, src);
+    }
+
+    #[test]
+    fn sanitize_limits_matches_server_probe_limits_floor() {
+        // Server PUT /v1/settings clamps with the same floors — keep in sync.
+        let l = sanitize_limits(Limits {
+            max_rss_bytes: 1,
+            max_observations: 1,
+            max_output_bytes: 1,
+            max_files_examined: 1,
+            ..Limits::default()
+        });
+        assert!(l.max_rss_bytes >= 4 * 1024 * 1024);
+        assert!(l.max_observations >= 1_000);
+        assert!(l.max_output_bytes >= 1024 * 1024);
+        assert!(l.max_files_examined >= 1_000);
     }
 
     #[test]
