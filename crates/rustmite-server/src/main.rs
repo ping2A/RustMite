@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use rustmite_notify::WebhookSink;
 use rustmite_server::{
@@ -31,12 +32,12 @@ struct Args {
 
     /// Enable TLS 1.3 (default on). When no cert/key are given, auto-generates a
     /// self-signed pair under `--tls-dir` (like ismyphonepwned / mimic-rs).
-    #[arg(long, default_value_t = true, env = "RUSTMITE_TLS")]
+    #[arg(long, default_value_t = true, env = "RUSTMITE_TLS", value_parser = BoolishValueParser::new())]
     tls: bool,
 
     /// Disable TLS on the operator console only (cleartext HTTP). The node/agent
     /// listener always uses TLS 1.3 — secrets and scan traffic stay encrypted.
-    #[arg(long, default_value_t = false, env = "RUSTMITE_NO_TLS")]
+    #[arg(long, default_value_t = false, env = "RUSTMITE_NO_TLS", value_parser = BoolishValueParser::new())]
     no_tls: bool,
 
     /// Fleet credential encryption *public* key (hex file). Private key stays on nodes.
@@ -83,13 +84,13 @@ struct Args {
     #[arg(long, env = "RUSTMITE_WEBHOOK_SECRET", default_value = "rustmite-dev-secret")]
     webhook_secret: String,
 
-    #[arg(long, env = "RUSTMITE_SEED_DEMO", default_value_t = false)]
+    #[arg(long, env = "RUSTMITE_SEED_DEMO", default_value_t = false, value_parser = BoolishValueParser::new())]
     seed_demo: bool,
 
     #[arg(long, env = "RUSTMITE_SEED_HOSTS", default_value_t = DEFAULT_SEED_HOSTS)]
     seed_hosts: usize,
 
-    #[arg(long, env = "RUSTMITE_SCAN_SIM", default_value_t = true)]
+    #[arg(long, env = "RUSTMITE_SCAN_SIM", default_value_t = true, value_parser = BoolishValueParser::new())]
     scan_sim: bool,
 
     #[arg(long, default_value = "standard", env = "RUSTMITE_DEFAULT_CHECK_SET")]
@@ -141,7 +142,7 @@ struct Args {
     #[arg(long, default_value_t = 30, env = "RUSTMITE_CLICKHOUSE_TIMEOUT_SECS")]
     clickhouse_timeout_secs: u64,
 
-    #[arg(long, default_value_t = true, env = "RUSTMITE_NOISE_XX")]
+    #[arg(long, default_value_t = true, env = "RUSTMITE_NOISE_XX", value_parser = BoolishValueParser::new())]
     noise_xx: bool,
 
     /// JSON snapshot of hosts, findings, scans, and observations (survives restart).
@@ -149,7 +150,7 @@ struct Args {
     store: PathBuf,
 
     /// Ignore any existing snapshot and start with an empty control-plane store.
-    #[arg(long, default_value_t = false, env = "RUSTMITE_RESET_STORE")]
+    #[arg(long, default_value_t = false, env = "RUSTMITE_RESET_STORE", value_parser = BoolishValueParser::new())]
     reset_store: bool,
 }
 
@@ -330,7 +331,8 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(
                     error = %e,
                     url = ch.base_url(),
-                    "ClickHouse not reachable — falling back to local JSON store (.dev/store.json)"
+                    store = %args.store.display(),
+                    "ClickHouse not reachable — falling back to local JSON store"
                 );
                 None
             }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
@@ -24,7 +25,7 @@ struct Args {
 
     /// Allow cleartext `http://` to the control plane (dev only). Agent traffic must
     /// normally be TLS — omit this / set `RUSTMITE_ALLOW_INSECURE=0`.
-    #[arg(long, default_value_t = false, env = "RUSTMITE_ALLOW_INSECURE")]
+    #[arg(long, default_value_t = false, env = "RUSTMITE_ALLOW_INSECURE", value_parser = BoolishValueParser::new())]
     allow_insecure: bool,
 
     #[arg(long)]

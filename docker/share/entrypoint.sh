@@ -31,6 +31,8 @@ Usage:
 
 Examples:
   docker run --rm -p 8080:8080 rustmite:latest
+  # → https://127.0.0.1:8080/ (self-signed; accept browser warning)
+  docker run --rm rustmite:latest server --no-tls   # cleartext lab mode
   docker run --rm rustmite:latest cli scan-fixture \
     --fixture /opt/rustmite/fixtures/diamorphine-hidden-pid
 EOF

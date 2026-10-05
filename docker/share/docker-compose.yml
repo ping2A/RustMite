@@ -5,7 +5,7 @@
 #
 # Run:
 #   docker compose -f docker/share/docker-compose.yml up
-#   open http://127.0.0.1:8080/
+#   open https://127.0.0.1:8080/  (accept the self-signed cert warning)
 #
 # Tag & push to share:
 #   docker tag rustmite:latest your-registry/rustmite:0.1.0
@@ -25,16 +25,20 @@ services:
       RUSTMITE_LISTEN: 0.0.0.0:8080
       RUSTMITE_NODE_LISTEN: 0.0.0.0:8443
       RUSTMITE_CHECKS: /opt/rustmite/checks
-      RUSTMITE_NO_TLS: "1"
       RUSTMITE_SEED_DEMO: "0"
       RUSTMITE_SCAN_SIM: "0"
+      RUSTMITE_STORE: /opt/rustmite/data/store.json
+      RUSTMITE_AUTH_FILE: /opt/rustmite/data/auth.json
+      RUSTMITE_TLS_DIR: /opt/rustmite/tls
+      RUSTMITE_CRED_PUBKEY: /opt/rustmite/vault/cred.pub
+      RUSTMITE_VAULT_KEY_FILE: /opt/rustmite/vault/master.key
     volumes:
       - rustmite-data:/opt/rustmite/data
       - rustmite-tls:/opt/rustmite/tls
       - rustmite-vault:/opt/rustmite/vault
-    command: ["server", "--no-tls"]
+    command: ["server"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      test: ["CMD", "curl", "-kfsS", "https://127.0.0.1:8080/"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -52,7 +56,7 @@ services:
     command:
       [
         "node",
-        "--server", "http://server:8443",
+        "--server", "https://server:8443",
         "--allow-insecure",
         "--fixture-mode",
         "--fixture", "/opt/rustmite/fixtures/diamorphine-hidden-pid",

@@ -5,7 +5,7 @@
 #   docker build -t rustmite:latest .
 #   docker run --rm -p 8080:8080 -p 8443:8443 rustmite:latest
 #
-# Open http://127.0.0.1:8080/ (TLS off in the default CMD for easy demos).
+# Open https://127.0.0.1:8080/ (self-signed TLS by default; accept the browser warning).
 
 ARG RUST_VERSION=1.89.0
 
@@ -60,7 +60,8 @@ ENV RUSTMITE_CHECKS=/opt/rustmite/checks \
     RUSTMITE_TLS_DIR=/opt/rustmite/tls \
     RUSTMITE_VAULT_KEY_FILE=/opt/rustmite/vault/master.key \
     RUSTMITE_CRED_PUBKEY=/opt/rustmite/vault/cred.pub \
-    RUSTMITE_STORE_FILE=/opt/rustmite/data/store.json \
+    RUSTMITE_STORE=/opt/rustmite/data/store.json \
+    RUSTMITE_AUTH_FILE=/opt/rustmite/data/auth.json \
     RUSTMITE_SEED_DEMO=0 \
     RUSTMITE_SCAN_SIM=0 \
     RUST_LOG=info
@@ -70,5 +71,6 @@ EXPOSE 8080 8443
 VOLUME ["/opt/rustmite/data", "/opt/rustmite/tls", "/opt/rustmite/vault"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "rustmite-entrypoint"]
-# Clean install: operator UI without TLS; empty fleet (no seed / scan simulator).
-CMD ["server", "--no-tls"]
+# HTTPS by default (auto self-signed certs under RUSTMITE_TLS_DIR). Empty fleet.
+# Opt out: docker run … rustmite:latest server --no-tls
+CMD ["server"]

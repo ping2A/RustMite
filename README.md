@@ -61,15 +61,16 @@ gunzip -c rustmite-0.1.0.tar.gz | docker load
 
 docker run --rm -p 8080:8080 -p 8443:8443 \
   -v rustmite-data:/opt/rustmite/data \
+  -v rustmite-tls:/opt/rustmite/tls \
   rustmite:0.1.0
-# → http://127.0.0.1:8080/  (admin / admin)
+# → https://127.0.0.1:8080/  (admin / admin; accept self-signed cert)
 ```
 
 **Build an image to share**
 
 ```bash
-./scripts/share-image.sh
-# → dist/rustmite-<version>.tar.gz
+./scripts/share-image.sh --x64
+# → dist/rustmite-<version>-amd64.tar.gz
 ```
 
 More: `[docker/share/README.md](docker/share/README.md)`.
