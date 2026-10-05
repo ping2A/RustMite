@@ -23,8 +23,8 @@ Operator and node share the same cert/key by default; override with `--node-tls-
 - OpenAPI 3.1 document served at `/v1/openapi.json`, generated from types (e.g. `utoipa`).
 
 ## 2. AuthN / AuthZ
-- **Operators (default on)**: password login + optional per-user TOTP MFA → opaque session Bearer (`Authorization: Bearer …`). Passwords hashed with Argon2. Store: file-backed users/sessions (see `16-operator-console.md`). Disable with `RUSTMITE_REQUIRE_AUTH=0` for local open mode.
-- **Auth endpoints**: `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/mfa`, `POST /v1/auth/logout`, `GET /v1/auth/me`, `POST /v1/auth/totp/{setup,enable,disable}`, `GET|POST /v1/auth/users`, `PATCH|DELETE /v1/auth/users/{id}` (admin).
+- **Operators (default on)**: password login + optional per-user TOTP and/or YubiKey (WebAuthn/FIDO2) MFA → opaque session Bearer (`Authorization: Bearer …`). Passwords hashed with Argon2. Self-service password change requires the current password and revokes other sessions. Store: file-backed users/sessions (see `16-operator-console.md`). Disable with `RUSTMITE_REQUIRE_AUTH=0` for local open mode.
+- **Auth endpoints**: `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/mfa`, `POST /v1/auth/webauthn/login/{begin,finish}`, `POST /v1/auth/logout`, `GET /v1/auth/me`, `POST /v1/auth/password`, `POST /v1/auth/totp/{setup,enable,disable}`, `POST /v1/auth/webauthn/register/{begin,finish}`, `DELETE /v1/auth/webauthn/credentials/{id}`, `GET|POST /v1/auth/users`, `PATCH|DELETE /v1/auth/users/{id}` (admin).
 - **Legacy API token**: optional `RUSTMITE_API_TOKEN` shared Bearer (admin-equivalent) for scripts.
 - **Nodes**: mutual TLS. Node client cert fingerprint is registered in `nodes.cert_fingerprint`. Node endpoints are on a **separate listener/port** (8443) from the operator API (443), so operator credentials can never be used on node endpoints and vice-versa.
 - **RBAC roles**: `viewer`, `analyst`, `admin` (console today); design also reserves `responder` / `auditor`. Admin-only: user CRUD.

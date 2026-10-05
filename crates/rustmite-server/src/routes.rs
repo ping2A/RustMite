@@ -56,6 +56,8 @@ pub struct AppState {
     pub virtual_agents: crate::virtual_agents::VirtualAgentStore,
     /// Operator console users / sessions / MFA (Mobipwn-style).
     pub operator_auth: Arc<OperatorAuth>,
+    /// Live-editable WebAuthn origin / RP ID (Settings + `--webauthn-*` flags).
+    pub webauthn_rp: Arc<tokio::sync::RwLock<crate::webauthn::WebauthnRpConfig>>,
 }
 
 pub fn operator_router(state: AppState) -> Router {
@@ -301,6 +303,9 @@ async fn settings_export(state: &AppState) -> crate::settings::SettingsExport {
     export.effective.host_health_interval_secs = hh.interval_secs;
     export.effective.host_health_concurrency = hh.concurrency;
     export.effective.host_health_connect_timeout_secs = hh.connect_timeout_secs;
+    let wa = state.webauthn_rp.read().await.clone();
+    export.effective.webauthn_origin = wa.origin;
+    export.effective.webauthn_rp_id = wa.rp_id;
     export
 }
 
@@ -314,6 +319,9 @@ pub struct SettingsPartialBody {
     /// Fleet host reachability checker (optional fields merge onto current).
     #[serde(default)]
     pub host_health: Option<HostHealthPatch>,
+    /// WebAuthn / YubiKey relying party (optional fields merge onto current).
+    #[serde(default)]
+    pub webauthn: Option<WebauthnPatch>,
 }
 
 #[derive(Deserialize, Default)]
@@ -322,6 +330,12 @@ pub struct HostHealthPatch {
     pub interval_secs: Option<u64>,
     pub concurrency: Option<usize>,
     pub connect_timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct WebauthnPatch {
+    pub origin: Option<String>,
+    pub rp_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -489,6 +503,52 @@ async fn put_settings_partial(
                 host_id: None,
                 node_id: None,
                 detail: Some(serde_json::json!({ "host_health": snapshot })),
+            })
+            .await;
+        state.store.mark_dirty_public();
+    }
+    if let Some(patch) = body.webauthn {
+        let mut guard = state.webauthn_rp.write().await;
+        if let Some(v) = patch.origin {
+            guard.origin = {
+                let t = v.trim().trim_end_matches('/');
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            };
+        }
+        if let Some(v) = patch.rp_id {
+            guard.rp_id = {
+                let t = v.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            };
+        }
+        *guard = guard.clone().sanitized();
+        crate::webauthn::save_config(&guard);
+        let snapshot = guard.clone();
+        drop(guard);
+        let _ = state
+            .store
+            .push_activity(ActivityEvent {
+                id: Uuid::new_v4(),
+                ts: crate::sys_metrics::utc_now_rfc3339(),
+                level: "info".into(),
+                kind: "settings.updated".into(),
+                message: format!(
+                    "WebAuthn RP origin={} rp_id={}",
+                    snapshot.origin.as_deref().unwrap_or("(request)"),
+                    snapshot.rp_id.as_deref().unwrap_or("(from origin)")
+                ),
+                scan_id: None,
+                host_id: None,
+                node_id: None,
+                detail: Some(serde_json::json!({ "webauthn": snapshot })),
             })
             .await;
         state.store.mark_dirty_public();

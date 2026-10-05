@@ -111,7 +111,9 @@
     const logout = $("#btnLogout");
     if (el) {
       el.textContent = state.authUser
-        ? `${state.authUser.username} · ${state.authUser.role}${state.authUser.totp_enabled ? " · MFA" : ""}`
+        ? `${state.authUser.username} · ${state.authUser.role}${
+            (state.authUser.totp_enabled || state.authUser.webauthn_enabled) ? " · MFA" : ""
+          }`
         : (state.requireAuth ? "" : "auth off");
     }
     if (logout) logout.classList.toggle("hidden", !state.authUser && !sessionToken());
@@ -166,15 +168,124 @@
     return false;
   }
 
+  function bufToB64url(buf) {
+    const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    let bin = "";
+    bytes.forEach((b) => { bin += String.fromCharCode(b); });
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function b64urlToBuf(s) {
+    const pad = "=".repeat((4 - (s.length % 4)) % 4);
+    const bin = atob(String(s).replace(/-/g, "+").replace(/_/g, "/") + pad);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+
+  function reviveWebauthnPublicKey(opts) {
+    const pk = opts && opts.publicKey ? opts.publicKey : opts;
+    const copy = { publicKey: { ...pk } };
+    copy.publicKey.challenge = b64urlToBuf(pk.challenge);
+    if (pk.user && pk.user.id) {
+      copy.publicKey.user = { ...pk.user, id: b64urlToBuf(pk.user.id) };
+    }
+    if (Array.isArray(pk.excludeCredentials)) {
+      copy.publicKey.excludeCredentials = pk.excludeCredentials.map((c) => ({
+        ...c,
+        id: b64urlToBuf(c.id),
+      }));
+    }
+    if (Array.isArray(pk.allowCredentials)) {
+      copy.publicKey.allowCredentials = pk.allowCredentials.map((c) => ({
+        ...c,
+        id: b64urlToBuf(c.id),
+      }));
+    }
+    return copy;
+  }
+
+  function credentialToJson(cred) {
+    const r = cred.response;
+    const json = {
+      id: cred.id,
+      rawId: bufToB64url(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufToB64url(r.clientDataJSON),
+      },
+    };
+    if (r.attestationObject) json.response.attestationObject = bufToB64url(r.attestationObject);
+    if (r.authenticatorData) json.response.authenticatorData = bufToB64url(r.authenticatorData);
+    if (r.signature) json.response.signature = bufToB64url(r.signature);
+    if (r.userHandle) json.response.userHandle = bufToB64url(r.userHandle);
+    return json;
+  }
+
   function wireLoginForm() {
     const form = $("#loginForm");
     if (!form || form.dataset.wired) return;
     form.dataset.wired = "1";
     let challengeId = null;
+    let mfaMethods = [];
     const errEl = $("#loginError");
     const cred = $("#loginCredFields");
     const mfa = $("#loginMfaFields");
+    const totpWrap = $("#loginTotpWrap");
+    const webauthnBtn = $("#btnLoginWebauthn");
     const submit = $("#loginSubmit");
+
+    function applyLoginSuccess(data) {
+      setSessionToken(data.token);
+      state.authUser = data.user;
+      challengeId = null;
+      mfaMethods = [];
+      showLogin(false);
+      updateSessionChrome();
+    }
+
+    async function completeWebauthnLogin() {
+      if (!challengeId) return;
+      if (!window.PublicKeyCredential) throw new Error("This browser does not support security keys");
+      const begin = await fetch("/v1/auth/webauthn/login/begin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ challenge_id: challengeId }),
+      });
+      const opts = await begin.json().catch(() => ({}));
+      if (!begin.ok) throw new Error(opts.message || opts.detail || "security key challenge failed");
+      const cred = await navigator.credentials.get(reviveWebauthnPublicKey(opts));
+      if (!cred) throw new Error("security key cancelled");
+      const payload = credentialToJson(cred);
+      payload.challenge_id = challengeId;
+      const res = await fetch("/v1/auth/webauthn/login/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || data.detail || (typeof data === "string" ? data : "security key failed"));
+      applyLoginSuccess(data);
+      await loadAll();
+      startPolling();
+      render();
+    }
+
+    webauthnBtn?.addEventListener("click", async () => {
+      if (errEl) {
+        errEl.textContent = "";
+        errEl.classList.add("hidden");
+      }
+      try {
+        await completeWebauthnLogin();
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = err.message || String(err);
+          errEl.classList.remove("hidden");
+        }
+      }
+    });
+
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
@@ -195,11 +306,7 @@
           });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.message || data.detail || (typeof data === "string" ? data : "invalid code"));
-          setSessionToken(data.token);
-          state.authUser = data.user;
-          challengeId = null;
-          showLogin(false);
-          updateSessionChrome();
+          applyLoginSuccess(data);
           await loadAll();
           startPolling();
           render();
@@ -220,16 +327,22 @@
         }
         if (data.mfa_required) {
           challengeId = data.challenge_id;
+          mfaMethods = data.methods || [];
           if (cred) cred.classList.add("hidden");
           if (mfa) mfa.classList.remove("hidden");
-          if (submit) submit.textContent = "Verify MFA";
-          form.querySelector('[name="mfa_code"]')?.focus();
+          const hasTotp = mfaMethods.includes("totp");
+          const hasKey = mfaMethods.includes("webauthn");
+          if (totpWrap) totpWrap.classList.toggle("hidden", !hasTotp);
+          if (webauthnBtn) webauthnBtn.classList.toggle("hidden", !hasKey);
+          if (submit) {
+            submit.textContent = hasTotp ? "Verify MFA" : "Use security key";
+            submit.classList.toggle("hidden", hasKey && !hasTotp);
+          }
+          if (hasTotp) form.querySelector('[name="mfa_code"]')?.focus();
+          else if (hasKey) await completeWebauthnLogin();
           return;
         }
-        setSessionToken(data.token);
-        state.authUser = data.user;
-        showLogin(false);
-        updateSessionChrome();
+        applyLoginSuccess(data);
         await loadAll();
         startPolling();
         render();
@@ -9211,7 +9324,7 @@
           <div><dt>Scan interval</dt><dd>${esc(eff.scan_interval)} ±${esc(eff.scan_jitter_pct)}%</dd></div>
           <div><dt>Check set</dt><dd>${esc(eff.default_check_set)}</dd></div>
           <div><dt>Scan history</dt><dd>${esc(eff.scan_history_per_host ?? 3)} finished / host</dd></div>
-          <div><dt>Host health</dt><dd>${eff.host_health_enabled === false ? "disabled" : `every ${esc(eff.host_health_interval_secs ?? 60)}s · ${esc(eff.host_health_concurrency ?? 8)} concurrent`}</dd></div>
+          <div><dt>WebAuthn</dt><dd>${eff.webauthn_origin ? esc(eff.webauthn_origin) : "request Origin"}${eff.webauthn_rp_id ? ` · rpId ${esc(eff.webauthn_rp_id)}` : ""}</dd></div>
           <div><dt>Concurrency</dt><dd>${esc(eff.max_concurrent_scans)} · timeout ${esc(eff.scan_timeout_secs)}s</dd></div>
           <div><dt>Noise XX</dt><dd>${eff.noise_xx_enabled ? esc(eff.noise_xx_server_fingerprint || "enabled") : "disabled"}</dd></div>
           <div><dt>Seed demo</dt><dd>${eff.seed_demo ? `yes (${eff.seed_hosts} hosts)` : "no"}</dd></div>
@@ -9263,6 +9376,22 @@
               </label>
             </div>
             <button type="submit" class="btn primary" style="margin-top:0.75rem">Save host health</button>
+          </form>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h3>WebAuthn / YubiKey</h3></div>
+          <form class="form" id="webauthnRpForm" style="padding:0 1.1rem 1.1rem;margin:0">
+            <p class="muted" style="margin:0 0 0.75rem;font-size:0.78rem">
+              Override the origin the browser uses for security keys. Leave blank to follow the address bar
+              (Origin / Host). Same values as <span class="mono">--webauthn-origin</span> / <span class="mono">--webauthn-rp-id</span>.
+            </p>
+            <label>Origin
+              <input name="origin" type="url" placeholder="https://console.example" value="${esc(eff.webauthn_origin || "")}" />
+            </label>
+            <label>Relying-party ID (hostname)
+              <input name="rp_id" placeholder="console.example" value="${esc(eff.webauthn_rp_id || "")}" />
+            </label>
+            <button type="submit" class="btn primary" style="margin-top:0.75rem">Save WebAuthn</button>
           </form>
         </section>
       </div>
@@ -9421,22 +9550,47 @@
   function settingsAccountHtml() {
     const u = state.authUser;
     if (!u || u.username === "anonymous") {
-      return `<section class="panel"><div class="empty">Sign in to manage MFA for your account.</div></section>`;
+      return `<section class="panel"><div class="empty">Sign in to manage your password and MFA.</div></section>`;
     }
     const mfaOn = !!u.totp_enabled;
+    const keys = u.webauthn_credentials || [];
     const setup = state._mfaSetup || null;
+    const mfaBits = [
+      mfaOn ? "TOTP on" : "TOTP off",
+      keys.length ? `YubiKey ${keys.length}` : "no security key",
+    ].join(" · ");
     return `
       <section class="panel">
         <div class="panel-head"><h3>Account</h3>
-          <span class="muted">${esc(u.username)} · ${esc(u.role)}${mfaOn ? " · MFA on" : " · MFA off"}</span>
+          <span class="muted">${esc(u.username)} · ${esc(u.role)} · ${esc(mfaBits)}</span>
         </div>
+        <h4 class="account-subhead">Change password</h4>
         <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
-          Multi-factor authentication (TOTP) — Google Authenticator, 1Password, Authy, etc.
+          Enter your current password. New password must be at least 12 characters.
+          Other sign-in sessions are signed out.
+        </p>
+        <form class="form" id="changePasswordForm" autocomplete="off">
+          <label>Current password
+            <input name="current_password" type="password" required autocomplete="current-password" />
+          </label>
+          <label>New password
+            <input name="new_password" type="password" required minlength="12" autocomplete="new-password" />
+          </label>
+          <label>Confirm new password
+            <input name="new_password2" type="password" required minlength="12" autocomplete="new-password" />
+          </label>
+          <button class="btn primary" type="submit">Update password</button>
+        </form>
+      </section>
+      <section class="panel" style="margin-top:1rem">
+        <div class="panel-head"><h3>Authenticator app (TOTP)</h3></div>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          Google Authenticator, 1Password, Authy, or a YubiKey in TOTP mode.
         </p>
         ${mfaOn ? `
-          <button type="button" class="btn ghost" id="btnMfaDisable">Disable MFA</button>
+          <button type="button" class="btn ghost" id="btnMfaDisable">Disable TOTP</button>
         ` : `
-          ${!setup ? `<button type="button" class="btn primary" id="btnMfaSetup">Set up MFA</button>` : `
+          ${!setup ? `<button type="button" class="btn primary" id="btnMfaSetup">Set up TOTP</button>` : `
             <div class="mfa-setup-box">
               <p class="muted" style="margin:0;font-size:0.82rem">Add this account in your authenticator app (scan URI or enter secret).</p>
               <p class="mono mfa-secret">${esc(setup.secret)}</p>
@@ -9446,9 +9600,27 @@
               <label>6-digit code
                 <input id="mfaEnableCode" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" />
               </label>
-              <button type="button" class="btn primary" id="btnMfaEnable">Enable MFA</button>
+              <button type="button" class="btn primary" id="btnMfaEnable">Enable TOTP</button>
             </div>
           `}
+        `}
+      </section>
+      <section class="panel" style="margin-top:1rem">
+        <div class="panel-head"><h3>YubiKey / security key</h3>
+          <button type="button" class="btn primary" id="btnWebauthnAdd">Register key</button>
+        </div>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          FIDO2 / WebAuthn (YubiKey 5, Security Key, etc.). Use a hostname in the URL
+          (<span class="mono">https://localhost:…</span>), not a raw IP, if the browser rejects the key.
+        </p>
+        ${!keys.length ? `<div class="empty">No security keys registered</div>` : `
+          <table class="data"><thead><tr><th>Name</th><th>Added</th><th></th></tr></thead><tbody>
+            ${keys.map((k) => `<tr>
+              <td>${esc(k.name || "YubiKey")}</td>
+              <td class="mono muted">${esc(k.created_at ? new Date(k.created_at * 1000).toISOString() : "—")}</td>
+              <td><button type="button" class="btn ghost tiny" data-del-webauthn="${esc(k.id)}">Remove</button></td>
+            </tr>`).join("")}
+          </tbody></table>
         `}
       </section>`;
   }
@@ -9467,7 +9639,7 @@
         <form class="form" id="createUserForm" style="margin-bottom:1rem">
           <div class="form-row">
             <label>Username <input name="username" required autocomplete="off" /></label>
-            <label>Password <input name="password" type="password" required minlength="4" /></label>
+            <label>Password <input name="password" type="password" required minlength="12" autocomplete="new-password" /></label>
             <label>Role
               <select name="role">
                 <option value="analyst">analyst</option>
@@ -9485,7 +9657,9 @@
             ${users.map((x) => `<tr>
               <td>${esc(x.username)}</td>
               <td>${esc(x.role)}</td>
-              <td>${x.totp_enabled ? "on" : "off"}</td>
+              <td>${x.totp_enabled || x.webauthn_enabled
+                ? [x.totp_enabled ? "TOTP" : null, x.webauthn_enabled ? "YubiKey" : null].filter(Boolean).join(" + ")
+                : "off"}</td>
               <td><button type="button" class="btn ghost tiny" data-del-user="${esc(x.id)}" ${x.id === u.id ? "disabled" : ""}>Delete</button></td>
             </tr>`).join("")}
           </tbody></table>`}
@@ -9724,15 +9898,66 @@
       }
     });
     $("#btnMfaDisable")?.addEventListener("click", async () => {
-      if (!confirm("Disable MFA for your account?")) return;
+      if (!confirm("Disable authenticator-app MFA for your account?")) return;
       try {
         await api("/v1/auth/totp/disable", { method: "POST", body: {} });
         state.authUser = await fetchMe();
-        toast("MFA disabled");
+        toast("TOTP disabled");
         render();
       } catch (err) {
         toast(err.message);
       }
+    });
+    $("#changePasswordForm")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const current = String(fd.get("current_password") || "");
+      const next = String(fd.get("new_password") || "");
+      const next2 = String(fd.get("new_password2") || "");
+      if (next !== next2) {
+        toast("New passwords do not match");
+        return;
+      }
+      try {
+        await api("/v1/auth/password", {
+          method: "POST",
+          body: { current_password: current, new_password: next },
+        });
+        e.target.reset();
+        toast("Password updated · other sessions signed out");
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    $("#btnWebauthnAdd")?.addEventListener("click", async () => {
+      try {
+        if (!window.PublicKeyCredential) throw new Error("This browser does not support security keys");
+        const opts = await api("/v1/auth/webauthn/register/begin", { method: "POST", body: {} });
+        const cred = await navigator.credentials.create(reviveWebauthnPublicKey(opts));
+        if (!cred) throw new Error("registration cancelled");
+        const payload = credentialToJson(cred);
+        payload.name = "YubiKey";
+        await api("/v1/auth/webauthn/register/finish", { method: "POST", body: payload });
+        state.authUser = await fetchMe();
+        toast("Security key registered");
+        render();
+      } catch (err) {
+        toast(err.message || "Could not register security key");
+      }
+    });
+    $$("[data-del-webauthn]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-del-webauthn");
+        if (!id || !confirm("Remove this security key?")) return;
+        try {
+          await api(`/v1/auth/webauthn/credentials/${encodeURIComponent(id)}`, { method: "DELETE" });
+          state.authUser = await fetchMe();
+          toast("Security key removed");
+          render();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
     });
     $("#btnReloadUsers")?.addEventListener("click", async () => {
       await loadAuthUsers();
@@ -10099,6 +10324,28 @@
         try {
           state.settings = await api("/v1/settings", { method: "PUT", body });
           toast("Host health settings saved");
+          render();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    }
+    const webauthnForm = $("#webauthnRpForm");
+    if (webauthnForm) {
+      webauthnForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(webauthnForm);
+        try {
+          state.settings = await api("/v1/settings", {
+            method: "PUT",
+            body: {
+              webauthn: {
+                origin: String(fd.get("origin") || "").trim(),
+                rp_id: String(fd.get("rp_id") || "").trim(),
+              },
+            },
+          });
+          toast("WebAuthn settings saved");
           render();
         } catch (err) {
           toast(err.message);

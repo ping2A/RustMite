@@ -34,7 +34,7 @@ Six regional nodes are registered. The console paginates hosts/findings/scans an
 
 ## Authentication (on by default)
 
-Operator console login is **required by default** (Mobipwn-style): Argon2 passwords, session Bearer tokens, and optional per-user TOTP MFA.
+Operator console login is **required by default**: Argon2 passwords, session Bearer tokens, optional TOTP, and optional YubiKey / FIDO2 (WebAuthn) MFA.
 
 | Env | Default | Purpose |
 |---|---|---|
@@ -43,9 +43,11 @@ Operator console login is **required by default** (Mobipwn-style): Argon2 passwo
 | `RUSTMITE_ADMIN_PASSWORD` | `admin` | Bootstrap admin password when the auth store is empty |
 | `RUSTMITE_API_TOKEN` | unset | Optional legacy shared Bearer (sidebar “Legacy API token”) |
 
-Users and sessions persist under `.dev/auth.json` (or `RUSTMITE_AUTH_FILE`). Change the default password immediately; enable MFA under **Settings → Account**. Admins manage users under **Settings → Users**.
+YubiKey / WebAuthn origin: `--webauthn-origin` / `--webauthn-rp-id`, or **Settings → Scanning** (persisted in `.dev/webauthn.json`). Blank follows the browser Origin header.
 
-Public without a session: `/`, `/ui/*`, `/v1/health`, `/v1/version`, `/v1/auth/status|login|mfa`, and virtual-agent ingest. All other `/v1/*` routes require `Authorization: Bearer <session>`.
+Users and sessions persist under `.dev/auth.json` (or `RUSTMITE_AUTH_FILE`). Change the default password immediately under **Settings → Account** (current password required; other sessions are signed out). Enable TOTP and/or a YubiKey there. Admins manage users under **Settings → Users** (new passwords ≥ 12 characters).
+
+Public without a session: `/`, `/ui/*`, `/v1/health`, `/v1/version`, `/v1/auth/status|login|mfa`, `/v1/auth/webauthn/login/*`, and virtual-agent ingest. All other `/v1/*` routes require `Authorization: Bearer <session>`.
 
 ## Screens (Sandfly ↔ RustMite)
 

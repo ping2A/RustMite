@@ -152,6 +152,15 @@ struct Args {
     /// Ignore any existing snapshot and start with an empty control-plane store.
     #[arg(long, default_value_t = false, env = "RUSTMITE_RESET_STORE", value_parser = BoolishValueParser::new())]
     reset_store: bool,
+
+    /// WebAuthn origin advertised to the browser (e.g. `https://console.example`).
+    /// Empty = use the request Origin/Host. Also editable under Settings.
+    #[arg(long)]
+    webauthn_origin: Option<String>,
+
+    /// WebAuthn relying-party ID (hostname). Empty = hostname of the origin.
+    #[arg(long)]
+    webauthn_rp_id: Option<String>,
 }
 
 fn resolve_tls(
@@ -660,6 +669,24 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::warn!("operator auth DISABLED (RUSTMITE_REQUIRE_AUTH=0) — console is open");
     }
+    let mut webauthn_rp = rustmite_server::webauthn::load_config();
+    if args.webauthn_origin.is_some() || args.webauthn_rp_id.is_some() {
+        if let Some(o) = args.webauthn_origin.clone() {
+            webauthn_rp.origin = Some(o);
+        }
+        if let Some(id) = args.webauthn_rp_id.clone() {
+            webauthn_rp.rp_id = Some(id);
+        }
+        webauthn_rp = webauthn_rp.sanitized();
+        rustmite_server::webauthn::save_config(&webauthn_rp);
+    }
+    if let Some(ref origin) = webauthn_rp.origin {
+        tracing::info!(
+            origin,
+            rp_id = webauthn_rp.rp_id.as_deref().unwrap_or(""),
+            "WebAuthn RP override from --webauthn-* / Settings"
+        );
+    }
     let settings = Arc::new(RuntimeSettings {
         listen: args.listen,
         node_listen: args.node_listen,
@@ -732,6 +759,7 @@ async fn main() -> anyhow::Result<()> {
             ".dev/virtual-agents.json",
         ),
         operator_auth,
+        webauthn_rp: Arc::new(tokio::sync::RwLock::new(webauthn_rp)),
     };
 
     let _ = rustmite_server::credentials::import_filesystem_credentials(&state).await;

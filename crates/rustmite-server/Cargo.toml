@@ -53,3 +53,5 @@ totp-lite = { workspace = true }
 base32 = { workspace = true }
 rand = { workspace = true }
 urlencoding = { workspace = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ciborium = "0.2"

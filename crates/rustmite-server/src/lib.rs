@@ -6,6 +6,7 @@ pub mod anomark_api;
 pub mod auth;
 pub mod operator_auth;
 pub mod routes_auth;
+pub mod webauthn;
 pub mod check_catalog;
 pub mod check_sets;
 pub mod clickhouse;

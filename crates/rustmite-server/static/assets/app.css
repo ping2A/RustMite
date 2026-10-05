@@ -4026,6 +4026,10 @@ a.host-name-link {
   color: var(--ink);
 }
 .login-card .btn { width: 100%; margin-top: 0.25rem; }
+.account-subhead {
+  margin: 0.15rem 0 0.35rem;
+  font-size: 0.92rem;
+}
 .session-user { word-break: break-all; }
 .mfa-setup-box {
   display: flex;

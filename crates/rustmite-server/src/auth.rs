@@ -31,6 +31,8 @@ fn is_public_path(path: &str) -> bool {
         || path == "/v1/auth/status"
         || path == "/v1/auth/login"
         || path == "/v1/auth/mfa"
+        || path == "/v1/auth/webauthn/login/begin"
+        || path == "/v1/auth/webauthn/login/finish"
         // Virtual agents authenticate with their own ingest token.
         || path == "/v1/ingest/logs"
         || path.starts_with("/v1/ingest/logs/")

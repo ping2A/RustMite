@@ -89,6 +89,9 @@ pub struct EffectiveSettings {
     pub host_health_interval_secs: u64,
     pub host_health_concurrency: usize,
     pub host_health_connect_timeout_secs: u64,
+    /// WebAuthn RP advertised to the browser (empty = use request Origin/Host).
+    pub webauthn_origin: Option<String>,
+    pub webauthn_rp_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -501,6 +504,28 @@ pub const SETTINGS_CATALOG: &[SettingDescriptor] = &[
         options: None,
     },
     SettingDescriptor {
+        key: "webauthn_origin",
+        flag: "--webauthn-origin",
+        env: "(none)",
+        value_type: "url",
+        default: "(request Origin)",
+        description: "WebAuthn origin advertised to YubiKeys (e.g. https://console.example). Empty uses the browser Origin header.",
+        requires_restart: false,
+        secret: false,
+        options: None,
+    },
+    SettingDescriptor {
+        key: "webauthn_rp_id",
+        flag: "--webauthn-rp-id",
+        env: "(none)",
+        value_type: "string",
+        default: "(hostname of origin)",
+        description: "WebAuthn relying-party ID (hostname). Empty uses the hostname of the origin.",
+        requires_restart: false,
+        secret: false,
+        options: None,
+    },
+    SettingDescriptor {
         key: "api_token",
         flag: "(none)",
         env: "RUSTMITE_API_TOKEN",
@@ -653,6 +678,8 @@ impl RuntimeSettings {
             host_health_interval_secs: crate::host_health::DEFAULT_INTERVAL_SECS,
             host_health_concurrency: crate::host_health::DEFAULT_CONCURRENCY,
             host_health_connect_timeout_secs: 3,
+            webauthn_origin: None,
+            webauthn_rp_id: None,
         }
     }
 }
@@ -867,6 +894,8 @@ impl SettingsInner {
             "node_tls_cert" => self.runtime.node_tls_cert = None,
             "node_tls_key" => {}
             "node_tls_client_ca" => self.runtime.node_tls_client_ca = None,
+            "webauthn_origin" => {}
+            "webauthn_rp_id" => {}
             "rust_log" => {
                 std::env::remove_var("RUST_LOG");
             }
@@ -1034,6 +1063,9 @@ impl SettingsInner {
             "node_tls_client_ca" => {
                 self.runtime.node_tls_client_ca = optional_path(raw);
             }
+            "webauthn_origin" | "webauthn_rp_id" => {
+                // Live values live in AppState.webauthn_rp (Settings PUT / CLI).
+            }
             "api_token" => {
                 self.runtime.api_token_required = !raw.is_empty();
                 if raw.is_empty() {
@@ -1091,6 +1123,8 @@ pub fn editor_value(key: &str, eff: &EffectiveSettings, overrides: &BTreeMap<Str
         "node_tls_cert" => eff.node_tls_cert.clone().unwrap_or_default(),
         "node_tls_key" => String::new(),
         "node_tls_client_ca" => eff.node_tls_client_ca.clone().unwrap_or_default(),
+        "webauthn_origin" => eff.webauthn_origin.clone().unwrap_or_default(),
+        "webauthn_rp_id" => eff.webauthn_rp_id.clone().unwrap_or_default(),
         "api_token" => String::new(),
         "rust_log" => eff.rust_log.clone().unwrap_or_else(|| "info".into()),
         _ => String::new(),

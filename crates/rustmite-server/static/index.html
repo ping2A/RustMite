@@ -37,9 +37,12 @@
         </label>
       </div>
       <div id="loginMfaFields" class="hidden">
-        <label>Authenticator code
-          <input name="mfa_code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" />
-        </label>
+        <div id="loginTotpWrap">
+          <label>Authenticator code
+            <input name="mfa_code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" />
+          </label>
+        </div>
+        <button type="button" class="btn ghost hidden" id="btnLoginWebauthn">Use YubiKey / security key</button>
       </div>
       <button class="btn primary" type="submit" id="loginSubmit">Sign in</button>
       <p class="muted login-hint">Default account: admin / admin · enable MFA under Settings → Account</p>
