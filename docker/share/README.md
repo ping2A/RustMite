@@ -20,7 +20,19 @@ docker run --rm -p 8080:8080 -p 8443:8443 \
 ```
 
 HTTPS is on by default. The server auto-generates a self-signed cert into
-`/opt/rustmite/tls` (mount that volume to keep it across restarts).
+`/opt/rustmite/tls` (mount that volume to keep it across restarts). Publish
+**8080** (operator console + `/v1/*`) and **8443** (scanner nodes). Listen is
+`0.0.0.0` in the image so both ports are reachable on the host.
+
+If you terminate TLS on a hostname, pass SANs when the cert is first created:
+
+```bash
+docker run --rm -p 8080:8080 -p 8443:8443 \
+  -v rustmite-tls:/opt/rustmite/tls \
+  rustmite:0.1.0 server --tls-san ids.example --tls-san 10.0.0.5
+```
+
+Delete the TLS volume (or `cert.pem`/`key.pem`) if you need to regenerate names.
 
 Cleartext (lab only):
 

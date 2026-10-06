@@ -45,12 +45,21 @@ pub const DEFAULT_TLS_DIR: &str = ".dev/tls";
 
 /// Ensure a self-signed cert/key exist under `dir` (create on first run).
 ///
-/// SANs: `localhost`, `127.0.0.1`, `::1`. Reuses existing PEMs when both files are present.
+/// Default SANs: `localhost`, `127.0.0.1`, `::1`, plus `$HOSTNAME` and `extra`.
+/// Reuses existing PEMs when both files are present.
 pub fn ensure_dev_certs(dir: impl AsRef<Path>) -> anyhow::Result<TlsPaths> {
+    ensure_dev_certs_with_sans(dir, &[] as &[String])
+}
+
+pub fn ensure_dev_certs_with_sans(
+    dir: impl AsRef<Path>,
+    extra: &[String],
+) -> anyhow::Result<TlsPaths> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir).with_context(|| format!("create TLS dir {}", dir.display()))?;
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
+    let sans = default_dev_sans(extra);
 
     if cert_path.is_file() && key_path.is_file() {
         tracing::info!(
@@ -68,13 +77,10 @@ pub fn ensure_dev_certs(dir: impl AsRef<Path>) -> anyhow::Result<TlsPaths> {
 
     tracing::info!(
         dir = %dir.display(),
-        "generating self-signed TLS certificate (localhost, 127.0.0.1, ::1)"
+        sans = ?sans,
+        "generating self-signed TLS certificate"
     );
-    let (cert_pem, key_pem) = generate_self_signed_pem(&[
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ])?;
+    let (cert_pem, key_pem) = generate_self_signed_pem(&sans)?;
     fs::write(&cert_path, cert_pem.as_bytes())
         .with_context(|| format!("write {}", cert_path.display()))?;
     fs::write(&key_path, key_pem.as_bytes())
@@ -91,6 +97,30 @@ pub fn ensure_dev_certs(dir: impl AsRef<Path>) -> anyhow::Result<TlsPaths> {
         client_ca: None,
         auto_generated: true,
     })
+}
+
+fn default_dev_sans(extra: &[String]) -> Vec<String> {
+    let mut sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        push_san(&mut sans, h.trim());
+    }
+    for s in extra {
+        push_san(&mut sans, s.trim());
+    }
+    sans
+}
+
+fn push_san(sans: &mut Vec<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    if !sans.iter().any(|s| s == name) {
+        sans.push(name.to_string());
+    }
 }
 
 fn generate_self_signed_pem(sans: &[String]) -> anyhow::Result<(String, String)> {

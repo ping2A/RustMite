@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, Method, StatusCode};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use base64::Engine as _;
 use rustmite_checks::CheckEngine;
 use rustmite_notify::{AlertEvent, NotifySink, WebhookSink};
@@ -70,6 +71,7 @@ pub fn operator_router(state: AppState) -> Router {
         .route("/ui", get(ui::index))
         .route("/ui/", get(ui::index))
         .route("/ui/assets/{*path}", get(ui_asset))
+        .route("/favicon.ico", get(favicon))
         .route("/v1/health", get(health))
         .route("/health", get(health))
         .route("/v1/version", get(version_inventory))
@@ -229,7 +231,36 @@ pub fn operator_router(state: AppState) -> Router {
             let gate = gate.clone();
             async move { require_auth(gate, req, next).await }
         }))
+        .layer(operator_cors())
         .with_state(state)
+}
+
+fn operator_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::HEAD,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+        ])
+        .allow_credentials(true)
+        .max_age(std::time::Duration::from_secs(600))
+}
+
+async fn favicon() -> axum::response::Response {
+    let uri: axum::http::Uri = "/ui/assets/logo-mark.png"
+        .parse()
+        .unwrap_or_else(|_| "/ui/assets/".parse().unwrap());
+    ui::asset(uri).await
 }
 
 async fn ui_asset(

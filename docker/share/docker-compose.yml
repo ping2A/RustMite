@@ -38,7 +38,7 @@ services:
       - rustmite-vault:/opt/rustmite/vault
     command: ["server"]
     healthcheck:
-      test: ["CMD", "curl", "-kfsS", "https://127.0.0.1:8080/"]
+      test: ["CMD", "curl", "-kfsS", "https://127.0.0.1:8080/v1/health"]
       interval: 15s
       timeout: 5s
       retries: 10

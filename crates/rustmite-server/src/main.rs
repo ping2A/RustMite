@@ -10,7 +10,7 @@ use clap::builder::BoolishValueParser;
 use clap::Parser;
 use rustmite_notify::WebhookSink;
 use rustmite_server::{
-    default_checks_dir, ensure_dev_certs, node_router, operator_router, seed_demo, serve_plain,
+    default_checks_dir, ensure_dev_certs_with_sans, node_router, operator_router, seed_demo, serve_plain,
     serve_tls, spawn_host_health_checker, spawn_scan_scheduler, spawn_scan_simulator, AppState,
     CheckCatalog, MetricsHub,
     RuntimeSettings, TlsPaths,
@@ -153,6 +153,10 @@ struct Args {
     #[arg(long, default_value_t = false, env = "RUSTMITE_RESET_STORE", value_parser = BoolishValueParser::new())]
     reset_store: bool,
 
+    /// Extra DNS/IP names on the auto-generated TLS certificate (repeatable).
+    #[arg(long = "tls-san")]
+    tls_san: Vec<String>,
+
     /// WebAuthn origin advertised to the browser (e.g. `https://console.example`).
     /// Empty = use the request Origin/Host. Also editable under Settings.
     #[arg(long)]
@@ -200,7 +204,7 @@ fn resolve_operator_and_node_tls(args: &Args) -> anyhow::Result<(Option<TlsPaths
         if explicit {
             resolve_tls(args.tls_cert.clone(), args.tls_key.clone(), None, "operator")?
         } else {
-            Some(ensure_dev_certs(&args.tls_dir)?)
+            Some(ensure_dev_certs_with_sans(&args.tls_dir, &args.tls_san)?)
         }
     } else {
         None
@@ -219,7 +223,7 @@ fn resolve_operator_and_node_tls(args: &Args) -> anyhow::Result<(Option<TlsPaths
         Some(paths) => Some(paths),
         None => {
             // Always encrypt the node API — generate/reuse certs under tls_dir.
-            Some(ensure_dev_certs(&args.tls_dir)?)
+            Some(ensure_dev_certs_with_sans(&args.tls_dir, &args.tls_san)?)
         }
     };
     if let (Some(op), Some(ref mut n)) = (&operator, &mut node) {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -19,14 +19,23 @@ pub struct AuthGate {
     pub api_token: Option<String>,
 }
 
-fn is_public_path(path: &str) -> bool {
+fn normalize_path(path: &str) -> &str {
+    if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    }
+}
+
+pub(crate) fn is_public_path(path: &str) -> bool {
+    let path = normalize_path(path);
     path.ends_with("/health")
         || path == "/health"
         || path.ends_with("/version")
         || path == "/v1/version"
         || path == "/"
+        || path == "/favicon.ico"
         || path == "/ui"
-        || path == "/ui/"
         || path.starts_with("/ui/")
         || path == "/v1/auth/status"
         || path == "/v1/auth/login"
@@ -47,6 +56,11 @@ fn bearer_token(req: &Request) -> Option<&str> {
 
 /// Gate operator routes. Inserts `AuthContext` when a user session is valid.
 pub async fn require_auth(gate: AuthGate, mut req: Request, next: Next) -> Response {
+    // CORS preflight has no Bearer token; CorsLayer answers OPTIONS.
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+
     let path = req.uri().path().to_string();
     if is_public_path(&path) {
         return next.run(req).await;
@@ -87,6 +101,53 @@ pub async fn require_auth(gate: AuthGate, mut req: Request, next: Next) -> Respo
         Err(e) => {
             tracing::warn!(error = %e, "auth session verify failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "auth error").into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public_path;
+
+    #[test]
+    fn deploy_public_paths_stay_open() {
+        for p in [
+            "/",
+            "/ui",
+            "/ui/",
+            "/ui/assets/app.js",
+            "/favicon.ico",
+            "/health",
+            "/v1/health",
+            "/v1/health/",
+            "/v1/version",
+            "/v1/auth/status",
+            "/v1/auth/login",
+            "/v1/auth/login/",
+            "/v1/auth/mfa",
+            "/v1/auth/webauthn/login/begin",
+            "/v1/auth/webauthn/login/finish",
+            "/v1/ingest/logs",
+            "/v1/ingest/logs/abc",
+        ] {
+            assert!(is_public_path(p), "{p} should be public");
+        }
+    }
+
+    #[test]
+    fn operator_api_is_gated() {
+        for p in [
+            "/v1/hosts",
+            "/v1/summary",
+            "/v1/settings",
+            "/v1/auth/me",
+            "/v1/auth/password",
+            "/v1/auth/users",
+            "/v1/auth/webauthn/register/begin",
+            "/v1/openapi.json",
+            "/v1/nodes",
+        ] {
+            assert!(!is_public_path(p), "{p} should require a session");
         }
     }
 }

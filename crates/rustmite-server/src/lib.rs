@@ -40,4 +40,6 @@ pub use scan_sim::spawn_scan_simulator;
 pub use seed::{seed_demo, DEFAULT_SEED_HOSTS};
 pub use settings::{RuntimeSettings, SettingsExport, SETTINGS_CATALOG};
 pub use sys_metrics::MetricsHub;
-pub use tls::{ensure_dev_certs, serve_plain, serve_tls, TlsPaths, DEFAULT_TLS_DIR};
+pub use tls::{
+    ensure_dev_certs, ensure_dev_certs_with_sans, serve_plain, serve_tls, TlsPaths, DEFAULT_TLS_DIR,
+};
