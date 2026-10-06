@@ -617,7 +617,7 @@ impl RuntimeSettings {
             scan_sim: self.scan_sim,
             api_token_required: self.api_token_required,
             rust_log: std::env::var("RUST_LOG").ok(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::version_info::crate_version().to_string(),
             default_check_set: self.default_check_set.clone(),
             scan_interval: self.scan_interval.clone(),
             scan_jitter_pct: self.scan_jitter_pct,

@@ -20,14 +20,30 @@ RUN apt-get update \
 # Copy the whole workspace (see .dockerignore). Cache cargo registry + target.
 COPY . .
 
+# Image tag → UI / `--version`. share-image.sh passes `--build-arg VERSION=<tag>`.
+# Declared after COPY so a new tag invalidates this layer (and cargo env fingerprint).
+ARG VERSION=
+ENV RUSTMITE_VERSION=$VERSION
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
+    set -eu; \
+    if [ -n "${VERSION}" ]; then \
+      awk -v v="${VERSION#v}" ' \
+        BEGIN { inpkg=0; done=0 } \
+        $0 == "[workspace.package]" { inpkg=1 } \
+        inpkg && /^version = / && !done { printf "version = \"%s\"\n", v; done=1; next } \
+        /^\[/ && $0 != "[workspace.package]" { inpkg=0 } \
+        { print } \
+        END { if (!done) exit 1 } \
+      ' Cargo.toml > Cargo.toml.version && mv Cargo.toml.version Cargo.toml; \
+    fi; \
     cargo build --release \
       -p rustmite-server \
       -p rustmite-node \
       -p rustmite-cli \
- && mkdir -p /out \
+    && mkdir -p /out \
  && cp target/release/rustmite-server \
        target/release/rustmite-node \
        target/release/rustmite-cli \

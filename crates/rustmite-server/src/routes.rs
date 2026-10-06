@@ -299,7 +299,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "clickhouse": state.clickhouse.is_some(),
         "store_backend": if state.clickhouse.is_some() { "clickhouse" } else { "json" },
         "noise_xx": state.noise_xx_enabled,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::version_info::crate_version(),
     }))
 }
 

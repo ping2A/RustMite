@@ -69,7 +69,9 @@ Build a shareable RustMite Docker image.
   ./scripts/share-image.sh [options]
 
 Options:
-  --tag TAG        Image version tag (default: ${VERSION} from Cargo.toml)
+  --tag TAG        Image version tag AND UI/console version
+                   (default: ${VERSION} from Cargo.toml). Use Cargo-style
+                   versions (0.2.0); a leading v is stripped for Cargo.toml.
   --x64, --amd64   Build for linux/amd64 (x86_64) — typical share target
   --arm64          Build for linux/arm64
   --arch ARCH      Same as above: amd64|x64|arm64
@@ -167,10 +169,12 @@ mkdir -p "$OUT_DIR"
 echo "==> Building ${IMAGE} for ${PLATFORM} (also tagged ${LATEST}, ${IMAGE_ARCH})"
 if docker buildx version >/dev/null 2>&1; then
   BUILD_ARGS=(buildx build --load --platform "$PLATFORM"
+    --build-arg "VERSION=${VERSION}"
     -t "$IMAGE" -t "$LATEST" -t "$IMAGE_ARCH" -t "$LATEST_ARCH"
     -f Dockerfile .)
 else
   BUILD_ARGS=(build --platform "$PLATFORM"
+    --build-arg "VERSION=${VERSION}"
     -t "$IMAGE" -t "$LATEST" -t "$IMAGE_ARCH" -t "$LATEST_ARCH"
     -f Dockerfile .)
 fi

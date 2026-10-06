@@ -70,6 +70,10 @@ docker run --rm rustmite:0.1.0 help
 ./scripts/share-image.sh --x64
 # → dist/rustmite-0.1.0-amd64.tar.gz
 
+# New release tag — Docker image AND operator UI version
+./scripts/share-image.sh --tag 0.2.0 --x64
+# → dist/rustmite-0.2.0-amd64.tar.gz  (console shows v0.2.0)
+
 # Host architecture (omit --x64 / --arm64)
 ./scripts/share-image.sh
 ```

@@ -1,5 +1,13 @@
 //! Control-plane and agentless binary version / integrity inventory.
 
+/// Version shown in the operator UI / `/v1/health`.
+///
+/// Docker `./scripts/share-image.sh --tag` sets `RUSTMITE_VERSION` at compile time
+/// so the image tag and the console stay in sync. Local builds use `CARGO_PKG_VERSION`.
+pub fn crate_version() -> &'static str {
+    env!("RUSTMITE_RELEASE_VERSION")
+}
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -121,7 +129,7 @@ fn digest_for(name: &str, version: &str, path: Option<PathBuf>) -> BinaryDigest 
 }
 
 fn server_digest() -> BinaryDigest {
-    let version = env!("CARGO_PKG_VERSION").to_string();
+    let version = crate_version().to_string();
     match std::env::current_exe() {
         Ok(exe) => digest_for("rustmite-server", &version, Some(exe)),
         Err(e) => BinaryDigest {
@@ -156,7 +164,7 @@ fn find_component(roots: &[PathBuf], arch: &str, triple: &str, component: &str) 
 
 /// Snapshot of control-plane + agentless binary versions and SHA-256 digests.
 pub fn collect_version_inventory() -> VersionInventory {
-    let agentless_version = env!("CARGO_PKG_VERSION").to_string();
+    let agentless_version = crate_version().to_string();
     let roots = default_search_roots();
     let root_display: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
 
@@ -252,6 +260,8 @@ mod tests {
         assert!(!inv.agentlite.collectors.is_empty());
         assert_eq!(inv.agentless_info.name, "rustmite-probe");
         assert!(!inv.agentless_info.delivery_methods.is_empty());
+        assert!(!crate_version().is_empty());
+        assert_eq!(inv.server.version, crate_version());
         assert!(inv.server.present);
         assert!(inv
             .server
