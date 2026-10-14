@@ -222,7 +222,7 @@ pub const SETTINGS_CATALOG: &[SettingDescriptor] = &[
         flag: "--scan-history-per-host",
         env: "RUSTMITE_SCAN_HISTORY_PER_HOST",
         value_type: "usize",
-        default: "3",
+        default: "10",
         description: "Finished scans retained per host (newest kept; active jobs always retained). Hosts may override via label scan_history",
         requires_restart: false,
         secret: false,

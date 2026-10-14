@@ -25,6 +25,10 @@
 # Packaged Docker images from ./scripts/share-image.sh
 /dist/
 
+# Staged musl probe/loader ELFs for the share image (built by cargo zigbuild)
+/docker/share/probes/*/rustmite-probe
+/docker/share/probes/*/rustmite-loader
+
 # Local dev runtime (pids, logs, overrides) — managed by ./dev.sh
 .dev/
 

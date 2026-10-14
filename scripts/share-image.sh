@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build a RustMite Docker image you can share (tar file or registry push).
+# Build a shareable RustMite appliance image
+# (control plane + embedded ClickHouse + agentless probe/loader binaries).
+# Output: tar.gz and/or registry push.
 #
 # Usage:
 #   ./scripts/share-image.sh              # build for host arch → dist/rustmite-<ver>-<arch>.tar.gz
@@ -8,6 +10,8 @@
 #   ./scripts/share-image.sh --load       # same, then docker load locally (smoke)
 #   ./scripts/share-image.sh --push REG   # build, tag, push to REG/rustmite:<ver>
 #   ./scripts/share-image.sh --help
+#
+# The image entrypoint starts ClickHouse then rustmite-server. See docker/share/README.md.
 #
 set -euo pipefail
 
@@ -64,7 +68,8 @@ platform_to_arch() {
 
 usage() {
   cat <<EOF
-Build a shareable RustMite Docker image.
+Build a shareable RustMite appliance image
+(server + embedded ClickHouse + x86_64/i686/aarch64/armv7 probe/loader).
 
   ./scripts/share-image.sh [options]
 
@@ -91,8 +96,8 @@ Share the file:
 
 On the other machine:
   gunzip -c rustmite-${VERSION}-amd64.tar.gz | docker load
-  docker run --rm -p 8080:8080 -p 8443:8443 rustmite:${VERSION}
-  # open https://127.0.0.1:8080/  (accept self-signed cert)
+  docker run --rm -p 8080:8080 -p 8443:8443 -p 8123:8123 rustmite:${VERSION}
+  # open https://127.0.0.1:8080/  (accept self-signed cert; ClickHouse on :8123)
 EOF
 }
 
@@ -166,6 +171,15 @@ GZ="${TAR}.gz"
 
 mkdir -p "$OUT_DIR"
 
+# Stage musl probe/loader for x86_64 + i686 + aarch64 + armv7 into
+# docker/share/probes/ so the Dockerfile can COPY them into the image.
+# (scripts/ is dockerignored — this must run on the host before build.)
+if [[ -x "${ROOT}/scripts/stage-share-probes.sh" ]]; then
+  "${ROOT}/scripts/stage-share-probes.sh"
+else
+  bash "${ROOT}/scripts/stage-share-probes.sh"
+fi
+
 echo "==> Building ${IMAGE} for ${PLATFORM} (also tagged ${LATEST}, ${IMAGE_ARCH})"
 if docker buildx version >/dev/null 2>&1; then
   BUILD_ARGS=(buildx build --load --platform "$PLATFORM"
@@ -180,6 +194,34 @@ else
 fi
 docker "${BUILD_ARGS[@]}"
 
+# Guard: shipped image must not contain baked-in ClickHouse / store data.
+echo "==> Verifying empty ClickHouse + data dirs in ${IMAGE}"
+if ! docker run --rm --entrypoint bash "$IMAGE" -c '
+  set -e
+  # No data files under ClickHouse (dirs/markers only).
+  if find /var/lib/clickhouse -type f 2>/dev/null | grep -q .; then
+    echo "error: /var/lib/clickhouse contains files — refuse to ship non-empty ClickHouse" >&2
+    find /var/lib/clickhouse -type f | head -20 >&2
+    exit 1
+  fi
+  if [ -n "$(ls -A /opt/rustmite/data 2>/dev/null || true)" ]; then
+    echo "error: /opt/rustmite/data is not empty — refuse to ship seeded store" >&2
+    ls -la /opt/rustmite/data >&2
+    exit 1
+  fi
+  case "${RUSTMITE_SEED_DEMO:-0}" in
+    0|false|off|no) ;;
+    *)
+      echo "error: RUSTMITE_SEED_DEMO=${RUSTMITE_SEED_DEMO} — share image must default to 0" >&2
+      exit 1
+      ;;
+  esac
+  echo "    OK  ClickHouse data dir empty, store empty, SEED_DEMO=0"
+'; then
+  echo "error: share-image emptiness check failed" >&2
+  exit 1
+fi
+
 echo "==> Saving ${GZ}"
 rm -f "$TAR" "$GZ"
 docker save -o "$TAR" "$IMAGE" "$LATEST" "$IMAGE_ARCH" "$LATEST_ARCH"
@@ -191,8 +233,8 @@ echo "Ready to share: ${GZ} (${SIZE})"
 echo
 echo "  Recipient:"
 echo "    gunzip -c $(basename "$GZ") | docker load"
-echo "    docker run --rm -p 8080:8080 -p 8443:8443 ${IMAGE}"
-echo "    # → https://127.0.0.1:8080/  (accept self-signed cert)"
+echo "    docker run --rm -p 8080:8080 -p 8443:8443 -p 8123:8123 ${IMAGE}"
+echo "    # → https://127.0.0.1:8080/  (accept self-signed cert; ClickHouse on :8123)"
 echo
 
 if [[ "$DO_LOAD" -eq 1 ]]; then

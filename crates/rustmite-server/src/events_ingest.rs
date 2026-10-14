@@ -1,6 +1,8 @@
 //! Map probe observations → ClickHouse `events` rows for RPL hunting.
+//! Also maps virtual-agent process/file JSONL into the same table so Hunt works.
 
 use rustmite_proto::{Observation, PathBytes};
+use rustmite_sift::{RawFileEntry, RawLogEntry};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -272,19 +274,174 @@ fn path_str(p: Option<&PathBytes>) -> String {
     p.map(|p| p.to_string_lossy()).unwrap_or_default()
 }
 
+/// Map virtual-agent process JSONL rows → ClickHouse `events` for RPL hunt.
+pub fn virtual_processes_to_events(
+    host_id: Uuid,
+    host_name: &str,
+    rows: &[RawLogEntry],
+) -> Vec<Value> {
+    rows.iter()
+        .map(|e| {
+            let ts = clickhouse_ts(e.timestamp.as_deref().unwrap_or(""));
+            let path = e.path.clone();
+            let message = if e.args.trim().is_empty() {
+                format!("process pid={} comm={} exe={}", e.pid, e.name, path_or_dash(&path))
+            } else {
+                format!(
+                    "process pid={} comm={} exe={} args={}",
+                    e.pid,
+                    e.name,
+                    path_or_dash(&path),
+                    e.args
+                )
+            };
+            serde_json::json!({
+                "timestamp": ts,
+                "message": message,
+                "source_type": "rustmite_virtual",
+                "source": "virtual_ingest",
+                "platform": "linux",
+                "host_id": host_id.to_string(),
+                "host_name": host_name,
+                "scan_id": "",
+                "collector": "virtual.process",
+                "kind": "process",
+                "check_id": "",
+                "data_type": "process",
+                "process_name": e.name,
+                "process_id": e.pid,
+                "user": e.uid.to_string(),
+                "path": path,
+                "src_ip": "",
+                "dest_ip": "",
+                "file_hash": "",
+                "severity": "info",
+                "exe_memfd": 0,
+                "ext": serde_json::to_string(e).unwrap_or_else(|_| "{}".into()),
+            })
+        })
+        .collect()
+}
+
+/// Map virtual-agent file JSONL rows → ClickHouse `events` for RPL hunt.
+pub fn virtual_files_to_events(
+    host_id: Uuid,
+    host_name: &str,
+    rows: &[RawFileEntry],
+) -> Vec<Value> {
+    rows.iter()
+        .map(|e| {
+            let ts = clickhouse_ts(
+                e.timestamp
+                    .as_deref()
+                    .or(e.mtime.as_deref())
+                    .unwrap_or(""),
+            );
+            let message = format!("file_meta {}", e.path);
+            serde_json::json!({
+                "timestamp": ts,
+                "message": message,
+                "source_type": "rustmite_virtual",
+                "source": "virtual_ingest",
+                "platform": "linux",
+                "host_id": host_id.to_string(),
+                "host_name": host_name,
+                "scan_id": "",
+                "collector": "virtual.file",
+                "kind": "file_meta",
+                "check_id": "",
+                "data_type": "file_meta",
+                "process_name": "",
+                "process_id": 0,
+                "user": e.uid.to_string(),
+                "path": e.path,
+                "src_ip": "",
+                "dest_ip": "",
+                "file_hash": "",
+                "severity": "info",
+                "exe_memfd": 0,
+                "ext": serde_json::to_string(e).unwrap_or_else(|_| "{}".into()),
+            })
+        })
+        .collect()
+}
+
+fn path_or_dash(path: &str) -> &str {
+    if path.is_empty() {
+        "—"
+    } else {
+        path
+    }
+}
+
+/// Normalize a timestamp into a ClickHouse `DateTime64(6)`-friendly string.
+/// Bad / exotic vendor stamps fall back to now so a single bad row cannot abort
+/// a whole JSONEachRow insert chunk (which left virtual Hunt empty).
 fn clickhouse_ts(raw: &str) -> String {
     let s = raw.trim();
-    let base = if s.is_empty() {
-        utc_now_rfc3339()
-    } else {
-        s.to_string()
-    };
-    base.replace('T', " ")
-        .trim_end_matches('Z')
-        .replace('Z', "")
-        .chars()
-        .take(26)
-        .collect()
+    if s.is_empty() {
+        return format_ch_ts(&utc_now_rfc3339());
+    }
+    // Unix seconds / millis (common in CSV / vendor JSONL).
+    if let Ok(n) = s.parse::<i64>() {
+        let secs = if n > 1_000_000_000_000 {
+            n / 1000
+        } else {
+            n
+        };
+        if (1_000_000_000..4_000_000_000).contains(&secs) {
+            if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(secs) {
+                return format_offset_ch(dt);
+            }
+        }
+    }
+    // RFC3339 / ISO-ish with offset — avoid truncating `+00:00` into garbage.
+    if let Ok(dt) = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+    {
+        return format_offset_ch(dt.to_offset(time::UtcOffset::UTC));
+    }
+    let normalized = format_ch_ts(s);
+    // Must look like `YYYY-MM-DD HH:MM:SS…` (no trailing timezone junk).
+    if normalized.len() >= 19
+        && normalized.as_bytes().get(4) == Some(&b'-')
+        && normalized.as_bytes().get(10) == Some(&b' ')
+        && !normalized.contains('+')
+        && !normalized[11..].contains('-')
+    {
+        return normalized.chars().take(26).collect();
+    }
+    format_ch_ts(&utc_now_rfc3339())
+}
+
+fn format_offset_ch(dt: time::OffsetDateTime) -> String {
+    // 2024-01-15 12:00:00.000000
+    let (h, m, s) = dt.to_hms();
+    let us = dt.microsecond();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        h,
+        m,
+        s,
+        us
+    )
+}
+
+fn format_ch_ts(raw: &str) -> String {
+    // Strip a trailing numeric timezone (`+00:00` / `-05:00`) before truncating.
+    let mut s = raw.replace('T', " ").replace('Z', "");
+    if let Some(idx) = s.rfind(['+', '-']) {
+        if idx > 10 {
+            // Keep only if it looks like a timezone suffix, not a date dash.
+            let tail = &s[idx..];
+            if tail.len() >= 3 && tail.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit()) {
+                s.truncate(idx);
+            }
+        }
+    }
+    s.chars().take(26).collect::<String>().trim().to_string()
 }
 
 #[cfg(test)]
@@ -340,5 +497,42 @@ mod tests {
         assert_eq!(rows[0]["process_name"], "systemd");
         assert_eq!(rows[0]["kind"], "process");
         assert_eq!(rows[0]["process_id"], 1);
+    }
+
+    #[test]
+    fn virtual_process_rows_are_hunt_searchable() {
+        let rows = virtual_processes_to_events(
+            Uuid::nil(),
+            "virt-host",
+            &[RawLogEntry {
+                machine_id: "virt-host".into(),
+                pid: 42,
+                ppid: 1,
+                name: "nc".into(),
+                uid: 0,
+                path: "/usr/bin/nc".into(),
+                args: "-lvp 4444".into(),
+                timestamp: Some("2026-10-08T10:00:00Z".into()),
+            }],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"], "virtual_ingest");
+        assert_eq!(rows[0]["process_name"], "nc");
+        assert_eq!(rows[0]["host_name"], "virt-host");
+        assert!(rows[0]["message"].as_str().unwrap().contains("nc"));
+    }
+
+    #[test]
+    fn clickhouse_ts_handles_offsets_and_unix() {
+        let with_offset = clickhouse_ts("2024-01-15T12:00:00+00:00");
+        assert!(with_offset.starts_with("2024-01-15 12:00:00"), "{with_offset}");
+        assert!(!with_offset.contains('+'), "{with_offset}");
+
+        let unix = clickhouse_ts("1705312800"); // 2024-01-15T10:00:00Z
+        assert!(unix.starts_with("2024-01-15"), "{unix}");
+
+        let garbage = clickhouse_ts("not-a-date");
+        assert!(garbage.starts_with("20"), "{garbage}");
+        assert_eq!(garbage.as_bytes()[10], b' ');
     }
 }

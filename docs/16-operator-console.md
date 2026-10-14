@@ -47,6 +47,8 @@ YubiKey / WebAuthn origin: `--webauthn-origin` / `--webauthn-rp-id`, or **Settin
 
 Users and sessions persist under `.dev/auth.json` (or `RUSTMITE_AUTH_FILE`). Change the default password immediately under **Settings → Account** (current password required; other sessions are signed out). Enable TOTP and/or a YubiKey there. Admins manage users under **Settings → Users** (new passwords ≥ 12 characters).
 
+**Audit log (admin):** every mutating operator UI/API action is recorded with a plain-language **action** and entity-aware **summary** (host names resolved before delete, settings keys, RPL query preview, …), plus sanitized body, actor, role, method/path, and status. Inspect under **Settings → Audit log** (`GET /v1/audit`, admin-only). Events use activity `kind` prefix `audit.`.
+
 Public without a session: `/`, `/ui/*`, `/v1/health`, `/v1/version`, `/v1/auth/status|login|mfa`, `/v1/auth/webauthn/login/*`, and virtual-agent ingest. All other `/v1/*` routes require `Authorization: Bearer <session>`.
 
 ## Screens (Sandfly ↔ RustMite)

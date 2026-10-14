@@ -103,6 +103,22 @@ pub trait Store: Send + Sync {
         Ok(0)
     }
 
+    /// Drop every enrolled host and host-scoped scan/finding/baseline/key data.
+    /// SSH hunter keys/placements are cleared; zones, nodes, and credentials are left alone.
+    async fn clear_all_hosts(&self) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// Drop SSH hunter key records and placements.
+    async fn clear_all_ssh_hunter(&self) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// Drop SSH security zones.
+    async fn clear_all_ssh_zones(&self) -> StoreResult<usize> {
+        Ok(0)
+    }
+
     /// Keep the newest `keep` finished scans per host (active jobs always retained).
     /// When `host_id` is `None`, prune every host. Returns number of scan jobs removed.
     async fn prune_scan_history(

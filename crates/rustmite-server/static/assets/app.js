@@ -23,7 +23,7 @@
     pageSize: 50,
     useUtc: localStorage.getItem("rustmite_clock_utc") !== "0",
     pollTimer: null,
-    theme: localStorage.getItem("rustmite-theme") || "rustmite",
+    theme: localStorage.getItem("rustmite-theme") || "default",
     metrics: null,
     settings: null,
     checkSets: null,
@@ -370,11 +370,18 @@
       res = await fetch(path, { ...opts, headers });
     } catch (err) {
       const msg = err && err.message ? String(err.message) : String(err || "network error");
-      throw new Error(
-        /failed to fetch|networkerror|load failed/i.test(msg)
-          ? `Network error talking to ${path} (server overloaded, timed out, or restarted). Try Import tree for day folders, or retry with a smaller path.`
-          : msg
-      );
+      if (/abort|timed?\s*out/i.test(msg) || (err && err.name === "AbortError")) {
+        throw new Error(`Request to ${path} timed out — the server may still be waiting on SSH or a slow backend.`);
+      }
+      if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+        const hint = path.includes("/hosts/test")
+          ? "Connection test aborted (server overloaded, restarted, or unreachable). From Docker, target a LAN IP / host.docker.internal — not 127.0.0.1."
+          : path.includes("import") || path.includes("virtual")
+            ? "Try Import tree for day folders, or retry with a smaller path."
+            : "Server may be overloaded, timed out, or restarting — retry in a moment.";
+        throw new Error(`Network error talking to ${path}. ${hint}`);
+      }
+      throw new Error(msg);
     }
     if (res.status === 401 && state.requireAuth && !path.startsWith("/v1/auth/")) {
       setSessionToken(null);
@@ -930,6 +937,10 @@
       || ae.id === "anomarkAutoHostTag"
       || ae.id === "anomarkTrainHostQ"
       || ae.id === "anomarkTrainHostTag"
+      || ae.id === "anomarkTrainName"
+      || ae.id === "anomarkTrainOrder"
+      || ae.id === "anomarkTrainLines"
+      || ae.id === "anomarkTrainPath"
     );
     if (typingFilter) return;
     if (
@@ -1028,16 +1039,25 @@
     }
   }
 
-  function openModal(title, html) {
+  function openModal(title, html, opts) {
+    const panel = $("#modal .modal-panel");
+    const mode = (opts && opts.mode) || "default";
+    if (panel) {
+      panel.classList.toggle("is-wide", mode === "wide");
+    }
     $("#modalTitle").textContent = title;
     $("#modalBody").innerHTML = html;
     $("#modal").classList.remove("hidden");
     $("#modal").setAttribute("aria-hidden", "false");
+    document.body.classList.add("modal-open");
   }
 
   function closeModal() {
     $("#modal").classList.add("hidden");
     $("#modal").setAttribute("aria-hidden", "true");
+    document.body.classList.remove("modal-open");
+    const panel = $("#modal .modal-panel");
+    if (panel) panel.classList.remove("is-wide");
   }
 
   async function loadSshHunter() {
@@ -1305,6 +1325,35 @@
     return counts;
   }
 
+  async function refreshScanInvCounts(scanId, hostId) {
+    if (!hostId || !scanId) return;
+    const q = `${hostInventoryScanQuery({ scanId })}&count_only=1`;
+    const [procPack, filePack, connPack] = await Promise.all([
+      api(`/v1/hosts/${hostId}/processes?${q}`).catch(() => null),
+      api(`/v1/hosts/${hostId}/files?${q}`).catch(() => null),
+      api(`/v1/hosts/${hostId}/connections?${q}`).catch(() => null),
+    ]);
+    const invCounts = {
+      processes: Number(procPack?.count ?? 0),
+      files: Number(filePack?.count ?? 0),
+      connections: Number(connPack?.count ?? 0),
+    };
+    if (!state.scanDetail || String(state.scanDetail.id) !== String(scanId)) return;
+    state.scanDetail.invCounts = invCounts;
+    state.scanDetail.invCountsReady = true;
+    // Patch badges in place — avoid a full re-render of the scan page.
+    $$("[data-inv-stat]").forEach((el) => {
+      const key = el.getAttribute("data-inv-stat");
+      if (key && key in invCounts) el.textContent = String(invCounts[key]);
+    });
+    $$("[data-scan-tab]").forEach((btn) => {
+      const tab = btn.dataset.scanTab;
+      if (tab === "processes") btn.textContent = `Processes (${invCounts.processes})`;
+      if (tab === "files") btn.textContent = `Files (${invCounts.files})`;
+      if (tab === "connections") btn.textContent = `Connections (${invCounts.connections})`;
+    });
+  }
+
   async function openScanById(id, opts) {
     if (!id) return false;
     const hash = `#/scans/${encodeURIComponent(id)}`;
@@ -1312,6 +1361,8 @@
     state.selectedScanId = id;
     const keepTab = (opts && opts.tab) || state.scanDetail?.tab || "overview";
     try {
+      // Paint the full page as soon as scan meta is available — do not wait on
+      // inventory (processes/files/connections) which can be large.
       const status = await api(`/v1/scans/${id}`);
       const idx = (state.scans || []).findIndex((s) => String(s.job?.id || "") === String(id));
       if (idx >= 0) state.scans[idx] = status;
@@ -1321,20 +1372,6 @@
       const meta = status.meta || {};
       const hostId = job.host_id || meta.host_id || "";
       const findings = mergeScanFindings(id, status.findings || []);
-      let invCounts = { processes: 0, files: 0, connections: 0 };
-      if (hostId) {
-        const q = hostInventoryScanQuery({ scanId: id });
-        const [procPack, filePack, connPack] = await Promise.all([
-          api(`/v1/hosts/${hostId}/processes?${q}`).catch(() => null),
-          api(`/v1/hosts/${hostId}/files?${q}`).catch(() => null),
-          api(`/v1/hosts/${hostId}/connections?${q}`).catch(() => null),
-        ]);
-        invCounts = {
-          processes: Number(procPack?.count ?? (procPack?.processes || []).length ?? 0),
-          files: Number(filePack?.count ?? (filePack?.files || []).length ?? 0),
-          connections: Number(connPack?.count ?? (connPack?.connections || []).length ?? 0),
-        };
-      }
       const activity = (state.activity || []).filter((e) => {
         if (hostId && e.host_id && String(e.host_id) !== String(hostId)) return false;
         const msg = String(e.message || "");
@@ -1345,12 +1382,14 @@
         id: String(id),
         status,
         findings,
-        invCounts,
+        invCounts: { processes: null, files: null, connections: null },
+        invCountsReady: false,
         activity,
         hostId: String(hostId || ""),
         tab: keepTab,
+        findingsRendered: keepTab === "findings",
+        rawRendered: keepTab === "raw",
       };
-      // Remember as this host's selected inventory scan too.
       if (hostId) {
         if (!state._hostDetailScanByHost) state._hostDetailScanByHost = {};
         state._hostDetailScanByHost[hostId] = String(id);
@@ -1365,6 +1404,13 @@
       const hostLabel = hostId ? hostName(hostId) : "host";
       $("#pageTitle").textContent = `Scan ${shortId(id)}`;
       $("#pageSub").textContent = `${hostLabel} · ${job.check_set || "scan"} · full page`;
+
+      if (hostId) {
+        refreshScanInvCounts(id, hostId).catch(() => {});
+      } else if (state.scanDetail) {
+        state.scanDetail.invCounts = { processes: 0, files: 0, connections: 0 };
+        state.scanDetail.invCountsReady = true;
+      }
       return true;
     } catch (err) {
       toast(err.message || "Scan not found");
@@ -1404,13 +1450,16 @@
     const abs = scanPermalink(id);
     const hash = `#/scans/${encodeURIComponent(id)}`;
     const hostHref = hostId ? `#host/${encodeURIComponent(hostId)}` : "#/hosts";
-    const invCounts = pack.invCounts || { processes: 0, files: 0, connections: 0 };
+    const invCounts = pack.invCounts || { processes: null, files: null, connections: null };
+    const fmtInv = (n) => (n == null ? "…" : String(n));
     const activity = pack.activity || [];
     const capOn = Object.entries(caps).filter(([, v]) => !!v).map(([k]) => k);
     const outcomeLabel = formatScanOutcome(meta.outcome);
     const tab = pack.tab || "overview";
     const pane = (name) => (tab === name ? "" : "hidden");
     const tabCls = (name) => (tab === name ? "tab active" : "tab");
+    const showFindings = tab === "findings" || pack.findingsRendered;
+    const showRaw = tab === "raw" || pack.rawRendered;
 
     return `<section class="panel scan-page">
       <div class="scan-detail">
@@ -1441,17 +1490,17 @@
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(meta.observation_count ?? "—"))}</div><div class="scan-stat-label">Observations</div></div>
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(fired))}${applicable ? `<span class="muted">/${esc(String(applicable))}</span>` : ""}</div><div class="scan-stat-label">Checks fired</div></div>
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(findings.length))}</div><div class="scan-stat-label">Findings</div></div>
-          <div class="scan-stat"><div class="scan-stat-val">${esc(String(invCounts.connections))}</div><div class="scan-stat-label">Connections</div></div>
-          <div class="scan-stat"><div class="scan-stat-val">${esc(String(invCounts.processes))}</div><div class="scan-stat-label">Processes</div></div>
+          <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="connections">${esc(fmtInv(invCounts.connections))}</div><div class="scan-stat-label">Connections</div></div>
+          <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="processes">${esc(fmtInv(invCounts.processes))}</div><div class="scan-stat-label">Processes</div></div>
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(collectors.length))}</div><div class="scan-stat-label">Collectors</div></div>
         </div>
 
         <div class="host-detail-tabs scan-detail-tabs" role="tablist">
           <button type="button" class="${tabCls("overview")}" data-scan-tab="overview">Overview</button>
           <button type="button" class="${tabCls("findings")}" data-scan-tab="findings">Findings (${findings.length})</button>
-          <button type="button" class="${tabCls("processes")}" data-scan-tab="processes">Processes (${invCounts.processes})</button>
-          <button type="button" class="${tabCls("files")}" data-scan-tab="files">Files (${invCounts.files})</button>
-          <button type="button" class="${tabCls("connections")}" data-scan-tab="connections">Connections (${invCounts.connections})</button>
+          <button type="button" class="${tabCls("processes")}" data-scan-tab="processes">Processes (${esc(fmtInv(invCounts.processes))})</button>
+          <button type="button" class="${tabCls("files")}" data-scan-tab="files">Files (${esc(fmtInv(invCounts.files))})</button>
+          <button type="button" class="${tabCls("connections")}" data-scan-tab="connections">Connections (${esc(fmtInv(invCounts.connections))})</button>
           <button type="button" class="${tabCls("collectors")}" data-scan-tab="collectors">Collectors (${collectors.length})</button>
           <button type="button" class="${tabCls("activity")}" data-scan-tab="activity">Activity (${activity.length})</button>
           <button type="button" class="${tabCls("raw")}" data-scan-tab="raw">Raw JSON</button>
@@ -1478,6 +1527,14 @@
                 ${delivery.fallback_reason ? `<span class="muted"> · fallback ${esc(delivery.fallback_reason)}</span>` : ""}
                 <div class="muted" style="font-size:0.75rem">cleanup ${delivery.cleanup_ok === false ? "failed" : "ok"}${delivery.cleanup_forced ? " (forced)" : ""}
                   · bytes ${esc(String(delivery.bytes_transferred ?? meta.bytes_from_probe ?? 0))}</div></dd>
+              ${(meta.import_folders || []).length || (meta.import_files || []).length ? `
+              <dt>Import folders</dt><dd>${(meta.import_folders || []).length
+                ? `<ul class="scan-import-list">${(meta.import_folders || []).map((f) => `<li class="mono">${esc(f)}</li>`).join("")}</ul>`
+                : `<span class="muted">—</span>`}</dd>
+              <dt>Import files</dt><dd>${(meta.import_files || []).length
+                ? `<ul class="scan-import-list">${(meta.import_files || []).slice(0, 40).map((f) => `<li class="mono">${esc(f)}</li>`).join("")}${(meta.import_files || []).length > 40 ? `<li class="muted">… +${(meta.import_files || []).length - 40} more</li>` : ""}</ul>`
+                : `<span class="muted">—</span>`}</dd>
+              ` : ""}
               <dt>Probe</dt><dd class="mono">${esc(meta.probe_version || "—")}
                 ${meta.arch ? ` · ${esc(meta.arch)}` : ""}</dd>
               <dt>OS / kernel</dt><dd>${esc(meta.os || "—")}
@@ -1508,9 +1565,9 @@
               </div>
               <h3 class="scan-pane-title" style="margin-top:1.25rem">Inventory snapshot</h3>
               <dl class="kv">
-                <dt>Processes</dt><dd class="mono">${esc(String(invCounts.processes))}</dd>
-                <dt>Files</dt><dd class="mono">${esc(String(invCounts.files))}</dd>
-                <dt>Connections</dt><dd class="mono">${esc(String(invCounts.connections))}</dd>
+                <dt>Processes</dt><dd class="mono" data-inv-stat="processes">${esc(fmtInv(invCounts.processes))}</dd>
+                <dt>Files</dt><dd class="mono" data-inv-stat="files">${esc(fmtInv(invCounts.files))}</dd>
+                <dt>Connections</dt><dd class="mono" data-inv-stat="connections">${esc(fmtInv(invCounts.connections))}</dd>
                 <dt>Observations</dt><dd class="mono">${esc(String(meta.observation_count ?? "—"))}</dd>
               </dl>
             </div>
@@ -1523,9 +1580,11 @@
             <span class="muted" style="font-size:0.78rem" id="scanFindingCount">${findings.length.toLocaleString()} findings
               ${Number(fired) > findings.length ? ` · meta fired=${esc(String(fired))}` : ""}</span>
           </div>
-          <div id="scanFindingsPane">${findings.length
-            ? findingsTable(findings, { hideScan: true })
-            : `<div class="empty">No findings stored for this scan${Number(fired) > 0 ? ` (meta reports ${esc(String(fired))} fired)` : ""}.</div>`}</div>
+          <div id="scanFindingsPane">${showFindings
+            ? (findings.length
+              ? findingsTable(findings, { hideScan: true, sortable: true, sortKey: "when", sortDir: "desc" })
+              : `<div class="empty">No findings stored for this scan${Number(fired) > 0 ? ` (meta reports ${esc(String(fired))} fired)` : ""}.</div>`)
+            : `<div class="empty muted">Open this tab to load findings…</div>`}</div>
         </div>
 
         <div data-scan-pane="processes" class="${pane("processes")}">
@@ -1541,19 +1600,8 @@
           <div id="hostConnectionsPane"><div class="empty">Loading…</div></div>
         </div>
 
-        <div data-scan-pane="collectors" class="${pane("collectors")}">
-          ${!collectors.length ? `<div class="empty">No collector reports on this scan.</div>` : `
-          <table class="data"><thead><tr>
-            <th>Collector</th><th>Status</th><th>Observations</th><th>Elapsed</th><th>Reason</th>
-          </tr></thead><tbody>
-            ${collectors.map((c) => `<tr>
-              <td class="mono">${esc(c.id || "—")}</td>
-              <td><span class="pill neutral">${esc(c.status || "—")}</span></td>
-              <td class="mono">${esc(String(c.observations ?? 0))}</td>
-              <td class="mono">${c.elapsed_ms != null ? esc(fmtDuration(c.elapsed_ms)) : "—"}</td>
-              <td class="muted">${esc(c.reason || "—")}</td>
-            </tr>`).join("")}
-          </tbody></table>`}
+        <div data-scan-pane="collectors" class="${pane("collectors")}" id="scanCollectorsPane">
+          ${scanCollectorsTableHtml(collectors, "collector", "asc")}
         </div>
 
         <div data-scan-pane="activity" class="${pane("activity")}">
@@ -1571,7 +1619,9 @@
           <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
             <button type="button" class="btn ghost" id="btnCopyScanJson">Copy JSON</button>
           </div>
-          <pre class="json scan-raw-json" id="scanRawJson">${esc(JSON.stringify(status, null, 2))}</pre>
+          <pre class="json scan-raw-json" id="scanRawJson">${showRaw
+            ? esc(JSON.stringify(status, null, 2))
+            : "Open this tab to render raw JSON…"}</pre>
         </div>
       </div>
     </section>`;
@@ -1585,6 +1635,7 @@
     const hostId = pack.hostId;
     const findings = pack.findings || [];
     const job = pack.status.job || {};
+    const collectors = (pack.status.meta || {}).collectors || [];
     const abs = scanPermalink(id);
     const root = $("#content");
 
@@ -1637,31 +1688,65 @@
       });
     }
 
+    let findSortKey = "when";
+    let findSortDir = "desc";
+    let findFilterQ = "";
+    const paintFindings = () => {
+      const q = String(findFilterQ || "").toLowerCase().trim();
+      const shown = !q ? findings : findings.filter((f) => {
+        const hay = [
+          f.title, f.check_id, f.severity, f.confidence, f.status,
+          ...(f.attack || []),
+          JSON.stringify(f.evidence || {}),
+        ].join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+      const paneEl = $("#scanFindingsPane");
+      const count = $("#scanFindingCount");
+      if (paneEl) {
+        paneEl.innerHTML = shown.length
+          ? findingsTable(shown, {
+            hideScan: true,
+            sortable: true,
+            sortKey: findSortKey,
+            sortDir: findSortDir,
+          })
+          : `<div class="empty">No findings match “${esc(q)}”.</div>`;
+        wireFindingRows(paneEl);
+        wireSortableHeaders(paneEl, (key) => {
+          const next = toggleSortState(findSortKey, findSortDir, key);
+          findSortKey = next.key;
+          findSortDir = next.dir;
+          paintFindings();
+          restoreSearchFocus("#scanFindingQ", findFilterQ);
+        });
+      }
+      if (count) {
+        count.textContent = `${shown.length.toLocaleString()} / ${findings.length.toLocaleString()} findings`;
+      }
+    };
     const findQ = $("#scanFindingQ");
     if (findQ) {
       findQ.addEventListener("input", () => {
-        const q = String(findQ.value || "").toLowerCase().trim();
-        const shown = !q ? findings : findings.filter((f) => {
-          const hay = [
-            f.title, f.check_id, f.severity, f.confidence, f.status,
-            ...(f.attack || []),
-            JSON.stringify(f.evidence || {}),
-          ].join(" ").toLowerCase();
-          return hay.includes(q);
-        });
-        const paneEl = $("#scanFindingsPane");
-        const count = $("#scanFindingCount");
-        if (paneEl) {
-          paneEl.innerHTML = shown.length
-            ? findingsTable(shown, { hideScan: true })
-            : `<div class="empty">No findings match “${esc(q)}”.</div>`;
-          wireFindingRows(paneEl);
-        }
-        if (count) {
-          count.textContent = `${shown.length.toLocaleString()} / ${findings.length.toLocaleString()} findings`;
-        }
+        findFilterQ = findQ.value || "";
+        paintFindings();
       });
     }
+
+    let collSortKey = "collector";
+    let collSortDir = "asc";
+    const paintCollectors = () => {
+      const paneEl = $("#scanCollectorsPane");
+      if (!paneEl) return;
+      paneEl.innerHTML = scanCollectorsTableHtml(collectors, collSortKey, collSortDir);
+      wireSortableHeaders(paneEl, (key) => {
+        const next = toggleSortState(collSortKey, collSortDir, key);
+        collSortKey = next.key;
+        collSortDir = next.dir;
+        paintCollectors();
+      });
+    };
+    paintCollectors();
 
     const loadTab = (tab) => {
       if (!hostId) return;
@@ -1669,6 +1754,18 @@
       if (tab === "processes") loadHostProcesses(hostId, invOpts);
       if (tab === "files") loadHostFiles(hostId, invOpts);
       if (tab === "connections") loadHostConnections(hostId, invOpts);
+    };
+
+    const ensureFindingsPane = () => {
+      if (!state.scanDetail) return;
+      state.scanDetail.findingsRendered = true;
+      paintFindings();
+    };
+    const ensureRawPane = () => {
+      if (!state.scanDetail || state.scanDetail.rawRendered) return;
+      state.scanDetail.rawRendered = true;
+      const pre = $("#scanRawJson");
+      if (pre) pre.textContent = JSON.stringify(pack.status, null, 2);
     };
 
     $$("[data-scan-tab]", root).forEach((btn) => {
@@ -1679,12 +1776,17 @@
         $$("[data-scan-pane]", root).forEach((p) => {
           p.classList.toggle("hidden", p.getAttribute("data-scan-pane") !== tab);
         });
+        if (tab === "findings") ensureFindingsPane();
+        if (tab === "raw") ensureRawPane();
         loadTab(tab);
       });
     });
 
-    // Auto-load inventory if we restored onto an inventory tab.
-    loadTab(pack.tab || "overview");
+    // Auto-load inventory / heavy panes if we landed on that tab.
+    const initialTab = pack.tab || "overview";
+    if (initialTab === "findings" || pack.findingsRendered) ensureFindingsPane();
+    if (initialTab === "raw") ensureRawPane();
+    loadTab(initialTab);
 
     $$("[data-copy-scan-link]", root).forEach((btn) => {
       btn.addEventListener("click", async (e) => {
@@ -2269,13 +2371,37 @@
     const compact = !!(opts && opts.compact);
     const hideScan = !!(opts && opts.hideScan);
     const hideHost = !!(opts && opts.hideHost);
+    const sortable = !!(opts && opts.sortable);
+    const sortKey = (opts && opts.sortKey) || "";
+    const sortDir = (opts && opts.sortDir) || "asc";
     if (!rows.length) {
       return `<div class="empty">${compact ? "No occurrences" : "No findings match these filters. Adjust search, severity, host, or tag."}</div>`;
     }
+    const th = (label, key) => (sortable
+      ? sortableTh(label, key, sortKey, sortDir)
+      : `<th>${esc(label)}</th>`);
+    let data = rows;
+    if (sortable && sortKey) {
+      const getters = {
+        when: (f) => {
+          const w = findingWhen(f);
+          return w.finished || w.seen || "";
+        },
+        severity: (f) => findingSevRank(f.severity),
+        title: (f) => f.title || "",
+        check: (f) => f.check_id || "",
+        host: (f) => hostName(f.host_id),
+        tags: (f) => findingHostTagList(f).join(" "),
+        scan: (f) => f.scan_id || "",
+        attack: (f) => (f.attack || []).join(" "),
+      };
+      const getter = getters[sortKey];
+      if (getter) data = sortRowsBy(rows, getter, sortDir);
+    }
     return `<table class="data findings-table ${compact ? "findings-table-compact" : ""}"><thead><tr>
-      <th>When</th><th>Severity</th><th>Title</th><th>Check</th>${hideHost ? "" : "<th>Host</th>"}${compact || hideHost ? "" : "<th>Tags</th>"}${hideScan ? "" : "<th>Scan</th>"}<th>ATT&CK</th><th></th>
+      ${th("When", "when")}${th("Severity", "severity")}${th("Title", "title")}${th("Check", "check")}${hideHost ? "" : th("Host", "host")}${compact || hideHost ? "" : th("Tags", "tags")}${hideScan ? "" : th("Scan", "scan")}${th("ATT&CK", "attack")}<th></th>
     </tr></thead><tbody>
-      ${rows.map((f) => {
+      ${data.map((f) => {
         const href = `#finding/${encodeURIComponent(f.id)}`;
         const abs = findingPermalink(f.id);
         const hostHref = `#host/${encodeURIComponent(f.host_id)}`;
@@ -2301,6 +2427,34 @@
         </td>
       </tr>`;
       }).join("")}
+    </tbody></table>`;
+  }
+
+  function scanCollectorsTableHtml(collectors, sortKey, sortDir) {
+    if (!collectors.length) return `<div class="empty">No collector reports on this scan.</div>`;
+    const getters = {
+      collector: (c) => c.id || "",
+      status: (c) => c.status || "",
+      observations: (c) => c.observations ?? 0,
+      elapsed: (c) => c.elapsed_ms ?? null,
+      reason: (c) => c.reason || "",
+    };
+    const getter = getters[sortKey];
+    const rows = getter ? sortRowsBy(collectors, getter, sortDir) : collectors;
+    return `<table class="data" id="scanCollectorsTable"><thead><tr>
+      ${sortableTh("Collector", "collector", sortKey, sortDir)}
+      ${sortableTh("Status", "status", sortKey, sortDir)}
+      ${sortableTh("Observations", "observations", sortKey, sortDir)}
+      ${sortableTh("Elapsed", "elapsed", sortKey, sortDir)}
+      ${sortableTh("Reason", "reason", sortKey, sortDir)}
+    </tr></thead><tbody>
+      ${rows.map((c) => `<tr>
+        <td class="mono">${esc(c.id || "—")}</td>
+        <td><span class="pill neutral">${esc(c.status || "—")}</span></td>
+        <td class="mono">${esc(String(c.observations ?? 0))}</td>
+        <td class="mono">${c.elapsed_ms != null ? esc(fmtDuration(c.elapsed_ms)) : "—"}</td>
+        <td class="muted">${esc(c.reason || "—")}</td>
+      </tr>`).join("")}
     </tbody></table>`;
   }
 
@@ -2442,20 +2596,25 @@
     return html;
   }
 
-  function autoCollectFieldsHtml({ labels = {}, idPrefix = "autoCollect", showCheckbox = true } = {}) {
+  function autoCollectFieldsHtml({
+    labels = {},
+    idPrefix = "autoCollect",
+    showCheckbox = true,
+    titled = true,
+  } = {}) {
     const interval = String(labels.scan_interval || "manual").trim() || "manual";
     const enabled = !isManualScanInterval(interval);
     const fleet = state.settings?.effective?.scan_interval || "1h";
     const selectVal = enabled ? interval : fleet;
     return `
-      <fieldset class="ssh-auth-fields" style="border:0;margin:0 0 0.85rem;padding:0">
-        <legend style="font-size:0.85rem;margin-bottom:0.25rem;font-weight:600">Automatic collection</legend>
+      <div class="form-fieldset">
+        ${titled ? `<h3 class="form-section-title">Automatic collection</h3>` : ""}
         ${showCheckbox ? `
-        <label class="rules-enable" style="display:flex;gap:0.5rem;align-items:center;margin:0.25rem 0">
+        <label class="form-check-inline">
           <input type="checkbox" name="auto_collect" id="${esc(idPrefix)}Enable" ${enabled ? "checked" : ""} />
           Enable scheduled collection
         </label>` : ""}
-        <div id="${esc(idPrefix)}IntervalWrap" class="${enabled || !showCheckbox ? "" : "hidden"}" style="margin-top:0.45rem">
+        <div id="${esc(idPrefix)}IntervalWrap" class="form-block-follow ${enabled || !showCheckbox ? "" : "hidden"}">
           <label>Collection interval
             <select name="scan_interval" id="${esc(idPrefix)}Interval">
               ${showCheckbox
@@ -2464,10 +2623,10 @@
             </select>
           </label>
         </div>
-        <p class="muted" style="margin:0.35rem 0 0;font-size:0.75rem">
+        <p class="form-hint muted">
           New hosts stay <strong>manual</strong> until you enable this. Use <strong>Scan now</strong> anytime.
         </p>
-      </fieldset>`;
+      </div>`;
   }
 
   function wireAutoCollectToggle(idPrefix = "autoCollect") {
@@ -2747,12 +2906,13 @@
           ${!rows.length ? `<div class="empty">No hosts match filters. Use <strong>Add hosts</strong> to register endpoints.</div>` : `
           <table class="data hosts-table"><thead><tr>
             <th class="col-check"><input type="checkbox" id="hostCheckAll" ${allPageSelected ? "checked" : ""} /></th>
-            <th>Status</th><th>Host</th><th>Agent</th><th>Target</th><th>OS</th><th>Arch / kernel</th><th>Tags</th><th>Auth / last outcome</th><th>Last scan</th><th></th>
+            <th>Status</th><th>Host</th><th>Agent</th><th>Target</th><th>OS</th><th>Arch / kernel</th><th>Tags</th><th>Auth / last outcome</th><th>Scans</th><th>Last scan</th><th></th>
           </tr></thead><tbody>
             ${pageRows.map((h) => {
               const st = hostStatus(h);
               const agent = hostAgentInfo(h);
               const tags = hostTags(h);
+              const scanCount = siftHostFinishedScans(h.id).length;
               const checked = selected.has(h.id) ? "checked" : "";
               const href = `#host/${encodeURIComponent(h.id)}`;
               const abs = hostPermalink(h.id);
@@ -2777,6 +2937,7 @@
                 <td class="mono muted">${esc(h.arch || "—")} · ${esc(h.kernel || "—")}</td>
                 <td>${tags.length ? tags.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ") : `<span class="muted">—</span>`}</td>
                 <td>${esc(st.auth || "—")}</td>
+                <td class="mono">${scanCount ? esc(String(scanCount)) : `<span class="muted">0</span>`}</td>
                 <td class="mono muted">${esc(fmtWhen(h.last_scan_at))}</td>
                 <td class="hosts-actions" data-stop>
                   <button type="button" class="btn ghost tiny" data-copy-host-link="${esc(abs)}" title="Copy host link">Link</button>
@@ -3371,7 +3532,7 @@
   function siftInventoryKeep() {
     return Math.max(
       1,
-      Math.min(50, Number(state.settings?.effective?.scan_history_per_host ?? 3) || 3)
+      Math.min(50, Number(state.settings?.effective?.scan_history_per_host ?? 10) || 10)
     );
   }
 
@@ -4848,7 +5009,7 @@
   function anomarkInventoryKeep() {
     return Math.max(
       1,
-      Math.min(50, Number(state.settings?.effective?.scan_history_per_host ?? 3) || 3)
+      Math.min(50, Number(state.settings?.effective?.scan_history_per_host ?? 10) || 10)
     );
   }
 
@@ -4967,11 +5128,97 @@
     const score = state._anomarkScore || null;
     const selectedModel = models.find((m) => m.id === selected) || null;
     const readyCount = models.filter((m) => m.available !== false).length;
-    const tab = ["models", "score", "try"].includes(state._anomarkTab)
+    const tab = ["train", "models", "score", "try"].includes(state._anomarkTab)
       ? state._anomarkTab
       : "models";
     state._anomarkTab = tab;
     const suspectTotal = last ? Number(last.total_suspects ?? 0) : 0;
+    const trainName = state._anomarkTrainName ?? "";
+    const trainOrder = state._anomarkTrainOrder ?? 4;
+    const trainLines = state._anomarkTrainLines ?? "";
+    const trainPath = state._anomarkTrainPath ?? "";
+    const trainHosts = state._anomarkTrainHostSel || [];
+    const hostCount = (state.hosts || []).length;
+
+    const trainPanel = `
+          <section class="panel ml-card anomark-train-panel">
+            <div class="panel-head">
+              <h3>Train a model</h3>
+              <span class="muted">Host inventories, pasted lines, or a server path</span>
+            </div>
+            <form class="form ml-panel-body" id="anomarkTrainForm">
+              <div class="anomark-train-layout">
+                <div class="anomark-train-main stack">
+                  <div class="ml-form-grid">
+                    <label>Name
+                      <input name="name" id="anomarkTrainName" required placeholder="baseline-vpn" value="${esc(trainName)}" />
+                    </label>
+                    <label>Markov order
+                      <input type="number" name="order" id="anomarkTrainOrder" min="1" max="8" value="${esc(String(trainOrder))}" />
+                    </label>
+                    <label>Inventory scan #
+                      ${anomarkInventorySelectHtml("anomarkTrainInventory", "inventory", state._anomarkTrainInventory || "1")}
+                    </label>
+                  </div>
+                  <div class="anomark-train-sources">
+                    <div class="anomark-train-source">
+                      <h4 class="anomark-train-source-title">From hosts</h4>
+                      <p class="muted anomark-train-hint">${hostCount
+                        ? "Select hosts whose process inventories become training data."
+                        : "No hosts enrolled — paste command lines or set a server path instead."}</p>
+                      <div id="anomarkTrainHostPicks">
+                        ${anomarkHostOptions(trainHosts, "anomark-train-host-cb", "anomarkTrain")}
+                      </div>
+                      <div class="toolbar" style="margin-top:0.45rem;gap:0.35rem">
+                        <button type="button" class="btn ghost tiny" id="btnAnoMarkTrainSelectAll">Select visible</button>
+                        <button type="button" class="btn ghost tiny" id="btnAnoMarkTrainSelectNone">Clear</button>
+                      </div>
+                    </div>
+                    <div class="anomark-train-source">
+                      <h4 class="anomark-train-source-title">Or paste / path</h4>
+                      <label>Command lines <span class="muted">(one per line)</span>
+                        <textarea name="lines" id="anomarkTrainLines" rows="8" class="mono"
+                          placeholder="sshd: /usr/sbin/sshd -D&#10;/usr/bin/python3 /opt/agent.py">${esc(trainLines)}</textarea>
+                      </label>
+                      <label>Server path
+                        <input name="path" id="anomarkTrainPath" placeholder=".dev/train-cmds.jsonl" value="${esc(trainPath)}" />
+                      </label>
+                    </div>
+                  </div>
+                  <div class="anomark-train-actions">
+                    <button type="submit" class="btn primary" id="anomarkTrainSubmit">Train model</button>
+                    <button type="button" class="btn ghost" id="btnAnoMarkTrainReset">Reset form</button>
+                    <span class="muted" style="font-size:0.78rem">Training uses host inventories when selected; otherwise pasted lines or path.</span>
+                  </div>
+                </div>
+                <aside class="anomark-train-aside">
+                  <div class="anomark-train-aside-card">
+                    <h4>How training works</h4>
+                    <ol class="anomark-train-steps">
+                      <li>Collect command lines from scan inventory, paste, or a file on the server.</li>
+                      <li>Fit a character Markov model (order ${esc(String(trainOrder))}).</li>
+                      <li>Store the model for host scoring and the post-scan rule.</li>
+                    </ol>
+                    <p class="muted" style="font-size:0.78rem;margin:0.65rem 0 0">
+                      Prefer a clean baseline fleet. After training, use <strong>Score hosts</strong> or enable
+                      <span class="mono">RM-ML-0001</span> under Rules.
+                    </p>
+                  </div>
+                  ${state._anomarkLastTrain ? `
+                  <div class="anomark-train-aside-card anomark-train-aside-card--ok">
+                    <h4>Last train</h4>
+                    <p style="margin:0.25rem 0"><strong>${esc(state._anomarkLastTrain.record?.name || "model")}</strong></p>
+                    <p class="mono muted" style="margin:0;font-size:0.78rem">
+                      ${esc(String(state._anomarkLastTrain.record?.training_line_count ?? "—"))} lines ·
+                      ${state._anomarkLastTrain._elapsed_ms != null ? `${esc(String(state._anomarkLastTrain._elapsed_ms))} ms` : ""} ·
+                      ${esc(fmtWhen(state._anomarkLastTrain.record?.created_at))}
+                    </p>
+                    <button type="button" class="btn ghost tiny" style="margin-top:0.55rem" data-anomark-goto-models>View in Models</button>
+                  </div>` : ""}
+                </aside>
+              </div>
+            </form>
+          </section>`;
 
     const modelsPanel = `
           ${state._anomarkLastTrain ? `
@@ -4993,7 +5240,11 @@
               <h3>Models</h3>
               <span class="muted">${models.length ? "Click a card to select" : "None yet"}</span>
             </div>
-            ${!models.length ? `<div class="empty ml-empty-hero">No models yet — train from host inventories or paste command lines</div>` : `
+            ${!models.length ? `
+            <div class="empty ml-empty-hero anomark-empty-models">
+              <p>No models yet.</p>
+              <button type="button" class="btn primary" data-anomark-goto-train>Train your first model</button>
+            </div>` : `
             <div class="ml-model-list">
               ${models.map((m) => {
                 const active = m.id === selected ? " is-selected" : "";
@@ -5190,24 +5441,26 @@
             </form>
           </section>`;
 
-    const tabBody = tab === "score"
-      ? scoreHostsPanel
-      : tab === "try"
-        ? tryPanel
-        : modelsPanel;
+    const tabBody = tab === "train"
+      ? trainPanel
+      : tab === "score"
+        ? scoreHostsPanel
+        : tab === "try"
+          ? tryPanel
+          : modelsPanel;
 
     const mlRule = (state.checks || []).find((c) => c.is_anomark || c.id === "RM-ML-0001");
 
     return `
-      <div class="ml-workspace">
-        <header class="ml-hero panel">
+      <div class="ml-workspace anomark-workspace">
+        <header class="ml-hero panel anomark-hero">
           <div class="ml-hero-copy">
             <p class="ml-eyebrow">Command Markov models</p>
             <h2>AnoMark</h2>
-            <p class="muted">Train models and score commands. Post-scan scoring is configured as rule <span class="mono">RM-ML-0001</span> under Rules.</p>
+            <p class="muted">Train baselines, score host inventories, and try individual commands. Post-scan scoring is rule <span class="mono">RM-ML-0001</span>.</p>
           </div>
           <div class="ml-hero-actions">
-            ${tab === "models" ? `<button type="button" class="btn primary" id="btnAnoMarkNew">Train model</button>` : ""}
+            ${tab !== "train" ? `<button type="button" class="btn primary" id="btnAnoMarkNew">Train model</button>` : ""}
             <button type="button" class="btn ghost" id="btnAnoMarkOpenRule" title="Open AnoMark rule in Rules">Post-scan rule</button>
             <button type="button" class="btn ghost" id="btnAnoMarkRefresh">Refresh</button>
           </div>
@@ -5223,6 +5476,7 @@
         ${anomarkProgressHtml()}
 
         ${mlSubTabsHtml([
+          ["train", "Train"],
           ["models", "Models", models.length || null],
           ["score", "Score hosts", last ? suspectTotal : null],
           ["try", "Try command"],
@@ -5232,152 +5486,117 @@
       </div>`;
   }
 
-  function showTrainAnoMark() {
-    const modelsHint = (state.hosts || []).length
-      ? "Pick hosts and which scan inventory becomes training data."
-      : "No hosts — paste command lines or a server path instead.";
-    openDrawer("Train AnoMark model", `
-      <form class="form" id="anomarkTrainForm">
-        <label>Name
-          <input name="name" required placeholder="baseline-vpn" />
-        </label>
-        <div class="ml-form-grid">
-          <label>Order
-            <input type="number" name="order" min="1" max="8" value="4" />
-          </label>
-          <label>Inventory scan #
-            ${anomarkInventorySelectHtml("anomarkTrainInventory", "inventory", state._anomarkTrainInventory || "1")}
-          </label>
-        </div>
-        <p class="muted" style="font-size:0.82rem;margin:0 0 0.5rem">${esc(modelsHint)}</p>
-        <div id="anomarkTrainHostPicks">
-          ${anomarkHostOptions([], "anomark-train-host-cb", "anomarkTrain")}
-        </div>
-        <label style="margin-top:0.75rem">Or paste lines <span class="muted">(one command per line)</span>
-          <textarea name="lines" rows="6" placeholder="sshd: /usr/sbin/sshd -D&#10;/usr/bin/python3 /opt/agent.py"></textarea>
-        </label>
-        <label>Or server path
-          <input name="path" placeholder=".dev/train-cmds.jsonl" />
-        </label>
-        <div class="toolbar" style="margin-top:0.75rem">
-          <button type="submit" class="btn primary">Train</button>
-          <button type="button" class="btn ghost" data-close-drawer>Cancel</button>
-        </div>
-      </form>
-    `);
-    const form = $("#anomarkTrainForm");
-    if (!form) return;
-    $$("[data-close-drawer]").forEach((b) => b.addEventListener("click", () => closeDrawer()));
-    const refreshTrainHostPicks = () => {
-      const checked = $$(".anomark-train-host-cb:checked").map((c) => c.value);
-      const inv = $("#anomarkTrainInventory")?.value;
-      if (inv) state._anomarkTrainInventory = inv;
-      const wrap = $("#anomarkTrainHostPicks");
-      if (!wrap) return;
-      wrap.innerHTML = anomarkHostOptions(checked, "anomark-train-host-cb", "anomarkTrain");
-      wireAnoMarkHostFilters("anomarkTrain", refreshTrainHostPicks);
+  async function submitAnoMarkTrain(form) {
+    const fd = new FormData(form);
+    const host_ids = $$(".anomark-train-host-cb:checked").map((c) => c.value).filter(Boolean);
+    const inventory = String(fd.get("inventory") || $("#anomarkTrainInventory")?.value || "1");
+    state._anomarkTrainInventory = inventory;
+    state._anomarkTrainName = String(fd.get("name") || "").trim();
+    state._anomarkTrainOrder = Number(fd.get("order") || 4);
+    state._anomarkTrainLines = String(fd.get("lines") || "");
+    state._anomarkTrainPath = String(fd.get("path") || "").trim();
+    state._anomarkTrainHostSel = host_ids;
+    const body = {
+      name: state._anomarkTrainName,
+      order: state._anomarkTrainOrder,
+      host_ids,
+      inventory,
+      lines: state._anomarkTrainLines.trim() || null,
+      path: state._anomarkTrainPath || null,
     };
-    wireAnoMarkHostFilters("anomarkTrain", refreshTrainHostPicks);
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      const host_ids = $$(".anomark-train-host-cb:checked").map((c) => c.value).filter(Boolean);
-      const inventory = String(fd.get("inventory") || $("#anomarkTrainInventory")?.value || "1");
-      state._anomarkTrainInventory = inventory;
-      const body = {
-        name: String(fd.get("name") || "").trim(),
-        order: Number(fd.get("order") || 4),
-        host_ids,
-        inventory,
-        lines: String(fd.get("lines") || "").trim() || null,
-        path: String(fd.get("path") || "").trim() || null,
-      };
-      const t0 = performance.now();
-      const debug = [
-        { ts: mlDebugNow(), msg: `Train “${body.name}” · order=${body.order} · inventory=#${inventory}` },
-        { ts: mlDebugNow(), msg: host_ids.length
-          ? `${host_ids.length} host(s) selected`
-          : (body.lines ? "Using pasted lines" : body.path ? `path=${body.path}` : "No host/lines/path") },
-      ];
+    if (!body.name) {
+      toast("Name is required");
+      return;
+    }
+    if (!host_ids.length && !body.lines && !body.path) {
+      toast("Select hosts, paste lines, or set a server path");
+      return;
+    }
+    const t0 = performance.now();
+    const debug = [
+      { ts: mlDebugNow(), msg: `Train “${body.name}” · order=${body.order} · inventory=#${inventory}` },
+      { ts: mlDebugNow(), msg: host_ids.length
+        ? `${host_ids.length} host(s) selected`
+        : (body.lines ? "Using pasted lines" : body.path ? `path=${body.path}` : "No host/lines/path") },
+    ];
+    state._anomarkProgress = {
+      title: "Training AnoMark model",
+      phase: "Collect commands",
+      detail: host_ids.length
+        ? `Pulling process cmdlines from scan #${inventory}…`
+        : "Preparing training input…",
+      pct: 25,
+      indeterminate: true,
+      debug,
+      steps: [
+        { label: "Collect input", status: "active" },
+        { label: "Train Markov model", status: "pending" },
+        { label: "Persist model", status: "pending" },
+      ],
+    };
+    state._anomarkTab = "train";
+    render();
+    try {
+      mlPushDebug("_anomarkProgress", "POST /v1/anomark/models…");
       state._anomarkProgress = {
-        title: "Training AnoMark model",
-        phase: "Collect commands",
-        detail: host_ids.length
-          ? `Pulling process cmdlines from scan #${inventory}…`
-          : "Preparing training input…",
-        pct: 25,
-        indeterminate: true,
-        debug,
+        ...state._anomarkProgress,
+        phase: "Train Markov model",
+        detail: "Fitting character Markov model…",
+        pct: 55,
         steps: [
-          { label: "Collect input", status: "active" },
-          { label: "Train Markov model", status: "pending" },
+          { label: "Collect input", status: "done" },
+          { label: "Train Markov model", status: "active" },
           { label: "Persist model", status: "pending" },
         ],
       };
-      closeDrawer();
-      state._anomarkTab = "models";
       render();
+      const res = await api("/v1/anomark/models", { method: "POST", body });
+      const elapsed_ms = Math.round(performance.now() - t0);
+      const trainId = res.train_id || res.record?.id;
+      state._anomarkSelectedModel = trainId;
+      state._anomarkLastTrain = {
+        ...res,
+        _elapsed_ms: elapsed_ms,
+        _debug: [
+          ...debug,
+          { ts: mlDebugNow(), msg: `Trained ${res.record?.training_line_count ?? "?"} lines in ${elapsed_ms}ms` },
+          { ts: mlDebugNow(), msg: `Model id ${trainId}` },
+        ],
+      };
+      state._anomarkProgress = {
+        title: "Training complete",
+        phase: "Done",
+        detail: `${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`,
+        pct: 100,
+        indeterminate: false,
+        debug: state._anomarkLastTrain._debug,
+        steps: [
+          { label: "Collect input", status: "done" },
+          { label: "Train Markov model", status: "done" },
+          { label: "Persist model", status: "done" },
+        ],
+      };
+      await refreshAnoMark();
       try {
-        mlPushDebug("_anomarkProgress", "POST /v1/anomark/models…");
-        state._anomarkProgress = {
-          ...state._anomarkProgress,
-          phase: "Train Markov model",
-          detail: "Fitting character Markov model…",
-          pct: 55,
-          steps: [
-            { label: "Collect input", status: "done" },
-            { label: "Train Markov model", status: "active" },
-            { label: "Persist model", status: "pending" },
-          ],
-        };
-        render();
-        const res = await api("/v1/anomark/models", { method: "POST", body });
-        const elapsed_ms = Math.round(performance.now() - t0);
-        const trainId = res.train_id || res.record?.id;
-        state._anomarkSelectedModel = trainId;
-        state._anomarkLastTrain = {
-          ...res,
-          _elapsed_ms: elapsed_ms,
-          _debug: [
-            ...debug,
-            { ts: mlDebugNow(), msg: `Trained ${res.record?.training_line_count ?? "?"} lines in ${elapsed_ms}ms` },
-            { ts: mlDebugNow(), msg: `Model id ${trainId}` },
-          ],
-        };
-        state._anomarkProgress = {
-          title: "Training complete",
-          phase: "Done",
-          detail: `${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`,
-          pct: 100,
-          indeterminate: false,
-          debug: state._anomarkLastTrain._debug,
-          steps: [
-            { label: "Collect input", status: "done" },
-            { label: "Train Markov model", status: "done" },
-            { label: "Persist model", status: "done" },
-          ],
-        };
-        await refreshAnoMark();
-        try {
-          const insp = await api(`/v1/anomark/models/${encodeURIComponent(trainId)}/inspect`);
-          state._anomarkInspect = { ...insp, id: trainId };
-          state._anomarkLastTrain._debug.push({
-            ts: mlDebugNow(),
-            msg: `Inspect: order=${insp.order} contexts=${insp.num_contexts} transitions=${insp.num_transitions} size=${insp.file_size_bytes}B`,
-          });
-        } catch (_) {}
-        toast(`Trained ${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`);
-        render();
-        window.setTimeout(() => {
-          state._anomarkProgress = null;
-          if (state.view === "anomark") render();
-        }, 3200);
-      } catch (err) {
+        const insp = await api(`/v1/anomark/models/${encodeURIComponent(trainId)}/inspect`);
+        state._anomarkInspect = { ...insp, id: trainId };
+        state._anomarkLastTrain._debug.push({
+          ts: mlDebugNow(),
+          msg: `Inspect: order=${insp.order} contexts=${insp.num_contexts} transitions=${insp.num_transitions} size=${insp.file_size_bytes}B`,
+        });
+      } catch (_) {}
+      state._anomarkTab = "models";
+      toast(`Trained ${res.record?.name || body.name} · ${res.record?.training_line_count ?? "?"} lines · ${elapsed_ms}ms`);
+      render();
+      window.setTimeout(() => {
         state._anomarkProgress = null;
-        toast(err.message || "Train failed");
-        render();
-      }
-    });
+        if (state.view === "anomark") render();
+      }, 3200);
+    } catch (err) {
+      state._anomarkProgress = null;
+      toast(err.message || "Train failed");
+      render();
+    }
   }
 
   function wireAnoMarkHostFilters(prefix, onChange) {
@@ -5417,7 +5636,7 @@
   }
 
   function wireAnoMark() {
-    wireMlSubTabs("data-anomark-tab", "_anomarkTab", ["models", "score", "try"]);
+    wireMlSubTabs("data-anomark-tab", "_anomarkTab", ["train", "models", "score", "try"]);
 
     const btnRef = $("#btnAnoMarkRefresh");
     if (btnRef) {
@@ -5431,7 +5650,96 @@
       });
     }
     const btnNew = $("#btnAnoMarkNew");
-    if (btnNew) btnNew.addEventListener("click", () => showTrainAnoMark());
+    if (btnNew) {
+      btnNew.addEventListener("click", () => {
+        state._anomarkTab = "train";
+        render();
+      });
+    }
+    $$("[data-anomark-goto-train]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state._anomarkTab = "train";
+        render();
+      });
+    });
+    $$("[data-anomark-goto-models]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state._anomarkTab = "models";
+        render();
+      });
+    });
+
+    const trainForm = $("#anomarkTrainForm");
+    if (trainForm) {
+      const persistTrainFields = () => {
+        const name = $("#anomarkTrainName");
+        const order = $("#anomarkTrainOrder");
+        const lines = $("#anomarkTrainLines");
+        const path = $("#anomarkTrainPath");
+        const inv = $("#anomarkTrainInventory");
+        if (name) state._anomarkTrainName = name.value || "";
+        if (order) state._anomarkTrainOrder = Number(order.value || 4);
+        if (lines) state._anomarkTrainLines = lines.value || "";
+        if (path) state._anomarkTrainPath = path.value || "";
+        if (inv) state._anomarkTrainInventory = inv.value || "1";
+      };
+      ["anomarkTrainName", "anomarkTrainOrder", "anomarkTrainLines", "anomarkTrainPath"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener("change", persistTrainFields);
+        el.addEventListener("input", persistTrainFields);
+      });
+      $("#anomarkTrainInventory")?.addEventListener("change", persistTrainFields);
+
+      const refreshTrainHostPicks = () => {
+        persistTrainFields();
+        const visible = new Set(
+          anomarkFilteredHosts({
+            q: state._anomarkTrainHostQ,
+            env: state._anomarkTrainHostEnv,
+            kind: state._anomarkTrainHostKind,
+            tag: state._anomarkTrainHostTag,
+          }).map((h) => h.id)
+        );
+        const prev = new Set(state._anomarkTrainHostSel || []);
+        const checked = $$(".anomark-train-host-cb:checked").map((c) => c.value);
+        const kept = [...prev].filter((id) => !visible.has(id));
+        state._anomarkTrainHostSel = [...new Set([...kept, ...checked])];
+        const wrap = $("#anomarkTrainHostPicks");
+        if (!wrap) return;
+        wrap.innerHTML = anomarkHostOptions(
+          state._anomarkTrainHostSel,
+          "anomark-train-host-cb",
+          "anomarkTrain"
+        );
+        wireAnoMarkHostFilters("anomarkTrain", refreshTrainHostPicks);
+      };
+      wireAnoMarkHostFilters("anomarkTrain", refreshTrainHostPicks);
+
+      $("#btnAnoMarkTrainSelectAll")?.addEventListener("click", () => {
+        $$(".anomark-train-host-cb").forEach((c) => { c.checked = true; });
+        state._anomarkTrainHostSel = $$(".anomark-train-host-cb:checked").map((c) => c.value);
+      });
+      $("#btnAnoMarkTrainSelectNone")?.addEventListener("click", () => {
+        $$(".anomark-train-host-cb").forEach((c) => { c.checked = false; });
+        state._anomarkTrainHostSel = [];
+      });
+      $("#btnAnoMarkTrainReset")?.addEventListener("click", () => {
+        state._anomarkTrainName = "";
+        state._anomarkTrainOrder = 4;
+        state._anomarkTrainLines = "";
+        state._anomarkTrainPath = "";
+        state._anomarkTrainHostSel = [];
+        state._anomarkTrainInventory = "1";
+        render();
+      });
+      trainForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        persistTrainFields();
+        state._anomarkTrainHostSel = $$(".anomark-train-host-cb:checked").map((c) => c.value);
+        await submitAnoMarkTrain(trainForm);
+      });
+    }
 
     $$("[data-anomark-pick]").forEach((row) => {
       row.addEventListener("click", (e) => {
@@ -6554,12 +6862,15 @@
   function mergeVirtualImportSummary(a, b) {
     if (!a) return b || null;
     if (!b) return a;
+    const files = [...(a.source_files || []), ...(b.source_files || [])];
     return {
       files_processed: (a.files_processed || 0) + (b.files_processed || 0),
       processes_appended: (a.processes_appended || 0) + (b.processes_appended || 0),
       files_appended: (a.files_appended || 0) + (b.files_appended || 0),
       skipped: (a.skipped || 0) + (b.skipped || 0),
       path: a.path || b.path || null,
+      source_path: a.source_path || b.source_path || null,
+      source_files: files,
     };
   }
 
@@ -7215,18 +7526,11 @@
     const filterMatch = res?._filterMatch;
     const filterTotal = res?._filterTotal;
 
-    const statsBar = searching
-      ? `<div class="search-stats-bar running" role="status">Executing query…</div>`
+    const statusText = searching
+      ? `Executing…`
       : hasSearched
-        ? `<div class="search-stats-bar" role="status">
-            <span>Query complete</span>
-            <span class="sep">·</span>
-            <strong>${Number(hitCount || 0).toLocaleString()} hit${hitCount === 1 ? "" : "s"}</strong>
-            ${elapsed != null ? `<span class="sep">·</span><span class="mono">${esc(String(elapsed))} ms</span>` : ""}
-            <span class="sep">·</span><span class="muted">engine ${esc(resRaw?.engine || "—")}</span>
-            ${resRaw?.hint ? `<span class="sep">·</span><span class="rpl-hint">${esc(resRaw.hint)}</span>` : ""}
-          </div>`
-        : `<div class="search-stats-bar idle" role="status">Enter a Hunt query and press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run</div>`;
+        ? `${Number(hitCount || 0).toLocaleString()} hit${hitCount === 1 ? "" : "s"}${elapsed != null ? ` · ${elapsed} ms` : ""}${resRaw?.engine ? ` · ${resRaw.engine}` : ""}`
+        : `Press Ctrl+Enter to run`;
 
     return `
       <div class="search-workspace">
@@ -7239,33 +7543,33 @@
             </div>
             <div class="rpl-saved">
               <div class="rpl-saved-head">
-                <strong>Saved queries</strong>
-                <button type="button" class="btn ghost" id="rplSaveQuery" title="Save current query">Save</button>
+                <span class="rpl-side-label">Saved</span>
+                <button type="button" class="btn ghost tiny" id="rplSaveQuery" title="Save current query">Save</button>
               </div>
               ${saved.length
                 ? saved.map((s, i) => `
                   <div class="rpl-saved-item">
-                    <button type="button" class="rpl-saved-load" data-rpl-load="${i}">${esc(s.name || s.query.slice(0, 40))}</button>
+                    <button type="button" class="rpl-saved-load" data-rpl-load="${i}" title="${esc(s.query || "")}">${esc(s.name || s.query.slice(0, 40))}</button>
                     <button type="button" class="icon-btn" data-rpl-del="${i}" aria-label="Delete">×</button>
                   </div>`).join("")
-                : `<div class="muted" style="font-size:0.8rem">None yet — Save pins the current query here</div>`}
+                : `<p class="rpl-side-empty muted">Save pins the current query here</p>`}
             </div>
           </div>
         </aside>
 
         <div class="search-workspace-main">
-          <div class="rpl-tabs">
-            <button type="button" class="rpl-tab ${tab === "results" ? "active" : ""}" data-rpl-tab="results">Results</button>
+          <nav class="rpl-tabs" role="tablist" aria-label="Hunt views">
+            <button type="button" class="rpl-tab ${tab === "results" ? "active" : ""}" data-rpl-tab="results">Hunt</button>
             <button type="button" class="rpl-tab ${tab === "guide" ? "active" : ""}" data-rpl-tab="guide">Guide</button>
             <button type="button" class="rpl-tab ${tab === "expr" ? "active" : ""}" data-rpl-tab="expr">Expr</button>
-          </div>
+          </nav>
 
           ${tab === "guide" ? `<section class="panel rpl-guide-panel">${renderRplGuideHtml()}</section>` : ""}
 
           ${tab === "expr" ? `
           <section class="panel">
             <div class="panel-head"><h3>Legacy expr hunt</h3><span class="muted">POST /v1/hunt</span></div>
-            <div style="padding:1.1rem">
+            <div class="rpl-expr-body">
               <form class="form" id="huntForm">
                 <label>Match stream
                   <select name="match_on">
@@ -7280,7 +7584,7 @@
                   <button class="btn ghost" type="submit">Run expr</button>
                 </div>
               </form>
-              <div id="huntResults" style="margin-top:1rem">${state._exprResultsHtml || ""}</div>
+              <div id="huntResults" class="rpl-expr-results">${state._exprResultsHtml || ""}</div>
             </div>
           </section>` : ""}
 
@@ -7288,82 +7592,98 @@
           <section class="panel rpl-results-panel">
             <form class="search-command-card" id="rplHuntForm">
               <div class="search-query-shell">
+                <label class="search-query-label" for="rplQuery">Query</label>
                 <textarea name="query" id="rplQuery" spellcheck="false" placeholder='host_name="web-01" kind="process" | fields timestamp, process_name, process_id, user, path | head 200'>${esc(q)}</textarea>
                 <div class="search-history-drop" id="rplHistoryDrop" ${histOpen ? "" : "hidden"}>
                   ${history.length
                     ? history.slice(0, 20).map((h, i) => `
                         <button type="button" class="search-history-item" data-rpl-hist="${i}">${esc(h.query)}</button>`).join("")
                     : `<div class="search-history-empty">No recent queries yet</div>`}
-                  ${history.length ? `<button type="button" class="search-history-item" id="rplClearHistory" style="color:var(--crit)">Clear history</button>` : ""}
+                  ${history.length ? `<button type="button" class="search-history-item search-history-clear" id="rplClearHistory">Clear history</button>` : ""}
                 </div>
               </div>
-              <div class="search-query-bar">
-                <div class="search-query-hints">
-                  <span><kbd>Ctrl</kbd>+<kbd>Enter</kbd> run</span>
-                  <span class="search-time-presets">
+              <div class="search-toolbar">
+                <div class="search-toolbar-range">
+                  <div class="search-time-presets" role="group" aria-label="Time range">
                     ${[
-                      ["1h", "Last 1h"],
-                      ["24h", "Last 24h"],
-                      ["7d", "Last 7d"],
-                      ["", "All time"],
+                      ["1h", "1h"],
+                      ["24h", "24h"],
+                      ["7d", "7d"],
+                      ["", "All"],
                     ].map(([id, label]) => `
                       <button type="button" class="btn ghost ${preset === id ? "active" : ""}" data-rpl-preset="${id}">${label}</button>
                     `).join("")}
-                  </span>
+                  </div>
+                  <label class="search-range-field">From
+                    <input name="time_from" type="text" placeholder="-24h" value="${esc(state._rplTimeFrom || "")}" />
+                  </label>
+                  <label class="search-range-field">To
+                    <input name="time_to" type="text" placeholder="now" value="${esc(state._rplTimeTo || "")}" />
+                  </label>
+                  <label class="search-range-field search-range-limit">Limit
+                    <input name="limit" type="number" min="1" max="10000" value="${esc(String(state._rplLimit ?? 200))}" />
+                  </label>
                 </div>
                 <div class="search-query-actions">
                   <button type="button" class="btn ghost search-history-toggle" id="rplHistoryToggle" title="Search history" aria-expanded="${histOpen}">
-                    History
-                    ${history.length ? `<span class="search-history-badge">${history.length}</span>` : ""}
+                    History${history.length ? `<span class="search-history-badge">${history.length}</span>` : ""}
                   </button>
                   <button class="btn ghost" type="button" id="rplCompile">Compile</button>
                   <button class="btn primary" type="submit" ${searching ? "disabled" : ""}>${searching ? "Running…" : "Run"}</button>
                 </div>
               </div>
-              <div class="search-controls-row">
-                <label>From <input name="time_from" type="text" placeholder="ISO / -24h" value="${esc(state._rplTimeFrom || "")}" /></label>
-                <label>To <input name="time_to" type="text" placeholder="ISO / now" value="${esc(state._rplTimeTo || "")}" /></label>
-                <label>Limit <input name="limit" type="number" min="1" max="10000" value="${esc(String(state._rplLimit ?? 200))}" /></label>
-              </div>
             </form>
-            ${history.length ? `
-            <div class="search-recent-strip" aria-label="Recent searches">
-              <span class="label">Recent</span>
-              ${history.slice(0, 4).map((h, i) => `
-                <button type="button" class="btn ghost search-recent-chip" data-rpl-hist="${i}" title="${esc(h.query)}">${esc(h.query.length > 48 ? h.query.slice(0, 48) + "…" : h.query)}</button>
-              `).join("")}
-            </div>` : ""}
-            <div class="rpl-examples">${renderRplExampleChips()}</div>
-            ${statsBar}
-            <div class="results-filter-bar">
-              <div class="results-filter-input-wrap">
-                <input id="rplResultFilter" type="search" placeholder="Filter results…" value="${esc(filterVal)}" spellcheck="false" />
-                ${filterVal ? `<button type="button" class="results-filter-clear" id="rplResultFilterClear" aria-label="Clear">×</button>` : ""}
+
+            <details class="rpl-examples-fold" ${hasSearched ? "" : "open"}>
+              <summary>Example hunts</summary>
+              <div class="rpl-examples">${renderRplExampleChips()}</div>
+            </details>
+
+            <div class="search-results-toolbar ${searching ? "is-running" : hasSearched ? "is-ready" : "is-idle"}">
+              <div class="search-status" role="status">
+                <span class="search-status-text">${esc(statusText)}</span>
+                ${resRaw?.hint ? `<span class="rpl-hint">${esc(resRaw.hint)}</span>` : ""}
               </div>
-              <button type="button" class="btn ${filterRegex ? "primary" : "ghost"}" id="rplResultFilterRegex" aria-pressed="${filterRegex}">Regex</button>
-              ${filterVal && filterMatch != null && filterTotal != null
-                ? `<span class="results-filter-count">${filterMatch.toLocaleString()} / ${filterTotal.toLocaleString()}</span>`
-                : ""}
-              ${res?._filterError ? `<span class="results-filter-error">${esc(res._filterError)}</span>` : ""}
-              ${hasSearched ? `
-                <button type="button" class="btn ghost" id="rplExportJson" title="Export filtered rows as JSON">JSON</button>
-                <button type="button" class="btn ghost" id="rplExportCsv" title="Export filtered rows as CSV">CSV</button>
-              ` : ""}
+              <div class="results-filter-bar">
+                <div class="results-filter-input-wrap">
+                  <input id="rplResultFilter" type="search" placeholder="Filter results…" value="${esc(filterVal)}" spellcheck="false" ${hasSearched ? "" : "disabled"} />
+                  ${filterVal ? `<button type="button" class="results-filter-clear" id="rplResultFilterClear" aria-label="Clear">×</button>` : ""}
+                </div>
+                <button type="button" class="btn ${filterRegex ? "primary" : "ghost"} tiny" id="rplResultFilterRegex" aria-pressed="${filterRegex}" ${hasSearched ? "" : "disabled"}>Regex</button>
+                ${filterVal && filterMatch != null && filterTotal != null
+                  ? `<span class="results-filter-count">${filterMatch.toLocaleString()} / ${filterTotal.toLocaleString()}</span>`
+                  : ""}
+                ${res?._filterError ? `<span class="results-filter-error">${esc(res._filterError)}</span>` : ""}
+                ${hasSearched ? `
+                  <button type="button" class="btn ghost tiny" id="rplExportJson" title="Export filtered rows as JSON">JSON</button>
+                  <button type="button" class="btn ghost tiny" id="rplExportCsv" title="Export filtered rows as CSV">CSV</button>
+                ` : ""}
+              </div>
             </div>
+
+            ${hasSearched ? `
             <div class="rpl-chart-panel">
               <div class="rpl-chart-head">
-                <strong>Timeline</strong>
-                <div class="rpl-viz-switch">
+                <span class="rpl-chart-title">Results view</span>
+                <div class="rpl-viz-switch" role="group" aria-label="Result visualization">
                   ${["table", "timechart", "bar", "single_value"].map((m) => `
                     <button type="button" class="btn ghost ${panelViz === m || (m === "bar" && panelViz === "stats") ? "active" : ""}" data-rpl-viz="${m}">${m === "single_value" ? "single" : m === "bar" ? "bar" : m}</button>
                   `).join("")}
                 </div>
               </div>
-              <div class="rpl-chart-body" id="rplChart">${renderRplTimeline(res, hist)}</div>
-            </div>
-            <div class="rpl-split">
-              <div class="rpl-results" id="rplResults">${renderRplPanelBody(res, panelViz, selected)}</div>
-              <div class="rpl-inspector-wrap" id="rplInspector">${renderRplInspector(res, selected)}</div>
+              ${panelViz === "table" && hist?.buckets?.length
+                ? `<div class="rpl-chart-body" id="rplChart">${renderHistogramBars(hist.buckets)}</div>`
+                : `<div id="rplChart" class="hidden"></div>`}
+            </div>` : ""}
+
+            <div class="rpl-split ${hasSearched ? "" : "rpl-split-empty"}${hasSearched && panelViz !== "table" && panelViz !== "stats" ? " rpl-split-viz" : ""}">
+              <div class="rpl-results" id="rplResults">${hasSearched
+                ? renderRplPanelBody(res, panelViz, selected)
+                : `<div class="rpl-empty-state">
+                    <h3>Hunt ClickHouse events</h3>
+                    <p class="muted">Write an RPL query above, pick a time range, then Run. Open <strong>Example hunts</strong> for starters, or the Guide tab for syntax.</p>
+                  </div>`}</div>
+              <div class="rpl-inspector-wrap ${hasSearched && (panelViz === "table" || !panelViz) ? "" : "hidden"}" id="rplInspector">${hasSearched && (panelViz === "table" || !panelViz) ? renderRplInspector(res, selected) : ""}</div>
             </div>
             <details class="rpl-sql" ${sqlOpen ? "open" : ""} id="rplSqlDetails">
               <summary>SQL preview</summary>
@@ -7637,7 +7957,7 @@
     const labels = h.labels || {};
     const timeouts = h.timeouts || {};
     const fleetSet = state.settings?.effective?.default_check_set || "standard";
-    const fleetHistory = state.settings?.effective?.scan_history_per_host ?? 3;
+    const fleetHistory = state.settings?.effective?.scan_history_per_host ?? 10;
     return `
       <form class="form" id="hostSettingsForm">
         <div class="form-row">
@@ -7704,7 +8024,7 @@
       scan_jitter_pct: String(eff.scan_jitter_pct ?? "—"),
       max_concurrent_scans: String(eff.max_concurrent_scans ?? "—"),
       scan_timeout_secs: String(eff.scan_timeout_secs ?? "—"),
-      scan_history_per_host: String(eff.scan_history_per_host ?? "3"),
+      scan_history_per_host: String(eff.scan_history_per_host ?? "10"),
       webhook_url: eff.webhook_configured ? (eff.webhook_url || "set") : "(unset)",
       webhook_secret: eff.webhook_secret_configured ? "•••••••• (set)" : "(unset)",
       seed_demo: String(!!eff.seed_demo),
@@ -8908,6 +9228,29 @@
     };
     const clearable = [
       {
+        group: "Inventory",
+        items: [
+          {
+            id: "hosts",
+            title: "Hosts",
+            count: s.hosts ?? 0,
+            blurb: "Enrolled fleet (also drops host-scoped scans, findings, baselines, and hunter placements).",
+          },
+          {
+            id: "ssh_hunter",
+            title: "SSH hunter keys",
+            count: (s.ssh_keys ?? 0) + (s.ssh_placements ?? 0),
+            blurb: `${fmt(s.ssh_keys)} key records · ${fmt(s.ssh_placements)} placements.`,
+          },
+          {
+            id: "ssh_zones",
+            title: "SSH zones",
+            count: s.ssh_zones ?? 0,
+            blurb: "SSH hunter security zones.",
+          },
+        ],
+      },
+      {
         group: "Operational",
         items: [
           { id: "findings", title: "Findings", count: s.findings ?? 0, blurb: "Alert findings (Findings view, deep links)." },
@@ -8955,13 +9298,6 @@
           },
         ],
       },
-    ];
-    const inventory = [
-      { title: "Hosts", count: s.hosts ?? 0, hint: "enrolled fleet" },
-      { title: "Nodes", count: s.nodes ?? 0, hint: "scanner agents" },
-      { title: "SSH keys", count: s.ssh_keys ?? 0, hint: "hunter key records" },
-      { title: "SSH placements", count: s.ssh_placements ?? 0, hint: "key × host × user" },
-      { title: "SSH zones", count: s.ssh_zones ?? 0, hint: "security zones" },
     ];
     const credTable = (title, storage, rows, emptyMsg) => `
       <div style="margin-top:0.85rem">
@@ -9016,13 +9352,13 @@
           <h3>Clear data</h3>
           <div class="form-actions" style="margin:0;gap:0.5rem">
             <button type="button" class="btn ghost" id="btnReloadData">Refresh</button>
-            <button type="button" class="btn danger" id="btnClearDataAll">Clear all operational + hunt</button>
+            <button type="button" class="btn danger" id="btnClearDataAll">Clear all data</button>
           </div>
         </div>
         <div class="data-clear-list">
           <p class="muted" style="margin:0 0 0.85rem;font-size:0.88rem">
-            Wipe selected datasets. Hosts, SSH hunter inventory, and settings are kept.
-            Credential clears are explicit (not included in “Clear all”).
+            Wipe selected datasets, including hosts and sealed credentials.
+            Scanner nodes (${fmt(s.nodes)}) and operator settings are kept.
           </p>
           ${clearable.map((g) => `
             <h4 class="data-group-title">${esc(g.group)}</h4>
@@ -9040,13 +9376,11 @@
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><h3>Inventory (kept)</h3>
-          <span class="muted">Not cleared by “Clear all”</span>
+        <div class="panel-head"><h3>Kept on Clear all</h3>
+          <span class="muted">Re-registers automatically</span>
         </div>
         <div class="settings-kv" style="padding-bottom:1rem">
-          ${inventory.map((r) => `
-            <div><dt>${esc(r.title)}</dt><dd>${fmt(r.count)} <span class="muted">${esc(r.hint)}</span></dd></div>
-          `).join("")}
+          <div><dt>Nodes</dt><dd>${fmt(s.nodes)} <span class="muted">scanner agents</span></dd></div>
           <div><dt>Platform blobs</dt><dd>${fmt(s.platform_blobs)} <span class="muted">AnoMark / virtual CH cache</span></dd></div>
         </div>
       </section>`;
@@ -9059,26 +9393,58 @@
 
   async function clearDataTargets(targets) {
     const list = Array.isArray(targets) ? targets : [targets];
-    const label = list.join(", ");
+    const label = list.includes("all") ? "ALL data (hosts, scans, findings, hunt events, and credentials)" : list.join(", ");
     if (!confirm(`Clear ${label}? This cannot be undone.`)) return;
-    if (list.includes("ssh_identities") || list.includes("ssh_passwords")) {
-      if (!confirm("This permanently deletes sealed credential files from disk. Hosts that reference them will fail to authenticate until reconfigured. Continue?")) {
+    if (
+      list.includes("all")
+      || list.includes("hosts")
+      || list.includes("ssh_identities")
+      || list.includes("ssh_passwords")
+    ) {
+      if (!confirm("This permanently deletes hosts and/or sealed credentials. Continue?")) {
         return;
       }
     }
     const res = await api("/v1/data/clear", { method: "POST", body: { targets: list } });
     const purged = res.purged || {};
-    const parts = Object.entries(purged).map(([k, v]) => `${k}: ${v}`);
+    const parts = Object.entries(purged).map(([k, v]) => {
+      if (v && typeof v === "object" && v.skipped) return `${k}: skipped`;
+      return `${k}: ${v}`;
+    });
     toast(parts.length ? `Cleared ${parts.join(" · ")}` : "Cleared");
+
+    // Drop local caches immediately so every view empties before reload finishes.
+    const wipe = (name) => list.includes("all") || list.includes(name);
+    if (wipe("hosts")) {
+      state.hosts = [];
+      state.selectedHost = null;
+      closeDrawer();
+    }
+    if (wipe("findings") || wipe("hosts")) {
+      state.findings = [];
+      state.selectedFinding = null;
+      if (!wipe("hosts")) closeDrawer();
+    }
+    if (wipe("scans") || wipe("hosts")) {
+      state.scans = [];
+      state.queue = null;
+    }
+    if (wipe("activity")) state.activity = [];
+    if (wipe("events") || wipe("virtual_ingest") || wipe("hosts")) {
+      // Hunt results / RPL caches live in DOM; force a full re-render after reload.
+    }
+    if (state.summary) {
+      if (wipe("hosts")) state.summary.hosts = 0;
+      if (wipe("findings") || wipe("hosts")) state.summary.findings = 0;
+      if (wipe("scans") || wipe("hosts")) state.summary.scans = 0;
+      if (wipe("activity")) state.summary.activity = 0;
+    }
+
     await Promise.all([
       loadDataSummary().catch(() => null),
       loadAll().catch(() => null),
     ]);
-    if (state.view === "data") render();
-    else if (list.includes("findings") || list.includes("all")) {
-      state.selectedFinding = null;
-      closeDrawer();
-    }
+    render();
   }
 
   function wireDataPage() {
@@ -9291,6 +9657,7 @@
       ["overview", "Overview"],
       ["account", "Account"],
       ["users", "Users"],
+      ["audit", "Audit log"],
       ["scanning", "Scanning"],
       ["infra", "Infrastructure"],
       ["virtual", "Virtual agents"],
@@ -9302,6 +9669,7 @@
 
     const accountHtml = settingsAccountHtml();
     const usersHtml = settingsUsersHtml();
+    const auditHtml = settingsAuditHtml();
 
     const overviewHtml = `
       <section class="panel">
@@ -9323,7 +9691,7 @@
           <div><dt>Listen</dt><dd>${esc(eff.listen)}</dd></div>
           <div><dt>Scan interval</dt><dd>${esc(eff.scan_interval)} ±${esc(eff.scan_jitter_pct)}%</dd></div>
           <div><dt>Check set</dt><dd>${esc(eff.default_check_set)}</dd></div>
-          <div><dt>Scan history</dt><dd>${esc(eff.scan_history_per_host ?? 3)} finished / host</dd></div>
+          <div><dt>Scan history</dt><dd>${esc(eff.scan_history_per_host ?? 10)} finished / host</dd></div>
           <div><dt>WebAuthn</dt><dd>${eff.webauthn_origin ? esc(eff.webauthn_origin) : "request Origin"}${eff.webauthn_rp_id ? ` · rpId ${esc(eff.webauthn_rp_id)}` : ""}</dd></div>
           <div><dt>Concurrency</dt><dd>${esc(eff.max_concurrent_scans)} · timeout ${esc(eff.scan_timeout_secs)}s</dd></div>
           <div><dt>Noise XX</dt><dd>${eff.noise_xx_enabled ? esc(eff.noise_xx_server_fingerprint || "enabled") : "disabled"}</dd></div>
@@ -9339,7 +9707,7 @@
           <form class="form" id="fleetScanHistoryForm" style="padding:0 1.1rem 1rem;margin:0">
             <label>Finished scans kept per host
               <select name="scan_history_per_host">
-                ${[1,3,5,10,20,50].map((v) => `<option value="${v}" ${Number(eff.scan_history_per_host ?? 3) === v ? "selected" : ""}>${v}</option>`).join("")}
+                ${[1,3,5,10,20,50].map((v) => `<option value="${v}" ${Number(eff.scan_history_per_host ?? 10) === v ? "selected" : ""}>${v}</option>`).join("")}
               </select>
             </label>
             <p class="muted" style="margin:0.4rem 0 0.75rem;font-size:0.78rem">
@@ -9539,12 +9907,83 @@
         ${pane("overview", overviewHtml)}
         ${pane("account", accountHtml)}
         ${pane("users", usersHtml)}
+        ${pane("audit", auditHtml)}
         ${pane("scanning", scanningHtml)}
         ${pane("infra", infraHtml)}
         ${pane("virtual", virtualHtml)}
         ${pane("hosts", hostsHtml)}
         ${pane("catalog", catalogHtml)}
       </div>`;
+  }
+
+  function settingsAuditHtml() {
+    const u = state.authUser;
+    if (!u || u.role !== "admin") {
+      return `<section class="panel"><div class="empty">Admin role required to inspect the audit log.</div></section>`;
+    }
+    const rows = state._auditEvents || [];
+    const q = state._auditQ || "";
+    const openId = state._auditOpenId || "";
+    return `
+      <section class="panel">
+        <div class="panel-head">
+          <h3>UI / API audit log <span class="muted">(${rows.length})</span></h3>
+          <div class="toolbar">
+            <input id="auditQ" type="search" placeholder="Filter action, user, path…" value="${esc(q)}" style="min-width:12rem" />
+            <button type="button" class="btn ghost" id="btnAuditRefresh">Refresh</button>
+          </div>
+        </div>
+        <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          Mutating operator actions are recorded with a plain-language action, request summary
+          (secrets redacted), actor, and HTTP status. Expand a row for the full sanitized body.
+        </p>
+        ${!rows.length ? `<div class="empty">No audit events yet — perform an action in the UI, then refresh.</div>` : `
+          <table class="data activity-table"><thead><tr>
+            <th>Time</th><th>User</th><th>Action</th><th>Summary</th><th>Status</th><th></th>
+          </tr></thead><tbody>
+            ${rows.map((e) => {
+              const d = e.detail || {};
+              const action = d.action || e.kind || "Action";
+              const summary = d.summary || "";
+              const status = d.status != null ? String(d.status) : (e.level || "—");
+              const open = String(e.id) === String(openId);
+              const bodyJson = d.body != null
+                ? JSON.stringify(d.body, null, 2)
+                : "";
+              const meta = [
+                d.method && d.path ? `${d.method} ${d.path}` : "",
+                d.query ? `?${d.query}` : "",
+                d.role ? `role=${d.role}` : "",
+              ].filter(Boolean).join(" · ");
+              return `<tr class="audit-row" data-audit-id="${esc(String(e.id))}">
+                <td class="mono muted" style="white-space:nowrap">${esc(fmtTime(e.ts))}</td>
+                <td>${esc(d.actor || "—")}</td>
+                <td><strong>${esc(action)}</strong></td>
+                <td style="max-width:28rem;word-break:break-word">${esc(summary || e.message || "—")}</td>
+                <td class="level-${esc(e.level || "info")}">${esc(status)}</td>
+                <td><button type="button" class="btn ghost" data-audit-toggle="${esc(String(e.id))}" style="padding:0.15rem 0.45rem;font-size:0.78rem">${open ? "Hide" : "Details"}</button></td>
+              </tr>
+              ${open ? `<tr class="audit-detail-row"><td colspan="6">
+                <div class="mono muted" style="font-size:0.78rem;margin-bottom:0.35rem">${esc(meta || e.message || "")}</div>
+                ${bodyJson
+                  ? `<pre class="mono" style="margin:0;padding:0.65rem 0.75rem;font-size:0.75rem;max-height:16rem;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--surface-2, rgba(0,0,0,0.04));border-radius:6px">${esc(bodyJson)}</pre>`
+                  : `<div class="muted" style="font-size:0.82rem">No request body recorded for this event.</div>`}
+              </td></tr>` : ""}`;
+            }).join("")}
+          </tbody></table>`}
+      </section>`;
+  }
+
+  async function loadAuditLog() {
+    if (!state.authUser || state.authUser.role !== "admin") {
+      state._auditEvents = [];
+      return;
+    }
+    const q = (state._auditQ || "").trim();
+    const qs = new URLSearchParams({ limit: "500" });
+    if (q) qs.set("q", q);
+    const pack = await api(`/v1/audit?${qs}`);
+    state._auditEvents = pack.events || [];
   }
 
   function settingsAccountHtml() {
@@ -10218,6 +10657,47 @@
             if (state._settingsTab === "users") render();
           });
         }
+        if (id === "audit" && state.authUser?.role === "admin") {
+          loadAuditLog().then(() => {
+            if (state._settingsTab === "audit") render();
+          }).catch((err) => toast(err.message));
+        }
+      });
+    });
+    const auditRefresh = $("#btnAuditRefresh");
+    if (auditRefresh) {
+      auditRefresh.addEventListener("click", async () => {
+        try {
+          await loadAuditLog();
+          render();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    }
+    const auditQ = $("#auditQ");
+    if (auditQ) {
+      auditQ.addEventListener("change", async () => {
+        state._auditQ = auditQ.value || "";
+        try {
+          await loadAuditLog();
+          render();
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+      auditQ.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          auditQ.dispatchEvent(new Event("change"));
+        }
+      });
+    }
+    $$("[data-audit-toggle]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.getAttribute("data-audit-toggle");
+        state._auditOpenId = state._auditOpenId === id ? "" : id;
+        render();
       });
     });
     const exportBtn = $("#btnExportSettings");
@@ -10295,7 +10775,7 @@
       histForm.addEventListener("submit", async (e) => {
         e.preventDefault();
         const fd = new FormData(histForm);
-        const n = Number(fd.get("scan_history_per_host") || 3);
+        const n = Number(fd.get("scan_history_per_host") || 10);
         try {
           state.settings = await api("/v1/settings", {
             method: "PUT",
@@ -11387,7 +11867,7 @@ title_contains = "Custom rule"
           return ta.localeCompare(tb);
         });
       const histKeep = h.labels?.scan_history || h.labels?.scan_history_per_host
-        || state.settings?.effective?.scan_history_per_host || 3;
+        || state.settings?.effective?.scan_history_per_host || 10;
       const hostHash = `#host/${encodeURIComponent(h.id)}`;
       const hostAbs = hostPermalink(h.id);
       const virt = isVirtualHost(h);
@@ -11858,6 +12338,64 @@ title_contains = "Custom rule"
     return "";
   }
 
+  function sortValueCmp(a, b) {
+    const empty = (v) => v == null || v === "" || v === "—";
+    if (empty(a) && empty(b)) return 0;
+    if (empty(a)) return 1;
+    if (empty(b)) return -1;
+    if (typeof a === "number" && typeof b === "number") return a - b;
+    const sa = String(a).trim();
+    const sb = String(b).trim();
+    const na = Number(sa);
+    const nb = Number(sb);
+    if (sa !== "" && sb !== "" && Number.isFinite(na) && Number.isFinite(nb)
+      && /^-?\d+(\.\d+)?$/.test(sa) && /^-?\d+(\.\d+)?$/.test(sb)) {
+      return na - nb;
+    }
+    return sa.localeCompare(sb, undefined, { numeric: true, sensitivity: "base" });
+  }
+
+  function sortRowsBy(rows, keyFn, dir) {
+    const mult = dir === "desc" ? -1 : 1;
+    return [...rows].sort((a, b) => mult * sortValueCmp(keyFn(a), keyFn(b)));
+  }
+
+  function toggleSortState(prevKey, prevDir, nextKey) {
+    if (prevKey === nextKey) {
+      return { key: nextKey, dir: prevDir === "asc" ? "desc" : "asc" };
+    }
+    return { key: nextKey, dir: "asc" };
+  }
+
+  function sortableTh(label, key, sortKey, sortDir) {
+    const active = sortKey === key;
+    const aria = active ? (sortDir === "desc" ? "descending" : "ascending") : "none";
+    const ind = active ? (sortDir === "desc" ? "↓" : "↑") : "";
+    return `<th class="sortable-th${active ? " is-sorted" : ""}" data-sort-key="${esc(key)}" aria-sort="${aria}">
+      <button type="button" class="sortable-th-btn">${esc(label)}<span class="sortable-ind" aria-hidden="true">${ind}</span></button>
+    </th>`;
+  }
+
+  function wireSortableHeaders(root, onSort) {
+    if (!root || typeof onSort !== "function") return;
+    root.querySelectorAll("th.sortable-th[data-sort-key]").forEach((th) => {
+      const btn = th.querySelector(".sortable-th-btn") || th;
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const key = th.getAttribute("data-sort-key");
+        if (key) onSort(key);
+      });
+    });
+  }
+
+  function restoreSearchFocus(sel, value) {
+    const el = $(sel);
+    if (!el) return;
+    el.focus();
+    try { el.setSelectionRange(value.length, value.length); } catch (_) {}
+  }
+
   async function loadHostProcesses(hostId, opts) {
     const pane = $("#hostProcessesPane");
     if (!pane) return;
@@ -11875,9 +12413,34 @@ title_contains = "Custom rule"
       const src = pack.source === "virtual_ingest"
         ? "ingest JSONL"
         : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
-      const renderRows = (filterQ = "") => {
+      let sortKey = "pid";
+      let sortDir = "asc";
+      let filterQ = "";
+      const sortGetters = {
+        pid: (p) => p.pid,
+        ppid: (p) => p.ppid,
+        user: (p) => p.username || ((p.uids && p.uids[0] != null) ? String(p.uids[0]) : ""),
+        state: (p) => p.state || "",
+        comm: (p) => p.comm || "",
+        cmdline: (p) => (p.cmdline || []).map(pathBytes).filter(Boolean).join(" "),
+        exe: (p) => pathBytes(p.exe) || "",
+        listen: (p) => (p.listen_ports || [])[0] ?? "",
+        ns: (p) => {
+          const nsNet = (p.ns && (p.ns.net?.utf8 || p.ns.net?.b64 || p.ns.net?.s || p.ns.net?.b || p.ns.net)) || "";
+          return typeof nsNet === "string" ? nsNet : (pathBytes(nsNet) || "");
+        },
+        flags: (p) => [
+          p.exe_memfd ? "memfd" : "",
+          p.exe_deleted ? "deleted" : "",
+          p.rwx_maps ? `rwx:${p.rwx_maps}` : "",
+          p.unbacked_exec ? `unbacked:${p.unbacked_exec}` : "",
+          p.selinux || "",
+          ...(p.environ_flags || []),
+        ].filter(Boolean).join(" "),
+      };
+      const paint = () => {
         const q = String(filterQ || "").toLowerCase().trim();
-        const shown = !q ? rows : rows.filter((p) => {
+        let shown = !q ? rows : rows.filter((p) => {
           const hay = [
             p.comm, p.username, pathBytes(p.exe),
             ...(p.cmdline || []).map(pathBytes),
@@ -11885,13 +12448,24 @@ title_contains = "Custom rule"
           ].join(" ").toLowerCase();
           return hay.includes(q);
         });
-        return `
+        const getter = sortGetters[sortKey];
+        if (getter) shown = sortRowsBy(shown, getter, sortDir);
+        pane.innerHTML = `
         <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem">
           <input id="hostProcQ" type="search" placeholder="Filter by name, path, pid…" value="${esc(filterQ)}" style="min-width:14rem" />
           <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()} · ${esc(src)}</span>
         </div>
         <table class="data"><thead><tr>
-          <th>PID</th><th>PPID</th><th>User</th><th>State</th><th>Comm</th><th>Cmdline</th><th>Exe</th><th>Listen</th><th>NS net</th><th>Flags</th>
+          ${sortableTh("PID", "pid", sortKey, sortDir)}
+          ${sortableTh("PPID", "ppid", sortKey, sortDir)}
+          ${sortableTh("User", "user", sortKey, sortDir)}
+          ${sortableTh("State", "state", sortKey, sortDir)}
+          ${sortableTh("Comm", "comm", sortKey, sortDir)}
+          ${sortableTh("Cmdline", "cmdline", sortKey, sortDir)}
+          ${sortableTh("Exe", "exe", sortKey, sortDir)}
+          ${sortableTh("Listen", "listen", sortKey, sortDir)}
+          ${sortableTh("NS net", "ns", sortKey, sortDir)}
+          ${sortableTh("Flags", "flags", sortKey, sortDir)}
         </tr></thead><tbody>
           ${shown.map((p) => {
             const flags = [];
@@ -11921,33 +12495,24 @@ title_contains = "Custom rule"
             </tr>`;
           }).join("")}
         </tbody></table>`;
+        let t = 0;
+        $("#hostProcQ")?.addEventListener("input", (e) => {
+          clearTimeout(t);
+          t = setTimeout(() => {
+            filterQ = e.target.value || "";
+            paint();
+            restoreSearchFocus("#hostProcQ", filterQ);
+          }, 100);
+        });
+        wireSortableHeaders(pane, (key) => {
+          const next = toggleSortState(sortKey, sortDir, key);
+          sortKey = next.key;
+          sortDir = next.dir;
+          paint();
+          restoreSearchFocus("#hostProcQ", filterQ);
+        });
       };
-      pane.innerHTML = renderRows("");
-      const qEl = $("#hostProcQ");
-      let t = 0;
-      qEl?.addEventListener("input", () => {
-        clearTimeout(t);
-        t = setTimeout(() => {
-          const v = qEl.value || "";
-          pane.innerHTML = renderRows(v);
-          const again = $("#hostProcQ");
-          if (again) {
-            again.focus();
-            try { again.setSelectionRange(v.length, v.length); } catch (_) {}
-            again.addEventListener("input", () => {
-              clearTimeout(t);
-              t = setTimeout(() => {
-                pane.innerHTML = renderRows(again.value || "");
-                const el = $("#hostProcQ");
-                if (el) {
-                  el.focus();
-                  try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) {}
-                }
-              }, 100);
-            });
-          }
-        }, 100);
-      });
+      paint();
     } catch (err) {
       pane.innerHTML = `<div class="empty">${esc(err.message || "Failed to load processes")}</div>`;
     }
@@ -11970,9 +12535,33 @@ title_contains = "Custom rule"
       const src = pack.source === "virtual_ingest"
         ? "ingest JSONL"
         : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
-      const renderRows = (filterQ = "") => {
+      let sortKey = "path";
+      let sortDir = "asc";
+      let filterQ = "";
+      const fileSizeNum = (f) => {
+        const v = f.size?.s ?? f.size;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : v;
+      };
+      const sortGetters = {
+        path: (f) => pathBytes(f.path) || f.path || "",
+        size: fileSizeNum,
+        mode: (f) => f.mode_octal
+          || (typeof f.mode === "number" ? (f.mode & 0o7777).toString(8).padStart(4, "0") : (f.mode ?? f.permissions ?? "")),
+        owner: (f) => f.owner || (f.uid != null ? `uid:${f.uid}` : ""),
+        group: (f) => f.group || (f.gid === 0 ? "root" : "") || (f.gid != null ? `gid:${f.gid}` : ""),
+        uid: (f) => f.uid,
+        gid: (f) => f.gid,
+        inode: (f) => f.inode?.s ?? f.inode ?? "",
+        flags: (f) => (Array.isArray(f.flags) ? f.flags : [
+          f.setuid ? "setuid" : null,
+          f.setgid ? "setgid" : null,
+          f.immutable ? "immutable" : null,
+        ].filter(Boolean)).join(" "),
+      };
+      const paint = () => {
         const q = String(filterQ || "").toLowerCase().trim();
-        const shown = !q ? rows : rows.filter((f) => {
+        let shown = !q ? rows : rows.filter((f) => {
           const hay = [
             pathBytes(f.path) || f.path,
             f.owner, f.group, f.mode, f.mode_octal, f.permissions,
@@ -11982,15 +12571,26 @@ title_contains = "Custom rule"
           ].join(" ").toLowerCase();
           return hay.includes(q);
         });
-        return `
+        const getter = sortGetters[sortKey];
+        if (getter) shown = sortRowsBy(shown, getter, sortDir);
+        const capped = shown.slice(0, 5000);
+        pane.innerHTML = `
         <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem">
           <input id="hostFileQ" type="search" placeholder="Filter by path, owner, mode…" value="${esc(filterQ)}" style="min-width:14rem" />
           <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()} · ${esc(src)}</span>
         </div>
         <table class="data"><thead><tr>
-          <th>Path</th><th>Size</th><th>Mode</th><th>Owner</th><th>Group</th><th>UID</th><th>GID</th><th>Inode</th><th>Flags</th>
+          ${sortableTh("Path", "path", sortKey, sortDir)}
+          ${sortableTh("Size", "size", sortKey, sortDir)}
+          ${sortableTh("Mode", "mode", sortKey, sortDir)}
+          ${sortableTh("Owner", "owner", sortKey, sortDir)}
+          ${sortableTh("Group", "group", sortKey, sortDir)}
+          ${sortableTh("UID", "uid", sortKey, sortDir)}
+          ${sortableTh("GID", "gid", sortKey, sortDir)}
+          ${sortableTh("Inode", "inode", sortKey, sortDir)}
+          ${sortableTh("Flags", "flags", sortKey, sortDir)}
         </tr></thead><tbody>
-          ${shown.slice(0, 5000).map((f) => {
+          ${capped.map((f) => {
             const p = pathBytes(f.path) || f.path || "—";
             const modeDisp = f.mode_octal
               || (typeof f.mode === "number" ? (f.mode & 0o7777).toString(8).padStart(4, "0") : (f.mode ?? f.permissions ?? "—"));
@@ -12019,26 +12619,24 @@ title_contains = "Custom rule"
           }).join("")}
         </tbody></table>
         ${shown.length > 5000 ? `<div class="muted" style="margin-top:0.45rem">Showing first 5,000 of ${shown.length.toLocaleString()}</div>` : ""}`;
-      };
-      pane.innerHTML = renderRows("");
-      const wire = () => {
-        const qEl = $("#hostFileQ");
         let t = 0;
-        qEl?.addEventListener("input", () => {
+        $("#hostFileQ")?.addEventListener("input", (e) => {
           clearTimeout(t);
           t = setTimeout(() => {
-            const v = qEl.value || "";
-            pane.innerHTML = renderRows(v);
-            wire();
-            const again = $("#hostFileQ");
-            if (again) {
-              again.focus();
-              try { again.setSelectionRange(v.length, v.length); } catch (_) {}
-            }
+            filterQ = e.target.value || "";
+            paint();
+            restoreSearchFocus("#hostFileQ", filterQ);
           }, 100);
         });
+        wireSortableHeaders(pane, (key) => {
+          const next = toggleSortState(sortKey, sortDir, key);
+          sortKey = next.key;
+          sortDir = next.dir;
+          paint();
+          restoreSearchFocus("#hostFileQ", filterQ);
+        });
       };
-      wire();
+      paint();
     } catch (err) {
       pane.innerHTML = `<div class="empty">${esc(err.message || "Failed to load files")}</div>`;
     }
@@ -12058,12 +12656,32 @@ title_contains = "Custom rule"
           : `<div class="empty">No socket inventory for this scan. Pick another scan above, or run a scan that includes <span class="mono">net.sockets</span>.</div>`;
         return;
       }
-      pane.innerHTML = `
+      let sortKey = "proto";
+      let sortDir = "asc";
+      const sortGetters = {
+        proto: (s) => `${(s.protocol || "").toUpperCase()}/${s.family || ""}`,
+        state: (s) => s.state || "",
+        local: (s) => `${s.local_ip || ""}:${s.local_port ?? ""}`,
+        remote: (s) => `${s.remote_ip || ""}:${s.remote_port ?? ""}`,
+        pid: (s) => (s.owning_pid != null ? s.owning_pid : (s.owner_unresolved ? -1 : null)),
+        comm: (s) => s.owning_comm || "",
+        uid: (s) => s.uid,
+      };
+      const paint = () => {
+        const getter = sortGetters[sortKey];
+        const shown = getter ? sortRowsBy(rows, getter, sortDir) : rows;
+        pane.innerHTML = `
         <div class="muted" style="margin-bottom:0.5rem">${rows.length.toLocaleString()} connections${pack.scan_id ? ` · scan ${esc(shortId(pack.scan_id))}` : ""}</div>
         <table class="data"><thead><tr>
-          <th>Proto</th><th>State</th><th>Local</th><th>Remote</th><th>PID</th><th>Comm</th><th>UID</th>
+          ${sortableTh("Proto", "proto", sortKey, sortDir)}
+          ${sortableTh("State", "state", sortKey, sortDir)}
+          ${sortableTh("Local", "local", sortKey, sortDir)}
+          ${sortableTh("Remote", "remote", sortKey, sortDir)}
+          ${sortableTh("PID", "pid", sortKey, sortDir)}
+          ${sortableTh("Comm", "comm", sortKey, sortDir)}
+          ${sortableTh("UID", "uid", sortKey, sortDir)}
         </tr></thead><tbody>
-          ${rows.map((s) => {
+          ${shown.map((s) => {
             const local = `${s.local_ip || "?"}:${s.local_port ?? "?"}`;
             const remote = `${s.remote_ip || "?"}:${s.remote_port ?? "?"}`;
             const owner = s.owning_pid != null
@@ -12080,6 +12698,14 @@ title_contains = "Custom rule"
             </tr>`;
           }).join("")}
         </tbody></table>`;
+        wireSortableHeaders(pane, (key) => {
+          const next = toggleSortState(sortKey, sortDir, key);
+          sortKey = next.key;
+          sortDir = next.dir;
+          paint();
+        });
+      };
+      paint();
     } catch (err) {
       pane.innerHTML = `<div class="empty">${esc(err.message || "Failed to load connections")}</div>`;
     }
@@ -12162,7 +12788,7 @@ title_contains = "Custom rule"
           </label>
           <label>Scan history keep
             <select name="scan_history">
-              <option value="">Fleet default (${esc(String(state.settings?.effective?.scan_history_per_host ?? 3))})</option>
+              <option value="">Fleet default (${esc(String(state.settings?.effective?.scan_history_per_host ?? 10))})</option>
               ${[1,3,5,10,20,50].map((v) => `<option value="${v}" ${String(labels.scan_history || labels.scan_history_per_host || "") === String(v) ? "selected" : ""}>${v}</option>`).join("")}
             </select>
           </label>
@@ -12457,7 +13083,7 @@ title_contains = "Custom rule"
 
   function exportHostsCsv() {
     const rows = filteredHosts();
-    const header = ["id", "display_name", "agent", "agent_detail", "primary_addr", "ssh_port", "os", "os_id", "os_version", "arch", "kernel", "status", "last_outcome", "last_scan_at", "env", "profile", "region", "tags"];
+    const header = ["id", "display_name", "agent", "agent_detail", "primary_addr", "ssh_port", "os", "os_id", "os_version", "arch", "kernel", "status", "last_outcome", "scans", "last_scan_at", "env", "profile", "region", "tags"];
     const lines = [header.join(",")];
     for (const h of rows) {
       const st = hostStatus(h);
@@ -12476,6 +13102,7 @@ title_contains = "Custom rule"
         h.kernel || "",
         st.label,
         h.last_outcome || "",
+        siftHostFinishedScans(h.id).length,
         h.last_scan_at || "",
         h.labels?.env || "",
         h.labels?.profile || "",
@@ -12574,8 +13201,8 @@ title_contains = "Custom rule"
   } = {}) {
     const isPw = method === "password";
     return `
-      <fieldset class="ssh-auth-fields" style="border:0;margin:0;padding:0">
-        <legend style="font-size:0.85rem;margin-bottom:0.25rem">SSH auth method</legend>
+      <div class="form-fieldset ssh-auth-fields">
+        <h3 class="form-section-title">SSH auth method</h3>
         <div class="ssh-auth-method" role="radiogroup" aria-label="SSH auth method">
           <label>
             <input type="radio" name="ssh_auth" value="publickey" ${!isPw ? "checked" : ""} data-ssh-auth-radio />
@@ -12595,7 +13222,7 @@ title_contains = "Custom rule"
           </label>
           <input type="hidden" name="ssh_password_file" value="${esc(passwordFileValue)}" />
           ${passwordFileValue
-            ? `<p class="muted" style="margin:0.35rem 0 0;font-size:0.75rem">A password is already saved — leave blank to keep it.</p>`
+            ? `<p class="form-hint muted">A password is already saved — leave blank to keep it.</p>`
             : ""}
         </div>
         ${sshSudoFieldsHtml({
@@ -12604,7 +13231,7 @@ title_contains = "Custom rule"
           passwordFileValue: sudoPasswordFileValue,
           idPrefix: `${idPrefix}Sudo`,
         })}
-      </fieldset>`;
+      </div>`;
   }
 
   function sshSudoFieldsHtml({
@@ -12615,15 +13242,15 @@ title_contains = "Custom rule"
   } = {}) {
     const m = mode || "ssh_password";
     return `
-      <div class="ssh-sudo-fields" style="margin-top:0.75rem;padding-top:0.65rem;border-top:1px solid var(--line)">
-        <label style="display:flex;align-items:center;gap:0.45rem;font-weight:600">
+      <div class="ssh-sudo-fields">
+        <label class="form-check-inline form-check-strong">
           <input type="checkbox" name="ssh_sudo" value="1" ${enabled ? "checked" : ""} data-ssh-sudo-toggle />
           Escalate with sudo (root)
         </label>
-        <p class="muted" style="margin:0.35rem 0 0.5rem;font-size:0.75rem">
+        <p class="form-hint muted">
           Required for <span class="mono">/etc/shadow</span>, other users' keys, and reliable <span class="mono">/proc</span> reads when SSH is a non-root user (applies to SSH probe and AgentLite scans).
         </p>
-        <div data-ssh-sudo-pane class="${enabled ? "" : "hidden"}">
+        <div data-ssh-sudo-pane class="form-block-follow ${enabled ? "" : "hidden"}">
           <label>Sudo mode
             <select name="ssh_sudo_mode" data-ssh-sudo-mode>
               <option value="ssh_password" ${m === "ssh_password" ? "selected" : ""}>Reuse SSH password</option>
@@ -12631,7 +13258,7 @@ title_contains = "Custom rule"
               <option value="password" ${m === "password" ? "selected" : ""}>Separate sudo password</option>
             </select>
           </label>
-          <div data-ssh-sudo-pw-pane class="${m === "password" ? "" : "hidden"}" style="margin-top:0.5rem">
+          <div data-ssh-sudo-pw-pane class="form-block-follow ${m === "password" ? "" : "hidden"}">
             <label>Sudo password
               <input name="ssh_sudo_password" type="password" autocomplete="new-password" placeholder="${esc(passwordFileValue ? "Leave blank to keep saved sudo password" : "sudo password")}" />
             </label>
@@ -12755,20 +13382,34 @@ title_contains = "Custom rule"
     if (resultEl) {
       resultEl.innerHTML = `<div class="conn-test"><div class="muted">Testing ${esc(payload.host)}:${payload.ssh_port || 22}…</div></div>`;
     }
-    const report = await api("/v1/hosts/test", { method: "POST", body: payload });
-    if (resultEl) resultEl.innerHTML = renderTestReport(report);
-    return report;
+    const connectSecs = Number(payload.connect_timeout_secs || 8);
+    // Wall clock ≈ connect + auth + probe + slack; abort before the browser drops the socket silently.
+    const abortMs = Math.min(90000, Math.max(25000, (connectSecs * 3 + 20) * 1000));
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), abortMs) : null;
+    try {
+      const report = await api("/v1/hosts/test", {
+        method: "POST",
+        body: payload,
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      if (resultEl) resultEl.innerHTML = renderTestReport(report);
+      return report;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   function showAddHost() {
     openModal("Add hosts", `
-      <form class="form" id="addHostForm">
-        <p class="muted" style="margin:0 0 0.75rem;font-size:0.88rem">
+      <form class="form add-host-form" id="addHostForm">
+        <p class="form-lead muted">
           Choose an agent, then paste hostnames, IPs, or IPv4 CIDR netblocks.
           Use <strong>Test connection</strong> on the first host to verify SSH before Finish.
         </p>
-        <fieldset class="ssh-auth-fields" style="border:0;margin:0 0 0.85rem;padding:0">
-          <legend style="font-size:0.85rem;margin-bottom:0.25rem;font-weight:600">Agent</legend>
+
+        <section class="form-section">
+          <h3 class="form-section-title">Agent</h3>
           <div class="ssh-auth-method" role="radiogroup" aria-label="Agent">
             <label title="Ephemeral probe binary over SSH (highest fidelity)">
               <input type="radio" name="agent_kind" value="ssh" checked data-add-agent />
@@ -12783,114 +13424,135 @@ title_contains = "Custom rule"
               Virtual
             </label>
           </div>
-          <p id="addHostAgentHint" class="muted" style="margin:0.45rem 0 0;font-size:0.78rem">
+          <p id="addHostAgentHint" class="form-hint muted">
             Ephemeral probe delivered over SSH (memfd/tmpfs). Highest fidelity.
           </p>
-        </fieldset>
-        <div id="addHostSshFields">
-        <label>Input
-          <select name="add_type" id="addHostType">
-            <option value="list">Hostname / IP list</option>
-            <option value="cidr">IP netblock list (CIDR)</option>
-          </select>
-        </label>
-        <label id="addHostListLabel">Hosts (one hostname or IP per line)
-          <textarea name="hosts" placeholder="vm&#10;web-01.internal&#10;10.0.0.12" rows="6"></textarea>
-        </label>
-        <div class="form-row">
-          <label>SSH port
-            <input name="ssh_port" type="number" value="22" min="1" max="65535" />
+        </section>
+
+        <section class="form-section" id="addHostSshFields">
+          <h3 class="form-section-title">Targets</h3>
+          <label>Input
+            <select name="add_type" id="addHostType">
+              <option value="list">Hostname / IP list</option>
+              <option value="cidr">IP netblock list (CIDR)</option>
+            </select>
           </label>
-          <label>SSH username
-            <input name="ssh_user" placeholder="root / ubuntu" />
+          <label id="addHostListLabel">Hosts (one hostname or IP per line)
+            <textarea name="hosts" placeholder="vm&#10;web-01.internal&#10;10.0.0.12" rows="6"></textarea>
           </label>
-          <label>Credential ref (optional)
+
+          <h3 class="form-section-title form-section-title-sub">SSH access</h3>
+          <div class="form-row form-row-2">
+            <label>SSH port
+              <input name="ssh_port" type="number" value="22" min="1" max="65535" />
+            </label>
+            <label>SSH username
+              <input name="ssh_user" placeholder="root / ubuntu" />
+            </label>
+          </div>
+          <label>Credential ref <span class="field-optional">(optional)</span>
             <input name="credential" placeholder="vault://ssh/default" />
           </label>
-        </div>
-        ${sshAuthFieldsHtml({
-          method: "publickey",
-          identityName: "identity",
-          identityFileId: "addHostIdentityFile",
-          idPrefix: "addSshAuth",
-          sudoEnabled: false,
-          sudoMode: "ssh_password",
-        })}
-        </div>
-        <div id="addHostVirtualFields" class="hidden">
+          ${sshAuthFieldsHtml({
+            method: "publickey",
+            identityName: "identity",
+            identityFileId: "addHostIdentityFile",
+            idPrefix: "addSshAuth",
+            sudoEnabled: false,
+            sudoMode: "ssh_password",
+          })}
+        </section>
+
+        <section class="form-section hidden" id="addHostVirtualFields">
+          <h3 class="form-section-title">Virtual ingest</h3>
           <label>Virtual agent profile
             <select name="virtual_agent_id" id="addHostVirtualAgentId">
               ${virtualAgentOptionsHtml(state._vaProfileId || state.virtualAgents?.[0]?.id || "")}
             </select>
           </label>
-          <p class="muted" style="margin:0 0 0.75rem;font-size:0.82rem">
+          <p class="form-hint muted">
             Upload a day folder to <strong>create or update</strong> one virtual host per subdirectory
             (matched by display name). Each import <strong>adds a new scan</strong> under Scans — previous imports stay in history.
           </p>
-          <label>Kind
-            <select name="kind">
-              <option value="auto">Auto (sniff)</option>
-              <option value="processes">Processes</option>
-              <option value="files">Files</option>
-            </select>
-          </label>
+          <div class="form-row form-row-2">
+            <label>Kind
+              <select name="kind">
+                <option value="auto">Auto (sniff)</option>
+                <option value="processes">Processes</option>
+                <option value="files">Files</option>
+              </select>
+            </label>
+            <label class="form-check">
+              <span class="form-check-spacer" aria-hidden="true">Options</span>
+              <span class="form-check-row">
+                <input type="checkbox" name="recursive" checked />
+                Recurse directories (*.jsonl)
+              </span>
+            </label>
+          </div>
           <label>Server path (file or directory on the server)
             <input name="path" class="mono" placeholder="/var/log/fleet or ./samples/procs.jsonl" autocomplete="off" />
-          </label>
-          <label class="rules-enable" style="display:flex;gap:0.5rem;align-items:center;margin:0.35rem 0">
-            <input type="checkbox" name="recursive" checked />
-            Recurse directories (*.jsonl)
           </label>
           <label>Upload .jsonl / .json / .csv files
             <input type="file" id="addHostVirtualFiles" multiple accept=".jsonl,.ndjson,.json,.csv,text/*" />
           </label>
-          <label>Or upload a folder (day folder → create/update hosts by subdirectory)
+          <label>Or upload a folder (day folder → hosts by subdirectory)
             <input type="file" id="addHostVirtualDir" webkitdirectory directory multiple />
           </label>
-          <p id="addHostVirtualPickStatus" class="muted" style="font-size:0.78rem;margin:0.4rem 0 0;min-height:1.2em"></p>
+          <p id="addHostVirtualPickStatus" class="form-hint muted form-hint-status"></p>
           ${treeHostFromFieldsHtml("addVirt")}
           <div id="addVirtDisplayNameWrap" class="hidden">
             <label>Display name
               <input name="virtual_name" placeholder="siem-feed-prod" autocomplete="off" />
             </label>
-            <p class="muted" style="font-size:0.75rem;margin:0.25rem 0 0">Only needed for a single host (tree import off, or flat file upload). Same name updates an existing virtual host and adds a new scan.</p>
+            <p class="form-hint muted">Only needed for a single host (tree import off, or flat file upload). Same name updates an existing virtual host and adds a new scan.</p>
           </div>
           <div id="addHostVirtualProgress" class="hidden"></div>
-          <div id="addHostVirtualResult" class="hidden" style="margin-top:0.75rem"></div>
+          <div id="addHostVirtualResult" class="hidden add-host-virtual-result"></div>
+        </section>
+
+        <section class="form-section">
+          <h3 class="form-section-title">Labels</h3>
+          <div class="form-row form-row-3">
+            <label>Env
+              <input name="env" placeholder="prod" />
+            </label>
+            <label>Profile
+              <input name="profile" placeholder="web" />
+            </label>
+            <label>Region
+              <input name="region" placeholder="eu-west" />
+            </label>
+          </div>
+          <label>Tags <span class="field-optional">(optional, comma-separated)</span>
+            <input name="tags" placeholder="linux, pci" />
+          </label>
+        </section>
+
+        <section class="form-section">
+          ${autoCollectFieldsHtml({ labels: { scan_interval: "manual" }, idPrefix: "addHostAuto", showCheckbox: true, titled: true })}
+          <div id="addHostCollectPaths" class="hidden form-block-follow">
+            <label>Extra file paths to inventory (AgentLite)
+              <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh"></textarea>
+            </label>
+            <p class="form-hint muted">
+              Absolute files or directories (one per line, or comma-separated). Always merged with defaults (/bin, /usr/bin, /etc, /tmp, …).
+            </p>
+          </div>
+        </section>
+
+        <div id="addHostTestResult" aria-live="polite">
+          <div class="conn-test"><div class="muted">Test connection to verify SSH before Finish.</div></div>
         </div>
-        <div class="form-row">
-          <label>Env
-            <input name="env" placeholder="prod" />
-          </label>
-          <label>Profile
-            <input name="profile" placeholder="web" />
-          </label>
-          <label>Region
-            <input name="region" placeholder="eu-west" />
-          </label>
-        </div>
-        <label>Tags (optional, comma-separated)
-          <input name="tags" placeholder="linux, pci" />
-        </label>
-        ${autoCollectFieldsHtml({ labels: { scan_interval: "manual" }, idPrefix: "addHostAuto", showCheckbox: true })}
-        <div id="addHostCollectPaths" class="hidden" style="margin-top:0.65rem">
-          <label>Extra file paths to inventory (AgentLite)
-            <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh"></textarea>
-          </label>
-          <p class="muted" style="margin:0.25rem 0 0;font-size:0.75rem">
-            Absolute files or directories (one per line, or comma-separated). Always merged with defaults (/bin, /usr/bin, /etc, /tmp, …).
-          </p>
-        </div>
-        <div id="addHostTestResult"></div>
-        <div class="form-actions" style="justify-content:space-between;flex-wrap:wrap">
+        <div class="form-actions form-actions-split">
           <button type="button" class="btn ghost" id="btnTestHostConn">Test connection</button>
-          <div style="display:flex;gap:0.5rem">
+          <div class="form-actions-end">
             <button type="button" class="btn ghost" data-close-modal>Cancel</button>
             <button class="btn primary" type="submit">Finish</button>
           </div>
         </div>
       </form>
-    `);
+    `, { mode: "wide" });
     const typeSel = $("#addHostType");
     const listLabel = $("#addHostListLabel");
     const sshFields = $("#addHostSshFields");

@@ -109,7 +109,7 @@ struct Args {
     scan_timeout_secs: u64,
 
     /// Finished scans retained per host (newest kept).
-    #[arg(long, default_value_t = 3, env = "RUSTMITE_SCAN_HISTORY_PER_HOST")]
+    #[arg(long, default_value_t = 10, env = "RUSTMITE_SCAN_HISTORY_PER_HOST")]
     scan_history_per_host: usize,
 
     #[arg(long, default_value_t = 10, env = "RUSTMITE_SSH_CONNECT_TIMEOUT_SECS")]
@@ -387,6 +387,8 @@ async fn main() -> anyhow::Result<()> {
                     db = ch.database(),
                     "control-plane store loaded from ClickHouse"
                 );
+                // ClickHouse is authoritative — never let a stale JSON revive hosts.
+                rustmite_server::routes::discard_legacy_json_store(&args.store);
                 // One-shot cleanup: old modules.lkm compared every /sys/module entry
                 // (including built-ins like 8250) and flooded RM-KERN-0001. Only purge when
                 // the store still looks like that flood (>10 hits); real alerts stay.
@@ -500,6 +502,11 @@ async fn main() -> anyhow::Result<()> {
                                         "migrated legacy JSON store into ClickHouse"
                                     );
                                     store.clear_dirty();
+                                    // Drop the file so a later empty ClickHouse cannot
+                                    // re-import deleted hosts on the next restart.
+                                    rustmite_server::routes::discard_legacy_json_store(
+                                        &args.store,
+                                    );
                                 }
                                 Err(e) => tracing::warn!(
                                     error = %e,
@@ -517,9 +524,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                // save_control_plane refuses to TRUNCATE a non-empty volume with 0 hosts,
+                // so a failed load will not wipe durable data on the next flush.
+                tracing::error!(
                     error = %e,
-                    "ClickHouse load failed — starting with empty in-memory store"
+                    "ClickHouse control-plane load failed — UI starts empty this boot; \
+                     volume data is preserved. Fix connectivity / remount rustmite-ch-data and restart."
                 );
             }
         }
@@ -531,8 +541,6 @@ async fn main() -> anyhow::Result<()> {
             "control-plane store ready"
         );
 
-        // If RPL `events` is empty but we already have process observations in the
-        // control-plane store, backfill once so hunts work without a rescan.
         if let Err(e) = backfill_events_from_store(&ch, store.as_ref()).await {
             tracing::warn!(error = %e, "ClickHouse events backfill skipped");
         }
@@ -586,27 +594,69 @@ async fn main() -> anyhow::Result<()> {
             store.mark_dirty_public();
         }
     }
-    spawn_store_flusher(store.clone(), clickhouse_arc.clone());
+    spawn_store_flusher(
+        store.clone(),
+        clickhouse_arc.clone(),
+        args.store.clone(),
+    );
 
     if let Some(ch) = clickhouse_arc.clone() {
-        // Push on-disk virtual ingest / sift platform into ClickHouse.
-        let _ = rustmite_server::platform_ch::restore_sift_db(ch.as_ref()).await;
-        if let Ok(hosts) = store.list_hosts().await {
-            for h in hosts {
-                let is_v = h.agent_kind.eq_ignore_ascii_case("virtual")
-                    || h.auth_status
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case("virtual"))
-                        .unwrap_or(false);
-                if is_v {
-                    let _ = rustmite_server::platform_ch::restore_virtual_host(ch.as_ref(), h.id.0)
+        // Restore + reindex virtual ingest in the background so large fleets
+        // (tens of thousands of file rows per host) do not block :8080 readiness
+        // and fail the docker entrypoint health wait.
+        let store_bg = store.clone();
+        let ch_bg = ch.clone();
+        tokio::spawn(async move {
+            tracing::info!("background: restoring virtual ingest / indexing hunt events");
+            let _ = rustmite_server::platform_ch::restore_sift_db(ch_bg.as_ref()).await;
+            if let Ok(hosts) = store_bg.list_hosts().await {
+                let mut n = 0usize;
+                let mut skipped = 0usize;
+                for h in hosts {
+                    let is_v = h.agent_kind.eq_ignore_ascii_case("virtual")
+                        || h.auth_status
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case("virtual"))
+                            .unwrap_or(false);
+                    if !is_v {
+                        continue;
+                    }
+                    n += 1;
+                    // Hunt rows already in ClickHouse → skip restore+reindex.
+                    // Local JSONL is filled on demand (inventory views) and now
+                    // lives under the data volume (`…/ingest`), so it persists.
+                    if rustmite_server::platform_ch::virtual_host_events_present(
+                        ch_bg.as_ref(),
+                        h.id.0,
+                    )
+                    .await
+                    {
+                        skipped += 1;
+                        continue;
+                    }
+                    let _ = rustmite_server::platform_ch::restore_virtual_host(
+                        ch_bg.as_ref(),
+                        h.id.0,
+                    )
+                    .await;
+                    let _ = rustmite_server::platform_ch::sync_virtual_host(ch_bg.as_ref(), h.id.0)
                         .await;
-                    let _ =
-                        rustmite_server::platform_ch::sync_virtual_host(ch.as_ref(), h.id.0).await;
+                    let _ = rustmite_server::platform_ch::index_virtual_host_events(
+                        store_bg.as_ref(),
+                        ch_bg.as_ref(),
+                        h.id.0,
+                        false,
+                    )
+                    .await;
                 }
+                tracing::info!(
+                    virtual_hosts = n,
+                    skipped_ready = skipped,
+                    "background: virtual ingest restore/index done"
+                );
             }
-        }
-        rustmite_server::platform_ch::sync_sift_db(ch.as_ref()).await;
+            rustmite_server::platform_ch::sync_sift_db(ch_bg.as_ref()).await;
+        });
     }
 
     {
@@ -756,6 +806,7 @@ async fn main() -> anyhow::Result<()> {
         noise_keypair: Arc::new(noise_kp),
         noise_xx_enabled: args.noise_xx,
         cred_pubkey,
+        cred_pubkey_path: args.cred_pubkey.clone(),
         probe_limits,
         host_health,
         sift_platform: rustmite_server::sift_platform::SiftPlatform::default(),
@@ -764,6 +815,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         operator_auth,
         webauthn_rp: Arc::new(tokio::sync::RwLock::new(webauthn_rp)),
+        legacy_json_store: args.store.clone(),
     };
 
     let _ = rustmite_server::credentials::import_filesystem_credentials(&state).await;
@@ -804,7 +856,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("shutdown signal — persisting control-plane store");
         }
     }
-    if let Err(e) = persist_store(&store, clickhouse_arc.as_ref()).await {
+    if let Err(e) = persist_store(&store, clickhouse_arc.as_ref(), &args.store).await {
         tracing::error!(error = %e, "failed to persist store on shutdown");
     }
     Ok(())
@@ -878,16 +930,15 @@ async fn backfill_events_from_store(
 async fn persist_store(
     store: &InMemoryStore,
     ch: Option<&Arc<rustmite_server::clickhouse::ClickHouseClient>>,
+    legacy_json: &std::path::Path,
 ) -> anyhow::Result<()> {
-    if !store.is_dirty() && ch.is_some() {
-        // Still force-save on shutdown so a clean restart sees the latest snapshot.
-    }
     if let Some(ch) = ch {
         let snap = store.export_snapshot()?;
         ch.save_control_plane(&snap)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         store.clear_dirty();
+        rustmite_server::routes::discard_legacy_json_store(legacy_json);
         return Ok(());
     }
     store.save()?;
@@ -897,6 +948,7 @@ async fn persist_store(
 fn spawn_store_flusher(
     store: Arc<InMemoryStore>,
     ch: Option<Arc<rustmite_server::clickhouse::ClickHouseClient>>,
+    legacy_json: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -914,6 +966,7 @@ fn spawn_store_flusher(
                     Ok(snap) => match ch.save_control_plane(&snap).await {
                         Ok(n) => {
                             store.clear_dirty_if(gen);
+                            rustmite_server::routes::discard_legacy_json_store(&legacy_json);
                             tracing::debug!(rows = n, "control-plane store flushed to ClickHouse");
                         }
                         Err(e) => tracing::warn!(error = %e, "ClickHouse control-plane persist failed"),

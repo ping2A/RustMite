@@ -14,7 +14,7 @@ Adversary goals against RustMite: (a) steal fleet SSH credentials, (b) subvert r
 ## 3. Credential vault (defends a) — Sandfly-style node-only decrypt
 See also [Sandfly Credentials Security](https://docs.sandflysecurity.com/docs/credentials-security).
 
-- **Public-key sealed at rest.** SSH identities and passwords are encrypted to an X25519 public key (`cred.pub`). The matching private key lives **only on scanner nodes** (`cred.priv`). The control plane never holds a decrypt key.
+- **Public-key sealed at rest.** SSH identities and passwords are encrypted to an X25519 public key (`cred.pub`). The matching private key lives **only on scanner nodes** (`cred.priv`). The control plane never holds a decrypt key. The share appliance generates the keypair under `/opt/rustmite/vault/` and runs an embedded node so password hosts work out of the box (`RUSTMITE_EMBEDDED_NODE=0` to disable).
 - **Irreversible once added.** After upload, neither the UI nor the server can read credential plaintext again. To change a secret, delete and re-upload.
 - **Lease delivers ciphertext.** Nodes receive `ssh_*_box` blobs over TLS and decrypt in memory for the job only (`Zeroizing` buffers).
 - **Separation of duties.** A compromised server/DB yields only ciphertext. A powered-down node holds the private key but no stored fleet secrets. Compromising both is required to steal usable SSH credentials at rest.
@@ -29,9 +29,9 @@ See also [Sandfly Credentials Security](https://docs.sandflysecurity.com/docs/cr
 - **Coverage accounting** (`05` §6): a host that suddenly can't be inspected is flagged, so "clean because blind" is visible.
 
 ## 5. Tamper-evident audit (defends d)
-- `audit_log` is append-only with a **hash chain** (`hash = H(prev_hash || row)`); periodically anchor the head hash to an external store (or sign it) so silent history rewrites are detectable.
+- Operator UI/API actions are appended to the activity store with `kind` prefix `audit.` (plain-language action + entity-aware summary with host names, sanitized request body with secrets redacted, actor, role, method, path, status). Admins inspect them under **Settings → Audit log** / `GET /v1/audit`.
 - Every credential access, scan trigger, allowlist creation, check change, baseline capture, and response action is logged with actor, target, reason, timestamp.
-- Auditor role has read-only access to this log and nothing else.
+- Future: hash-chain the audit rows (`hash = H(prev_hash || row)`) and an auditor-only role for read-only access.
 
 ## 6. Non-repudiation & transparency toward monitored hosts
 - RustMite deliberately **does not** hide from the host: the SSH login is recorded in the host's own `wtmp`/`auth.log`, and the probe's PID is visible while it runs (`04` §5). This is an ethical and operational stance — a defensive scanner that behaves like a rootkit is indistinguishable from one, and undermines trust and forensics.

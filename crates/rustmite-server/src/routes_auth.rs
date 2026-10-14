@@ -107,17 +107,36 @@ async fn login(
     Json(body): Json<LoginBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = auth(&state);
-    let user = store
-        .authenticate(body.username.trim(), &body.password)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid credentials".into()))?;
+    let username = body.username.trim().to_string();
+    let user = match store.authenticate(&username, &body.password).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            crate::audit::audit_auth_event(
+                &state,
+                &username,
+                "login",
+                false,
+                serde_json::json!({ "reason": "invalid_credentials" }),
+            )
+            .await;
+            return Err((StatusCode::UNAUTHORIZED, "invalid credentials".into()));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
 
     if OperatorAuth::user_needs_mfa(&user) {
         let challenge_id = store
             .create_mfa_challenge(user.id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::audit::audit_auth_event(
+            &state,
+            &user.username,
+            "login_mfa_challenge",
+            true,
+            serde_json::json!({ "methods": OperatorAuth::user_mfa_methods(&user) }),
+        )
+        .await;
         return Ok(Json(serde_json::json!({
             "mfa_required": true,
             "challenge_id": challenge_id.to_string(),
@@ -129,6 +148,14 @@ async fn login(
         .create_session(&user, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::audit::audit_auth_event(
+        &state,
+        &user.username,
+        "login",
+        true,
+        serde_json::json!({ "role": user.role }),
+    )
+    .await;
     Ok(Json(serde_json::json!(AuthUserResponse {
         user: user.to_record(),
         token,
@@ -158,16 +185,40 @@ async fn verify_mfa(
         .create_session(&user, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::audit::audit_auth_event(
+        &state,
+        &user.username,
+        "login_mfa",
+        true,
+        serde_json::json!({ "role": user.role }),
+    )
+    .await;
     Ok(Json(AuthUserResponse {
         user: user.to_record(),
         token,
     }))
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ctx: Option<Extension<AuthContext>>,
+) -> StatusCode {
+    let username = ctx
+        .as_ref()
+        .map(|Extension(c)| c.username.as_str())
+        .unwrap_or("unknown");
     if let Some(token) = bearer_from_headers(&headers) {
         let _ = auth(&state).delete_session(token).await;
     }
+    crate::audit::audit_auth_event(
+        &state,
+        username,
+        "logout",
+        true,
+        serde_json::json!({}),
+    )
+    .await;
     StatusCode::NO_CONTENT
 }
 

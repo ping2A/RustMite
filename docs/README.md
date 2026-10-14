@@ -39,7 +39,7 @@ Read the documents in order. Each one is self-contained enough to be handed to a
 | 14 | [`14-implementation-guide.md`](14-implementation-guide.md) | Coding conventions, definition of done, ordering, pitfalls |
 | 15 | [`15-how-it-works.md`](15-how-it-works.md) | **Start here for intuition** — diagrams of scan flow, memfd delivery, collectors → findings |
 | 16 | [`16-operator-console.md`](16-operator-console.md) | Embedded web console: findings, hosts, RPL Hunt, checks |
-| 17 | [`17-rpl-clickhouse-noise.md`](17-rpl-clickhouse-noise.md) | RPL hunting APIs, ClickHouse index, Noise XX transport |
+| 17 | [`17-rpl-clickhouse-noise.md`](17-rpl-clickhouse-noise.md) | RPL hunting APIs, ClickHouse (dev + shared appliance image), Noise XX |
 | 18 | [`18-all-detections.md`](18-all-detections.md) | **Complete check catalog** generated from `checks/*.toml` |
 
 ### Suggested build order

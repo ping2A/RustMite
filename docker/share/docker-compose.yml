@@ -1,4 +1,4 @@
-# Shareable local stack: RustMite server (+ optional fixture node).
+# Shareable local stack: RustMite appliance (server + embedded ClickHouse).
 #
 # Build once from the repo root:
 #   docker compose -f docker/share/docker-compose.yml build
@@ -20,6 +20,7 @@ services:
     ports:
       - "8080:8080"
       - "8443:8443"
+      - "8123:8123"
     environment:
       RUST_LOG: info
       RUSTMITE_LISTEN: 0.0.0.0:8080
@@ -28,21 +29,32 @@ services:
       RUSTMITE_SEED_DEMO: "0"
       RUSTMITE_SCAN_SIM: "0"
       RUSTMITE_STORE: /opt/rustmite/data/store.json
+      RUSTMITE_INGEST_DIR: /opt/rustmite/data/ingest
       RUSTMITE_AUTH_FILE: /opt/rustmite/data/auth.json
       RUSTMITE_TLS_DIR: /opt/rustmite/tls
+      RUSTMITE_CRED_KEY: /opt/rustmite/vault/cred.priv
       RUSTMITE_CRED_PUBKEY: /opt/rustmite/vault/cred.pub
       RUSTMITE_VAULT_KEY_FILE: /opt/rustmite/vault/master.key
+      RUSTMITE_PROBE_DIR: /opt/rustmite/probes
+      RUSTMITE_EMBEDDED_NODE: "1"
+      RUSTMITE_EMBEDDED_CLICKHOUSE: "1"
+      RUSTMITE_CLICKHOUSE: "1"
+      RUSTMITE_CLICKHOUSE_URL: http://127.0.0.1:8123
+      RUSTMITE_CLICKHOUSE_USER: rustmite
+      RUSTMITE_CLICKHOUSE_PASSWORD: rustmite
+      RUSTMITE_CLICKHOUSE_DB: rustmite
     volumes:
       - rustmite-data:/opt/rustmite/data
       - rustmite-tls:/opt/rustmite/tls
       - rustmite-vault:/opt/rustmite/vault
+      - rustmite-ch-data:/var/lib/clickhouse
     command: ["server"]
     healthcheck:
       test: ["CMD", "curl", "-kfsS", "https://127.0.0.1:8080/v1/health"]
       interval: 15s
       timeout: 5s
-      retries: 10
-      start_period: 20s
+      retries: 12
+      start_period: 45s
 
   # Optional: fixture-mode node that posts RM-PROC-0001 findings into the server.
   node:
@@ -53,6 +65,8 @@ services:
     environment:
       RUST_LOG: info
       RUSTMITE_ALLOW_INSECURE: "1"
+      RUSTMITE_EMBEDDED_CLICKHOUSE: "0"
+      RUSTMITE_CLICKHOUSE: "0"
     command:
       [
         "node",
@@ -63,7 +77,14 @@ services:
       ]
     profiles: ["with-node"]
 
+# Fixed names so `docker compose` and bare `docker run -v rustmite-*:…` share
+# the same durable volumes across image upgrades.
 volumes:
   rustmite-data:
+    name: rustmite-data
   rustmite-tls:
+    name: rustmite-tls
   rustmite-vault:
+    name: rustmite-vault
+  rustmite-ch-data:
+    name: rustmite-ch-data

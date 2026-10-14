@@ -184,7 +184,6 @@ pub async fn create_virtual_host(
             body.replace,
         ) {
             Ok(s) => {
-                crate::platform_ch::sync_virtual_host_from_state(&state, host.id.0).await;
                 if body.create_scan {
                     match record_virtual_feed_scan(
                         &state,
@@ -200,6 +199,8 @@ pub async fn create_virtual_host(
                         }
                     }
                 }
+                // After scan observations exist, index JSONL (+ obs fallback) into Hunt.
+                crate::platform_ch::sync_virtual_host_from_state(&state, host.id.0).await;
                 import_summary = Some(s);
             }
             Err(e) => import_error = Some(e),
@@ -390,13 +391,17 @@ async fn record_virtual_feed_scan(
     if procs.is_empty() && files.is_empty() {
         return Err("no process/file rows to attach to scan".into());
     }
-    crate::ingest_tree::create_virtual_import_scan(
+    // Prefer accumulated provenance (covers chunked uploads); fall back to empty.
+    let (folders, file_names) = crate::sift_api::load_virtual_import_provenance(host);
+    crate::ingest_tree::create_virtual_import_scan_with_provenance(
         state,
         host,
         &procs,
         &files,
         &[],
         &format!("feed-import:{source}"),
+        &folders,
+        &file_names,
     )
     .await
 }
@@ -463,7 +468,6 @@ pub async fn import_virtual_feed(
         body.replace,
     )
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    crate::platform_ch::sync_virtual_host_from_state(&state, host.id.0).await;
 
     let mut scan_id = None;
     let mut scan_error = None;
@@ -476,6 +480,8 @@ pub async fn import_virtual_feed(
             }
         }
     }
+    // Index after scan so observation fallback can populate Hunt if JSONL alone fails.
+    crate::platform_ch::sync_virtual_host_from_state(&state, host.id.0).await;
 
     Ok(Json(serde_json::json!({
         "ok": true,

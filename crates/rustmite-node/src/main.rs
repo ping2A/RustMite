@@ -74,6 +74,11 @@ struct Args {
     #[arg(long, default_value = rustmite_crypto::DEFAULT_CRED_PUB_PATH, env = "RUSTMITE_CRED_PUBKEY")]
     cred_pubkey: PathBuf,
 
+    /// Only load/generate the credential keypair and exit (no control-plane connect).
+    /// Used by the share appliance entrypoint so `cred.pub` exists before the server starts.
+    #[arg(long, default_value_t = false)]
+    init_cred_keys: bool,
+
     /// Allow TOFU when host has no pinned key
     #[arg(long, default_value_t = true)]
     tofu: bool,
@@ -86,12 +91,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    if args.server.starts_with("http://") && !args.allow_insecure {
-        anyhow::bail!(
-            "refusing cleartext control-plane URL {} — use https:// (or pass --allow-insecure for local lab only)",
-            args.server
-        );
-    }
     let cred_key = rustmite_crypto::CredPrivateKey::load_or_generate(&args.cred_key, &args.cred_pubkey)
         .with_context(|| {
             format!(
@@ -107,6 +106,15 @@ async fn main() -> Result<()> {
         fingerprint = %cred_pub.to_hex(),
         "credential decrypt key ready (SSH secrets sealed to this public key)"
     );
+    if args.init_cred_keys {
+        return Ok(());
+    }
+    if args.server.starts_with("http://") && !args.allow_insecure {
+        anyhow::bail!(
+            "refusing cleartext control-plane URL {} — use https:// (or pass --allow-insecure for local lab only)",
+            args.server
+        );
+    }
     let cred_key = Arc::new(cred_key);
     let node_id = args.node_id.unwrap_or_else(Uuid::new_v4);
     let client = reqwest::Client::builder()

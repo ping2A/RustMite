@@ -67,6 +67,12 @@ pub struct ScanMeta {
     pub bytes_from_probe: u64,
     pub observation_count: u32,
     pub node_signature: Option<String>,
+    /// Virtual-import: folders that contributed JSONL/CSV to this snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_folders: Vec<String>,
+    /// Virtual-import: relative file paths ingested into this snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -13,8 +13,14 @@ examples/
 assets/*.psd
 **/*.md
 !README.md
+!docker/share/probes/README.md
 docker/ssh-matrix/.keys/
-docker/clickhouse/
+# Keep staged musl probe/loader ELFs for the appliance image.
+!docker/share/probes/
+!docker/share/probes/**/
+# Keep init.sql for the appliance image; omit compose-only files.
+docker/clickhouse/docker-compose.yml
+docker/clickhouse/**/data/
 *.pdb
 .env
 .env.*

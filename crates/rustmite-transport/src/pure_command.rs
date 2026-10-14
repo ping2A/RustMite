@@ -118,17 +118,25 @@ done
 echo '===AUTHKEYS==='
 while IFS=: read -r user _ uid _ _ home _; do
   [ -n "$home" ] || continue
-  f="$home/.ssh/authorized_keys"
-  if [ -r "$f" ]; then
-    printf '@@USER=%s@@PATH=%s@@\n' "$user" "$f"
-    cat "$f" 2>/dev/null || true
-  fi
+  for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+    if [ -r "$f" ]; then
+      printf '@@USER=%s@@PATH=%s@@\n' "$user" "$f"
+      cat "$f" 2>/dev/null || true
+    elif [ -e "$f" ]; then
+      # Present but unreadable for this euid — without sudo SSH Hunter stays empty.
+      printf '@@UNREADABLE@@USER=%s@@PATH=%s@@\n' "$user" "$f"
+    fi
+  done
 done < /etc/passwd 2>/dev/null
 echo '===HOSTKEYS==='
 for f in /etc/ssh/ssh_host_*.pub; do
-  [ -f "$f" ] || continue
-  printf '@@PATH=%s@@\n' "$f"
-  cat "$f" 2>/dev/null || true
+  [ -e "$f" ] || continue
+  if [ -r "$f" ]; then
+    printf '@@PATH=%s@@\n' "$f"
+    cat "$f" 2>/dev/null || true
+  else
+    printf '@@UNREADABLE@@PATH=%s@@\n' "$f"
+  fi
 done
 echo '===END==='
 "#;
@@ -1049,9 +1057,19 @@ pub fn assemble_pure_command_ndjson(
     {
         let body = section(stdout, "AUTHKEYS");
         let mut n = 0u32;
+        let mut denied = 0u32;
         let mut cur_user = String::new();
         let mut cur_path = String::new();
         for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("@@UNREADABLE@@USER=") {
+                if let Some((user, path_part)) = rest.split_once("@@PATH=") {
+                    let _ = (user, path_part.trim_end_matches("@@"));
+                    denied = denied.saturating_add(1);
+                }
+                cur_user.clear();
+                cur_path.clear();
+                continue;
+            }
             if let Some(rest) = line.strip_prefix("@@USER=") {
                 if let Some((user, path_part)) = rest.split_once("@@PATH=") {
                     cur_user = user.to_string();
@@ -1088,6 +1106,11 @@ pub fn assemble_pure_command_ndjson(
         let host_body = section(stdout, "HOSTKEYS");
         let mut cur_hk = String::new();
         for line in host_body.lines() {
+            if line.starts_with("@@UNREADABLE@@PATH=") {
+                denied = denied.saturating_add(1);
+                cur_hk.clear();
+                continue;
+            }
             if let Some(rest) = line.strip_prefix("@@PATH=") {
                 cur_hk = rest.trim_end_matches("@@").to_string();
                 continue;
@@ -1115,7 +1138,19 @@ pub fn assemble_pure_command_ndjson(
             }
         }
 
-        reports.push(CollectorReport::complete(CollectorId::SSH_KEYS, n, 0));
+        if n > 0 {
+            reports.push(CollectorReport::complete(CollectorId::SSH_KEYS, n, 0));
+        } else if denied > 0 || fp.euid.unwrap_or(0) != 0 {
+            reports.push(CollectorReport::unsupported(
+                CollectorId::SSH_KEYS,
+                format!(
+                    "no readable authorized_keys/host keys (euid={}; denied={denied}; enable ssh_sudo or SSH as root)",
+                    fp.euid.unwrap_or(0)
+                ),
+            ));
+        } else {
+            reports.push(CollectorReport::complete(CollectorId::SSH_KEYS, 0, 0));
+        }
     }
 
     // Always flag degraded fidelity (and note budget truncation when limits bite).

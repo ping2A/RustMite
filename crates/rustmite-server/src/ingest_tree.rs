@@ -1009,17 +1009,36 @@ async fn import_one_host_files(
         }
     }
 
-    crate::platform_ch::sync_virtual_host_from_state(state, host.id.0).await;
+    let ingest_names: Vec<String> = ingest_files.iter().map(|(n, _)| n.clone()).collect();
+    let _ = crate::sift_api::record_virtual_import_provenance(
+        &host,
+        Some(dirname),
+        &ingest_names,
+        replace,
+    );
+    let (folders, file_names) = crate::sift_api::load_virtual_import_provenance(&host);
+    let folders = if folders.is_empty() {
+        import_folders_from_files(Some(dirname), &ingest_names)
+    } else {
+        folders
+    };
+    let file_names = if file_names.is_empty() {
+        ingest_names
+    } else {
+        file_names
+    };
 
     let mut scan_id = None;
     if create_scan {
-        match create_virtual_import_scan(
+        match create_virtual_import_scan_with_provenance(
             state,
             &host,
             &all_proc,
             &all_file,
             &all_sock,
             &format!("tree-import:{dirname}"),
+            &folders,
+            &file_names,
         )
         .await
         {
@@ -1034,6 +1053,10 @@ async fn import_one_host_files(
             }
         }
     }
+
+    // Index JSONL (and scan-observation fallback) into ClickHouse *after* the
+    // import scan is recorded so Hunt sees rows even if JSONL timestamps were bad.
+    crate::platform_ch::sync_virtual_host_from_state(state, host.id.0).await;
 
     Ok(ImportTreeHostResult {
         dir: dirname.to_string(),
@@ -1054,6 +1077,30 @@ async fn import_one_host_files(
 /// every PulseSecure `file_information` row (40k+/host) OOMs the control plane.
 const MAX_FILE_OBS_IN_VIRTUAL_SCAN: usize = 1_500;
 
+/// Derive unique folder paths from ingested file relative paths + an optional root label.
+pub fn import_folders_from_files(root: Option<&str>, file_names: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut folders = BTreeSet::new();
+    if let Some(r) = root.map(str::trim).filter(|s| !s.is_empty()) {
+        folders.insert(r.replace('\\', "/"));
+    }
+    for name in file_names {
+        let n = name.replace('\\', "/").trim_start_matches("./").to_string();
+        if n.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = n.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        // All parent prefixes: a/b/c.jsonl → a, a/b
+        for i in 1..parts.len() {
+            folders.insert(parts[..i].join("/"));
+        }
+    }
+    folders.into_iter().collect()
+}
+
 /// Record a finished scan for a virtual-agent import (tree or single-host feed).
 /// Observations are stored so Scans / Hunt / checks can use the snapshot like a live scan.
 pub async fn create_virtual_import_scan(
@@ -1063,6 +1110,30 @@ pub async fn create_virtual_import_scan(
     files: &[RawFileEntry],
     socks: &[SocketObs],
     source: &str,
+) -> Result<Uuid, String> {
+    create_virtual_import_scan_with_provenance(
+        state,
+        host,
+        procs,
+        files,
+        socks,
+        source,
+        &[],
+        &[],
+    )
+    .await
+}
+
+/// Like [`create_virtual_import_scan`], also recording which folders/files fed the JSONL.
+pub async fn create_virtual_import_scan_with_provenance(
+    state: &AppState,
+    host: &HostRecord,
+    procs: &[RawLogEntry],
+    files: &[RawFileEntry],
+    socks: &[SocketObs],
+    source: &str,
+    import_folders: &[String],
+    import_files: &[String],
 ) -> Result<Uuid, String> {
     // Clear any stuck active scan for this host by completing as cancelled isn't available —
     // enqueue will conflict; try enqueue and surface a clear error.
@@ -1139,6 +1210,8 @@ pub async fn create_virtual_import_scan(
         bytes_from_probe: 0,
         observation_count: obs_count,
         node_signature: None,
+        import_folders: import_folders.to_vec(),
+        import_files: import_files.to_vec(),
     };
 
     state
@@ -1179,6 +1252,8 @@ pub async fn create_virtual_import_scan(
                 "files_total": files_total,
                 "files_in_scan": files_kept,
                 "files_truncated": files_truncated,
+                "import_folders": import_folders,
+                "import_files": import_files,
             })),
         })
         .await;
@@ -1252,5 +1327,19 @@ mod tests {
             resolve_host_name_ex("web-edge-01", "dirname", None, '-').as_str(),
             "web-edge-01"
         );
+    }
+
+    #[test]
+    fn import_folders_from_nested_jsonl_paths() {
+        let files = vec![
+            "HOST01/processes.jsonl".into(),
+            "HOST01/logs/files.jsonl".into(),
+            "flat.jsonl".into(),
+        ];
+        let folders = import_folders_from_files(Some("day-2026-05-11"), &files);
+        assert!(folders.iter().any(|f| f == "day-2026-05-11"));
+        assert!(folders.iter().any(|f| f == "HOST01"));
+        assert!(folders.iter().any(|f| f == "HOST01/logs"));
+        assert!(!folders.iter().any(|f| f.ends_with(".jsonl")));
     }
 }

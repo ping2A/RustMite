@@ -366,6 +366,8 @@ async fn finish_scan(
         bytes_from_probe: 12_000,
         observation_count: 80,
         node_signature: None,
+    import_folders: vec![],
+    import_files: vec![],
     };
     store
         .complete_scan(CompleteScan {

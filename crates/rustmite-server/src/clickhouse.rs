@@ -325,6 +325,66 @@ impl ClickHouseClient {
         Ok(())
     }
 
+    /// Ensure RPL hunt `events` (+ detection_signals) exist — same DDL as
+    /// `docker/clickhouse/init.sql`, so a missing initdb step cannot leave Hunt broken.
+    pub async fn ensure_events_schema(&self) -> Result<(), ClickHouseError> {
+        self.query_raw(
+            "CREATE TABLE IF NOT EXISTS events \
+             ( \
+               id UUID DEFAULT generateUUIDv7(), \
+               timestamp DateTime64(6, 'UTC'), \
+               message String, \
+               source_type LowCardinality(String) DEFAULT 'rustmite_probe', \
+               source LowCardinality(String) DEFAULT '', \
+               ingest_time DateTime64(6, 'UTC') DEFAULT now64(6), \
+               platform LowCardinality(String) DEFAULT 'linux', \
+               host_id String DEFAULT '', \
+               host_name String DEFAULT '', \
+               scan_id String DEFAULT '', \
+               collector LowCardinality(String) DEFAULT '', \
+               kind LowCardinality(String) DEFAULT '', \
+               check_id LowCardinality(String) DEFAULT '', \
+               data_type LowCardinality(String) DEFAULT '', \
+               process_name LowCardinality(String) DEFAULT '', \
+               process_id UInt32 DEFAULT 0, \
+               user LowCardinality(String) DEFAULT '', \
+               path String DEFAULT '', \
+               src_ip String DEFAULT '', \
+               dest_ip String DEFAULT '', \
+               file_hash String DEFAULT '', \
+               severity LowCardinality(String) DEFAULT 'info', \
+               exe_memfd UInt8 DEFAULT 0, \
+               ext String DEFAULT '{}' \
+             ) \
+             ENGINE = MergeTree \
+             PARTITION BY toYYYYMMDD(timestamp) \
+             ORDER BY (platform, host_id, timestamp, id) \
+             TTL toDateTime(timestamp) + INTERVAL 90 DAY \
+             SETTINGS index_granularity = 8192",
+        )
+        .await?;
+        let _ = self
+            .query_raw(
+                "CREATE TABLE IF NOT EXISTS detection_signals \
+                 ( \
+                   rule_id UUID, \
+                   rule_name String, \
+                   matched_at DateTime64(6, 'UTC') DEFAULT now64(6), \
+                   event_id UUID, \
+                   host_id String, \
+                   dedup_key String, \
+                   prevalence Float64 DEFAULT 0, \
+                   payload String \
+                 ) \
+                 ENGINE = MergeTree \
+                 PARTITION BY toYYYYMMDD(matched_at) \
+                 ORDER BY (rule_id, matched_at) \
+                 TTL toDateTime(matched_at) + INTERVAL 90 DAY",
+            )
+            .await;
+        Ok(())
+    }
+
     /// Ensure control-plane tables exist (safe to call on every start).
     pub async fn ensure_control_plane_schema(&self) -> Result<(), ClickHouseError> {
         self.query_raw(
@@ -342,6 +402,7 @@ impl ClickHouseClient {
         )
         .await?;
         self.ensure_platform_blobs_schema().await?;
+        self.ensure_events_schema().await?;
         Ok(())
     }
 
@@ -463,6 +524,26 @@ impl ClickHouseClient {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Table may not exist yet in fresh installs.
+                let msg = e.to_string();
+                if msg.contains("UNKNOWN_TABLE") || msg.contains("doesn't exist") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Remove only virtual-ingest hunt rows for a host (keeps real probe scan events).
+    pub async fn delete_virtual_events_for_host(&self, host_id: &str) -> Result<(), ClickHouseError> {
+        let hid = host_id.replace('\\', "\\\\").replace('\'', "\\'");
+        let sql = format!(
+            "ALTER TABLE events DELETE WHERE (host_id = '{hid}' OR host_name = '{hid}') \
+             AND source = 'virtual_ingest'"
+        );
+        match self.query_raw(&sql).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("UNKNOWN_TABLE") || msg.contains("doesn't exist") {
                     Ok(())
@@ -596,6 +677,17 @@ impl ClickHouseClient {
         snap: &rustmite_store::StoreSnapshot,
     ) -> Result<usize, ClickHouseError> {
         self.ensure_control_plane_schema().await?;
+
+        // Safety: never TRUNCATE a populated fleet with an empty in-memory snapshot.
+        // That happens when ClickHouse load fails on upgrade (auth/URL blip) and the
+        // flusher would otherwise wipe durable hosts on the next dirty tick.
+        let existing = self.control_plane_entity_count().await.unwrap_or(0);
+        if snap.hosts.is_empty() && existing > 0 {
+            return Err(ClickHouseError::Msg(format!(
+                "refusing to overwrite non-empty control plane ({existing} rows) with 0 hosts — \
+                 check ClickHouse connectivity / volume mounts; use --reset-store to wipe deliberately"
+            )));
+        }
 
         // Drop prior live rows so deletes (removed hosts/findings) actually disappear.
         // Truncate + reinsert is fine for lab / mid-size fleets and matches snapshot semantics.

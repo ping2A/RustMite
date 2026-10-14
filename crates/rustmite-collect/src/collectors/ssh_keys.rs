@@ -25,19 +25,40 @@ impl Collector for SshKeysCollector {
         sink: &mut dyn ObservationSink,
     ) -> Result<CollectorReport, CollectError> {
         let mut count = 0u32;
-        for (rel_path, username) in authorized_key_targets(ctx) {
-            let data = match ctx.fs.read(&rel_path).or_else(|_| {
+        let mut denied = 0u32;
+        let targets = authorized_key_targets(ctx);
+        for (rel_path, username) in &targets {
+            let data = match ctx.fs.read(rel_path).or_else(|_| {
                 ctx.proc
-                    .read(&rel_path)
+                    .read(rel_path)
                     .or_else(|_| ctx.fs.read(rel_path.trim_start_matches('/')))
             }) {
                 Ok(d) => d,
+                Err(rustmite_sys::Errno::PermissionDenied) => {
+                    denied = denied.saturating_add(1);
+                    continue;
+                }
                 Err(_) => continue,
             };
-            count = count.saturating_add(emit_keys(ctx, sink, &rel_path, &username, &data)?);
+            count = count.saturating_add(emit_keys(ctx, sink, rel_path, username, &data)?);
         }
-        count = count.saturating_add(emit_host_keys(ctx, sink)?);
-        Ok(CollectorReport::complete(CollectorId::SSH_KEYS, count, 0))
+        let (host_n, host_denied) = emit_host_keys(ctx, sink)?;
+        count = count.saturating_add(host_n);
+        denied = denied.saturating_add(host_denied);
+
+        if count > 0 {
+            return Ok(CollectorReport::complete(CollectorId::SSH_KEYS, count, 0));
+        }
+        if denied > 0 || (ctx.euid != 0 && !targets.is_empty()) {
+            return Ok(CollectorReport::unsupported(
+                CollectorId::SSH_KEYS,
+                format!(
+                    "no readable authorized_keys/host keys (euid={}; denied={denied}; enable ssh_sudo or SSH as root)",
+                    ctx.euid
+                ),
+            ));
+        }
+        Ok(CollectorReport::complete(CollectorId::SSH_KEYS, 0, 0))
     }
 }
 
@@ -76,14 +97,18 @@ fn authorized_key_targets(ctx: &CollectCtx<'_>) -> Vec<(String, String)> {
 fn emit_host_keys(
     ctx: &CollectCtx<'_>,
     sink: &mut dyn ObservationSink,
-) -> Result<u32, CollectError> {
+) -> Result<(u32, u32), CollectError> {
     let mut count = 0u32;
+    let mut denied = 0u32;
     let names = match ctx.fs.list_dir("etc/ssh") {
         Ok(ents) => ents
             .into_iter()
             .filter_map(|e| String::from_utf8(e.name).ok())
             .filter(|n| n.starts_with("ssh_host_") && n.ends_with(".pub"))
             .collect::<Vec<_>>(),
+        Err(rustmite_sys::Errno::PermissionDenied) => {
+            return Ok((0, 1));
+        }
         Err(_) => vec![
             "ssh_host_ed25519_key.pub".into(),
             "ssh_host_rsa_key.pub".into(),
@@ -94,6 +119,10 @@ fn emit_host_keys(
         let rel = format!("etc/ssh/{name}");
         let data = match ctx.fs.read(&rel) {
             Ok(d) => d,
+            Err(rustmite_sys::Errno::PermissionDenied) => {
+                denied = denied.saturating_add(1);
+                continue;
+            }
             Err(_) => continue,
         };
         let s = String::from_utf8_lossy(&data);
@@ -117,7 +146,7 @@ fn emit_host_keys(
         )?;
         count = count.saturating_add(1);
     }
-    Ok(count)
+    Ok((count, denied))
 }
 
 fn host_key_changed(ctx: &CollectCtx<'_>, fingerprint: &str) -> bool {

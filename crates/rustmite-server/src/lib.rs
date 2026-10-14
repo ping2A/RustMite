@@ -3,6 +3,7 @@
 #![recursion_limit = "512"]
 
 pub mod anomark_api;
+pub mod audit;
 pub mod auth;
 pub mod operator_auth;
 pub mod routes_auth;

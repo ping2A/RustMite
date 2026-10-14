@@ -93,7 +93,7 @@ impl InMemoryStore {
             persist_path: Mutex::new(None),
             dirty: AtomicBool::new(false),
             dirty_gen: std::sync::atomic::AtomicU64::new(0),
-            scan_history_per_host: std::sync::atomic::AtomicUsize::new(3),
+            scan_history_per_host: std::sync::atomic::AtomicUsize::new(10),
         }
     }
 
@@ -1117,6 +1117,55 @@ impl Store for InMemoryStore {
         Ok(removed)
     }
 
+    async fn clear_all_hosts(&self) -> StoreResult<usize> {
+        let removed = self.hosts.len();
+        self.hosts.clear();
+        self.hosts_by_name.clear();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // Host rows own the scan/finding graph; wipe the dependent tables so the
+        // Hosts view and Data counts stay consistent after "Clear all".
+        inner.jobs.clear();
+        inner.metas.clear();
+        inner.observations.clear();
+        inner.findings.clear();
+        inner.host_keys.clear();
+        inner.baselines.clear();
+        inner.activity.retain(|a| a.host_id.is_none());
+        inner.ssh_placements.clear();
+        inner.ssh_keys.clear();
+        drop(inner);
+        if removed > 0 {
+            self.mark_dirty();
+        }
+        Ok(removed)
+    }
+
+    async fn clear_all_ssh_hunter(&self) -> StoreResult<usize> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let removed = inner.ssh_keys.len() + inner.ssh_placements.len();
+        inner.ssh_keys.clear();
+        inner.ssh_placements.clear();
+        drop(inner);
+        if removed > 0 {
+            self.mark_dirty();
+        }
+        Ok(removed)
+    }
+
+    async fn clear_all_ssh_zones(&self) -> StoreResult<usize> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let removed = inner.ssh_zones.len();
+        inner.ssh_zones.clear();
+        drop(inner);
+        if removed > 0 {
+            self.mark_dirty();
+        }
+        Ok(removed)
+    }
+
     async fn prune_scan_history(
         &self,
         host_id: Option<HostId>,
@@ -1842,6 +1891,8 @@ mod tests {
             bytes_from_probe: 0,
             observation_count: 1,
             node_signature: None,
+        import_folders: vec![],
+        import_files: vec![],
         };
         store
             .complete_scan(CompleteScan {
@@ -2205,6 +2256,8 @@ mod tests {
                         bytes_from_probe: 0,
                         observation_count: 0,
                         node_signature: None,
+                    import_folders: vec![],
+                    import_files: vec![],
                     },
                 );
             }

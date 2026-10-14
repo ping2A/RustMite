@@ -8,6 +8,8 @@ use rustmite_sift::PlatformStore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use rustmite_store::{InMemoryStore, Store};
+
 use crate::clickhouse::ClickHouseClient;
 use crate::routes::AppState;
 
@@ -17,10 +19,10 @@ pub const KIND_ANOMARK_TRAINING: &str = "anomark_training";
 pub const KIND_SIFT_DB: &str = "sift_platform_db";
 
 fn ingest_dir() -> PathBuf {
-    PathBuf::from(".dev/ingest")
+    crate::sift_api::ingest_dir()
 }
 
-/// Remove `.dev/ingest/{host_id}/` if present. Used by [`purge_host_artifacts`].
+/// Remove the host virtual-ingest directory if present. Used by [`purge_host_artifacts`].
 pub fn remove_virtual_ingest_dir(host_id: Uuid) -> Result<bool, String> {
     let dir = ingest_dir().join(host_id.to_string());
     if !dir.exists() {
@@ -102,13 +104,163 @@ pub async fn sync_virtual_host_from_state(state: &AppState, host_id: Uuid) {
     if let Err(e) = sync_virtual_host(ch, host_id).await {
         warn!(error = %e, %host_id, "ClickHouse virtual ingest sync failed");
     }
+    // Re-index process/file JSONL into `events` so RPL Hunt can search virtual hosts.
+    if let Err(e) = index_virtual_host_events(state.store.as_ref(), ch, host_id, true).await {
+        warn!(error = %e, %host_id, "ClickHouse virtual events index failed");
+    }
+}
+
+/// Count existing virtual-ingest hunt rows for a host (UUID or display name).
+async fn virtual_events_count(
+    ch: &ClickHouseClient,
+    host_key: &str,
+) -> Result<u64, crate::clickhouse::ClickHouseError> {
+    let hid = host_key.replace('\\', "\\\\").replace('\'', "\\'");
+    let raw = ch
+        .query_raw(&format!(
+            "SELECT count() FROM events WHERE (host_id = '{hid}' OR host_name = '{hid}') \
+             AND source = 'virtual_ingest'"
+        ))
+        .await?;
+    Ok(raw.trim().parse().unwrap_or(0))
+}
+
+/// True when ClickHouse already has hunt rows for this virtual host (skip boot restore).
+pub async fn virtual_host_events_present(ch: &ClickHouseClient, host_id: Uuid) -> bool {
+    match virtual_events_count(ch, &host_id.to_string()).await {
+        Ok(n) if n > 0 => true,
+        _ => false,
+    }
+}
+
+/// Replace ClickHouse virtual-ingest `events` rows for a host from on-disk JSONL.
+///
+/// When `force` is false, skip work if hunt rows already exist (fast docker upgrades).
+pub async fn index_virtual_host_events(
+    store: &InMemoryStore,
+    ch: &ClickHouseClient,
+    host_id: Uuid,
+    force: bool,
+) -> Result<(), crate::clickhouse::ClickHouseError> {
+    let host = match store.get_host(rustmite_proto::HostId(host_id)).await {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+    // Make sure the hunt table exists even if docker initdb was skipped.
+    ch.ensure_events_schema().await?;
+
+    if !force {
+        let existing = virtual_events_count(ch, &host_id.to_string())
+            .await
+            .unwrap_or(0);
+        let by_name = if existing == 0 && host.display_name.trim() != host_id.to_string() {
+            virtual_events_count(ch, host.display_name.trim())
+                .await
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if existing + by_name > 0 {
+            info!(
+                %host_id,
+                events = existing + by_name,
+                "virtual ingest events already present — skip reindex"
+            );
+            return Ok(());
+        }
+    }
+
+    let procs = crate::sift_api::load_virtual_jsonl(&host);
+    let files = crate::sift_api::load_virtual_files_jsonl(&host);
+
+    // Drop prior virtual-ingest events only (keep real probe scan rows if any).
+    let _ = ch
+        .delete_virtual_events_for_host(&host_id.to_string())
+        .await;
+    if host.display_name.trim() != host_id.to_string() {
+        let _ = ch
+            .delete_virtual_events_for_host(&host.display_name)
+            .await;
+    }
+
+    let mut rows = crate::events_ingest::virtual_processes_to_events(
+        host_id,
+        &host.display_name,
+        &procs,
+    );
+    rows.extend(crate::events_ingest::virtual_files_to_events(
+        host_id,
+        &host.display_name,
+        &files,
+    ));
+
+    // Fallback: if JSONL is empty but the host already has process/file scan
+    // observations (virtual-import), fan those into Hunt so RPL is not empty.
+    if rows.is_empty() {
+        if let Ok(obs) = store
+            .list_observations(Some(rustmite_proto::HostId(host_id)), 50_000)
+            .await
+        {
+            let now = crate::sys_metrics::utc_now_rfc3339();
+            let mut by_scan: std::collections::HashMap<
+                Uuid,
+                Vec<rustmite_proto::Observation>,
+            > = std::collections::HashMap::new();
+            for o in obs {
+                if matches!(
+                    o.kind.as_str(),
+                    "process" | "file_meta" | "file_entropy" | "socket"
+                ) {
+                    by_scan.entry(o.scan_id.0).or_default().push(o.data);
+                }
+            }
+            for (scan_id, observations) in by_scan {
+                let ctx = crate::events_ingest::EventContext {
+                    host_id,
+                    host_name: &host.display_name,
+                    scan_id,
+                    collector: "virtual.import",
+                    timestamp: &now,
+                };
+                rows.extend(crate::events_ingest::observations_to_events(
+                    &ctx,
+                    &observations,
+                ));
+            }
+            // Tag fallback rows as virtual_ingest so re-index deletes stay scoped.
+            for row in &mut rows {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("source".into(), serde_json::json!("virtual_ingest"));
+                    obj.insert(
+                        "source_type".into(),
+                        serde_json::json!("rustmite_virtual"),
+                    );
+                }
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for chunk in rows.chunks(500) {
+        ch.insert_json_each_row("events", chunk).await?;
+    }
+    info!(
+        %host_id,
+        processes = procs.len(),
+        files = files.len(),
+        events = rows.len(),
+        "indexed virtual ingest into ClickHouse events"
+    );
+    Ok(())
 }
 
 /// Remove all host-scoped artifacts outside the control-plane store.
 ///
 /// Called after [`Store::delete_host`] (which already cascades scans, findings,
 /// observations, baselines, activity, and SSH placements). This covers:
-/// - on-disk virtual ingest (`.dev/ingest/{host_id}/`)
+/// - on-disk virtual ingest (`ingest/{host_id}/`)
 /// - ClickHouse `rm_platform_blobs` virtual process/file payloads
 /// - ClickHouse `events` rows for this host id (and display name when known)
 ///
@@ -181,6 +333,7 @@ pub async fn purge_all_virtual_ingest(state: &AppState) -> usize {
                     for kind in [KIND_VIRTUAL_PROCESSES, KIND_VIRTUAL_FILES] {
                         let _ = ch.delete_platform_blob(kind, &sid).await;
                     }
+                    let _ = ch.delete_events_for_host(&sid).await;
                 }
             } else if let Err(e) = fs::remove_dir_all(&path) {
                 warn!(error = %e, path = %path.display(), "virtual ingest purge failed");
@@ -198,6 +351,10 @@ pub async fn ensure_virtual_local(state: &AppState, host_id: Uuid) {
     };
     if let Err(e) = restore_virtual_host(ch, host_id).await {
         warn!(error = %e, %host_id, "ClickHouse virtual ingest restore failed");
+    }
+    // Soft reindex — skip when hunt rows already exist (inventory views must stay cheap).
+    if let Err(e) = index_virtual_host_events(state.store.as_ref(), ch, host_id, false).await {
+        warn!(error = %e, %host_id, "ClickHouse virtual events index failed");
     }
 }
 

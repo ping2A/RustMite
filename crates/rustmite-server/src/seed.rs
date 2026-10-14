@@ -648,6 +648,8 @@ pub async fn seed_demo(
             bytes_from_probe: 2_000 + (mix(idx) % 80_000) as u64,
             observation_count: 50 + (mix(idx) % 5_000),
             node_signature: None,
+        import_folders: vec![],
+        import_files: vec![],
         };
         store
             .complete_scan(CompleteScan {

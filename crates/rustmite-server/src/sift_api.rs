@@ -22,10 +22,39 @@ use uuid::Uuid;
 use crate::routes::{ApiError, AppState};
 
 fn sift_root() -> PathBuf {
+    // Prefer durable data dir next to RUSTMITE_STORE when set (docker volume).
+    if let Ok(store) = std::env::var("RUSTMITE_STORE") {
+        let store = PathBuf::from(store.trim());
+        if let Some(parent) = store.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("sift-platform");
+            }
+        }
+    }
     PathBuf::from(".dev/sift-platform")
 }
 
-fn ingest_dir() -> PathBuf {
+/// On-disk virtual ingest JSONL root (`processes.jsonl` / `files.jsonl` per host).
+///
+/// Resolution order:
+/// 1. `RUSTMITE_INGEST_DIR`
+/// 2. `<parent of RUSTMITE_STORE>/ingest` (docker: `/opt/rustmite/data/ingest`)
+/// 3. `.dev/ingest` (local dev)
+pub fn ingest_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("RUSTMITE_INGEST_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(store) = std::env::var("RUSTMITE_STORE") {
+        let store = PathBuf::from(store.trim());
+        if let Some(parent) = store.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("ingest");
+            }
+        }
+    }
     PathBuf::from(".dev/ingest")
 }
 
@@ -1100,6 +1129,92 @@ pub async fn host_by_ingest_token(
         })
 }
 
+/// Accumulate import provenance (folders/files) under `ingest/{host}/import_provenance.json`.
+/// Survives chunked uploads so the final virtual-import scan can list every source folder.
+pub fn record_virtual_import_provenance(
+    host: &HostRecord,
+    source_path: Option<&str>,
+    source_files: &[String],
+    replace: bool,
+) -> Result<(), String> {
+    ensure_sift_dirs();
+    let dir = ingest_dir().join(host.id.0.to_string());
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("import_provenance.json");
+    let mut folders: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    if !replace && path.is_file() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(arr) = v.get("folders").and_then(|x| x.as_array()) {
+                    for f in arr {
+                        if let Some(s) = f.as_str() {
+                            folders.push(s.to_string());
+                        }
+                    }
+                }
+                if let Some(arr) = v.get("files").and_then(|x| x.as_array()) {
+                    for f in arr {
+                        if let Some(s) = f.as_str() {
+                            files.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    folders.extend(
+        crate::ingest_tree::import_folders_from_files(source_path, source_files)
+            .into_iter(),
+    );
+    files.extend(source_files.iter().cloned());
+    folders.sort();
+    folders.dedup();
+    files.sort();
+    files.dedup();
+    let payload = serde_json::json!({
+        "folders": folders,
+        "files": files,
+        "source_path": source_path,
+        "updated_at": crate::sys_metrics::utc_now_rfc3339(),
+    });
+    fs::write(&path, serde_json::to_string_pretty(&payload).unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read accumulated import folders/files for a virtual host (empty if none).
+pub fn load_virtual_import_provenance(host: &HostRecord) -> (Vec<String>, Vec<String>) {
+    let path = ingest_dir()
+        .join(host.id.0.to_string())
+        .join("import_provenance.json");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (Vec::new(), Vec::new());
+    };
+    let folders = v
+        .get("folders")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let files = v
+        .get("files")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (folders, files)
+}
+
 pub fn append_virtual_process_logs(host: &HostRecord, body: &str) -> Result<usize, String> {
     append_virtual_logs(host, "processes.jsonl", body)
 }
@@ -1219,6 +1334,12 @@ pub struct VirtualImportSummary {
     pub files_appended: usize,
     pub skipped: usize,
     pub results: Vec<VirtualImportFileResult>,
+    /// Relative paths / names of ingested JSONL/CSV files (for scan provenance).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_files: Vec<String>,
+    /// Optional server root path that was imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 /// Collect ingestible paths the way IronSift does:
@@ -1797,6 +1918,10 @@ pub fn import_virtual_feed_data_opts(
         }
     }
 
+    let source_path = path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let mut summary = VirtualImportSummary {
         host_id: host.id.0,
         files_processed: 0,
@@ -1804,12 +1929,11 @@ pub fn import_virtual_feed_data_opts(
         files_appended: 0,
         skipped: 0,
         results: Vec::new(),
+        source_files: Vec::new(),
+        source_path: source_path.clone(),
     };
 
-    let root_for_names = path
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    let root_for_names = source_path.as_ref().map(PathBuf::from);
 
     let mut all_proc = String::new();
     let mut all_file = String::new();
@@ -1842,6 +1966,7 @@ pub fn import_virtual_feed_data_opts(
         summary.skipped += res.skipped;
         summary.processes_appended += res.processes;
         summary.files_appended += res.files;
+        summary.source_files.push(name);
         all_proc.push_str(&proc);
         all_file.push_str(&file);
         summary.results.push(res);
@@ -1854,6 +1979,7 @@ pub fn import_virtual_feed_data_opts(
         summary.skipped += res.skipped;
         summary.processes_appended += res.processes;
         summary.files_appended += res.files;
+        summary.source_files.push(name.clone());
         all_proc.push_str(&proc);
         all_file.push_str(&file);
         summary.results.push(res);
@@ -1880,6 +2006,12 @@ pub fn import_virtual_feed_data_opts(
     } else if replace {
         let _ = replace_virtual_file_logs(host, "");
     }
+    let _ = record_virtual_import_provenance(
+        host,
+        summary.source_path.as_deref(),
+        &summary.source_files,
+        replace,
+    );
     // ClickHouse sync is done by async callers via platform_ch::sync_virtual_host_from_state.
     if summary.processes_appended == 0 && summary.files_appended == 0 {
         let hints: Vec<String> = summary

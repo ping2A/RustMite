@@ -47,6 +47,8 @@ pub struct AppState {
     /// Fleet credential encryption public key — server seals, only nodes open
     /// ([Sandfly-style](https://docs.sandflysecurity.com/docs/credentials-security)).
     pub cred_pubkey: Arc<tokio::sync::RwLock<Option<rustmite_crypto::CredPublicKey>>>,
+    /// Where to persist `cred.pub` when a scanner node registers (matches `--cred-pubkey`).
+    pub cred_pubkey_path: PathBuf,
     /// Live-editable probe/agent resource envelope (memory, CPU, bandwidth, deadlines).
     pub probe_limits: Arc<tokio::sync::RwLock<rustmite_proto::Limits>>,
     /// Live-editable fleet host reachability checker (Settings panel).
@@ -59,6 +61,9 @@ pub struct AppState {
     pub operator_auth: Arc<OperatorAuth>,
     /// Live-editable WebAuthn origin / RP ID (Settings + `--webauthn-*` flags).
     pub webauthn_rp: Arc<tokio::sync::RwLock<crate::webauthn::WebauthnRpConfig>>,
+    /// Legacy JSON store path (`RUSTMITE_STORE`). Removed once ClickHouse is source of truth
+    /// so an empty `cp_entities` cannot resurrect deleted hosts from a stale file.
+    pub legacy_json_store: PathBuf,
 }
 
 pub fn operator_router(state: AppState) -> Router {
@@ -224,9 +229,15 @@ pub fn operator_router(state: AppState) -> Router {
             get(crate::sift_platform::get_anomark_config)
                 .post(crate::sift_platform::set_anomark_config),
         )
+        .route("/v1/audit", get(crate::audit::list_audit))
         .merge(crate::ingest_virtual::virtual_ingest_routes())
         .merge(crate::virtual_agents::virtual_agent_routes())
         .merge(crate::anomark_api::anomark_routes())
+        // Innermost → outermost: audit (needs AuthContext) → auth → CORS.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::audit::audit_ui_actions,
+        ))
         .layer(middleware::from_fn(move |req, next| {
             let gate = gate.clone();
             async move { require_auth(gate, req, next).await }
@@ -596,7 +607,7 @@ pub struct DataClearBody {
 }
 
 fn count_virtual_ingest_dirs() -> (usize, u64) {
-    let root = std::path::PathBuf::from(".dev/ingest");
+    let root = crate::sift_api::ingest_dir();
     let Ok(rd) = std::fs::read_dir(&root) else {
         return (0, 0);
     };
@@ -780,14 +791,19 @@ async fn data_summary(State(state): State<AppState>) -> Result<impl IntoResponse
                 "items": ["events", "virtual_ingest"]
             },
             {
+                "id": "inventory",
+                "title": "Inventory",
+                "items": ["hosts", "ssh_hunter", "ssh_zones"]
+            },
+            {
                 "id": "credentials",
                 "title": "Credentials",
                 "items": ["ssh_identities", "ssh_passwords"]
             },
             {
-                "id": "inventory",
-                "title": "Inventory (kept on Clear all)",
-                "items": ["hosts", "nodes", "ssh_keys", "ssh_placements", "ssh_zones"]
+                "id": "kept",
+                "title": "Kept on Clear all",
+                "items": ["nodes"]
             },
             {
                 "id": "platform",
@@ -813,21 +829,30 @@ async fn data_clear(
     if targets.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "targets required (findings, scans, observations, activity, baselines, host_keys, events, virtual_ingest, ssh_identities, ssh_passwords, or all)".into(),
+            "targets required (findings, scans, observations, activity, baselines, host_keys, hosts, ssh_hunter, ssh_zones, events, virtual_ingest, ssh_identities, ssh_passwords, or all)".into(),
         ));
     }
     let all = targets.iter().any(|t| t == "all");
-    // "all" clears operational + hunt only — credentials must be cleared explicitly.
-    let want = |name: &str| {
-        if matches!(name, "ssh_identities" | "ssh_passwords") {
-            targets.iter().any(|t| t == name)
-        } else {
-            all || targets.iter().any(|t| t == name)
-        }
-    };
+    // "all" wipes operational + hunt + inventory + credentials. Nodes are kept (re-register).
+    let want = |name: &str| all || targets.iter().any(|t| t == name);
 
     let mut purged = serde_json::Map::new();
 
+    // Hosts first: cascades scans/findings/baselines/keys/hunter placements.
+    if want("hosts") {
+        let before: Vec<_> = state
+            .store
+            .list_hosts()
+            .await?
+            .into_iter()
+            .map(|h| (h.id.0, h.display_name.clone()))
+            .collect();
+        let n = state.store.clear_all_hosts().await?;
+        for (id, name) in &before {
+            crate::platform_ch::purge_host_artifacts(&state, *id, Some(name.as_str())).await;
+        }
+        purged.insert("hosts".into(), serde_json::json!(n));
+    }
     if want("findings") {
         let n = state.store.clear_all_findings().await?;
         purged.insert("findings".into(), serde_json::json!(n));
@@ -852,20 +877,51 @@ async fn data_clear(
         let n = state.store.clear_all_host_keys().await?;
         purged.insert("host_keys".into(), serde_json::json!(n));
     }
+    if want("ssh_hunter") {
+        let n = state.store.clear_all_ssh_hunter().await?;
+        purged.insert("ssh_hunter".into(), serde_json::json!(n));
+    }
+    if want("ssh_zones") {
+        let n = state.store.clear_all_ssh_zones().await?;
+        purged.insert("ssh_zones".into(), serde_json::json!(n));
+    }
     if want("events") {
         match &state.clickhouse {
             Some(ch) => {
                 let before = ch.events_count().await.unwrap_or(0);
-                ch.clear_events()
-                    .await
-                    .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
-                purged.insert("events".into(), serde_json::json!(before));
+                match ch.clear_events().await {
+                    Ok(()) => {
+                        purged.insert("events".into(), serde_json::json!(before));
+                    }
+                    Err(e) if all => {
+                        // Finish store-backed clears even if ClickHouse truncate fails.
+                        purged.insert(
+                            "events".into(),
+                            serde_json::json!({
+                                "skipped": "clickhouse_error",
+                                "error": e.to_string(),
+                                "before": before,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        return Err(ApiError(StatusCode::BAD_GATEWAY, e.to_string()));
+                    }
+                }
             }
             None => {
-                return Err(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "ClickHouse not configured — cannot clear events".into(),
-                ));
+                // "Clear all" must still wipe store-backed data when ClickHouse is down.
+                if all {
+                    purged.insert(
+                        "events".into(),
+                        serde_json::json!({ "skipped": "clickhouse_unavailable" }),
+                    );
+                } else {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "ClickHouse not configured — cannot clear events".into(),
+                    ));
+                }
             }
         }
     }
@@ -888,7 +944,7 @@ async fn data_clear(
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!(
-                "unknown targets; use findings, scans, observations, activity, baselines, host_keys, events, virtual_ingest, ssh_identities, ssh_passwords, or all (got: {})",
+                "unknown targets; use findings, scans, observations, activity, baselines, host_keys, hosts, ssh_hunter, ssh_zones, events, virtual_ingest, ssh_identities, ssh_passwords, or all (got: {})",
                 targets.join(", ")
             ),
         ));
@@ -909,13 +965,57 @@ async fn data_clear(
         })
         .await;
 
-    // Ensure control-plane wipe hits ClickHouse promptly (hosts kept).
     state.store.mark_dirty_public();
+    // Persist immediately so a container restart cannot revive cleared hosts from
+    // a stale JSON file or an unflushed ClickHouse snapshot.
+    flush_control_plane_now(&state).await;
 
     Ok(Json(serde_json::json!({
         "purged": purged,
         "summary": state.store.data_counts().await?,
     })))
+}
+
+/// Drop the legacy on-disk JSON store so ClickHouse remains the only durable copy.
+pub fn discard_legacy_json_store(path: &std::path::Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if path.is_file() {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "removed legacy JSON store (ClickHouse is durable backend)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to remove legacy JSON store"
+            ),
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(tmp);
+}
+
+async fn flush_control_plane_now(state: &AppState) {
+    let Some(ch) = state.clickhouse.as_ref() else {
+        return;
+    };
+    match state.store.export_snapshot() {
+        Ok(snap) => match ch.save_control_plane(&snap).await {
+            Ok(n) => {
+                state.store.clear_dirty();
+                discard_legacy_json_store(&state.legacy_json_store);
+                tracing::info!(rows = n, "control-plane store flushed after data clear");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "ClickHouse flush after data clear failed — deletes may reappear on restart"
+            ),
+        },
+        Err(e) => tracing::warn!(error = %e, "export store snapshot failed after data clear"),
+    }
 }
 
 async fn get_check_sets(State(state): State<AppState>) -> impl IntoResponse {
@@ -2392,27 +2492,57 @@ async fn test_host_connection(
 
     let mut timeouts = SshTimeouts::default();
     if let Some(s) = body.connect_timeout_secs {
-        timeouts.connect = std::time::Duration::from_secs(s.max(1).min(60));
-        timeouts.auth = std::time::Duration::from_secs((s * 2).max(5).min(60));
-        timeouts.command = std::time::Duration::from_secs(15);
+        timeouts.connect = std::time::Duration::from_secs(s.max(1).min(30));
+        timeouts.auth = std::time::Duration::from_secs((s * 2).max(5).min(45));
+        timeouts.command = std::time::Duration::from_secs(12);
     } else {
-        timeouts.connect = std::time::Duration::from_secs(state.settings.ssh_connect_timeout_secs);
-        timeouts.auth = std::time::Duration::from_secs(state.settings.ssh_auth_timeout_secs);
-        timeouts.command = std::time::Duration::from_secs(15);
+        timeouts.connect = std::time::Duration::from_secs(state.settings.ssh_connect_timeout_secs.min(30));
+        timeouts.auth = std::time::Duration::from_secs(state.settings.ssh_auth_timeout_secs.min(45));
+        timeouts.command = std::time::Duration::from_secs(12);
     }
+    // Keep UI / appliance tests snappy — don't sit on a 90s inactivity deadline.
+    timeouts.inactivity = timeouts
+        .connect
+        .saturating_add(timeouts.auth)
+        .saturating_add(timeouts.command)
+        .saturating_add(std::time::Duration::from_secs(5));
 
-    let report = test_host_connectivity(ConnectivityTestOpts {
-        host,
-        port: body.ssh_port,
-        username: username.as_deref(),
-        identity: None,
-        identity_pem: identity_pem.as_deref(),
-        password: password.as_deref(),
-        timeouts,
-        require_auth: body.require_auth,
-    })
+    let wall = timeouts
+        .connect
+        .saturating_add(timeouts.auth)
+        .saturating_add(timeouts.command)
+        .saturating_add(std::time::Duration::from_secs(5));
+    let report = match tokio::time::timeout(
+        wall,
+        test_host_connectivity(ConnectivityTestOpts {
+            host,
+            port: body.ssh_port,
+            username: username.as_deref(),
+            identity: None,
+            identity_pem: identity_pem.as_deref(),
+            password: password.as_deref(),
+            timeouts,
+            require_auth: body.require_auth,
+        }),
+    )
     .await
-    .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Err(ApiError(StatusCode::BAD_GATEWAY, e.to_string()));
+        }
+        Err(_) => {
+            return Err(ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "SSH connectivity test timed out after {}s — check that the control plane can reach {}:{} (from Docker use a LAN IP or host.docker.internal, not 127.0.0.1)",
+                    wall.as_secs().max(1),
+                    host,
+                    body.ssh_port
+                ),
+            ));
+        }
+    };
 
     let mut saved_host = None;
     if let Some(id) = body.host_id {
@@ -2483,10 +2613,12 @@ async fn delete_host(
 ) -> Result<impl IntoResponse, ApiError> {
     // Capture display name before cascade so side-channel purge can match events
     // keyed by machine_id / host_name as well as UUID.
+    // Audit middleware resolves the name before this handler runs.
     let host = state.store.get_host(HostId(id)).await?;
     let name = host.display_name.clone();
     state.store.delete_host(HostId(id)).await?;
     crate::platform_ch::purge_host_artifacts(&state, id, Some(name.as_str())).await;
+    flush_control_plane_now(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2512,6 +2644,7 @@ async fn delete_hosts_bulk(
         ));
     }
     // Resolve names before delete so purge still knows host_name for events cleanup.
+    // Audit middleware also resolves names for the audit log before this runs.
     let mut names: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
     for id in &body.host_ids {
         if let Ok(h) = state.store.get_host(HostId(*id)).await {
@@ -2541,6 +2674,7 @@ async fn delete_hosts_bulk(
         )
         .await;
     }
+    flush_control_plane_now(&state).await;
     Ok(Json(result))
 }
 
@@ -2576,6 +2710,9 @@ pub struct HostInventoryQuery {
     /// Nth newest finished scan with this inventory kind: `1`/`latest`, `2`/`previous`, …
     #[serde(default)]
     pub inventory: Option<String>,
+    /// When true, return only `count` (empty row arrays) — used by scan overview badges.
+    #[serde(default)]
+    pub count_only: bool,
 }
 
 fn default_inventory_limit() -> usize {
@@ -2592,6 +2729,27 @@ fn inventory_index0(inventory: &str) -> usize {
             .map(|n| if n == 0 { 0 } else { n.saturating_sub(1) })
             .unwrap_or(0),
     }
+}
+
+/// Pick which scan UUID feeds an inventory kind (exact override or Nth newest).
+fn pick_inventory_scan_id<'a>(
+    of_kind: impl Iterator<Item = &'a rustmite_store::StoredObservation>,
+    scan_override: Option<Uuid>,
+    inventory: Option<&str>,
+) -> Option<Uuid> {
+    if let Some(sid) = scan_override {
+        return Some(sid);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<Uuid> = Vec::new();
+    for o in of_kind {
+        if seen.insert(o.scan_id.0) {
+            ordered.push(o.scan_id.0);
+        }
+    }
+    // Newest first (observations are append-ordered; caller should pass rev()).
+    let idx = inventory.map(inventory_index0).unwrap_or(0);
+    ordered.get(idx).copied().or_else(|| ordered.first().copied())
 }
 
 /// Resolve which scan's observations to return for a host inventory kind.
@@ -2614,25 +2772,8 @@ async fn host_kind_rows(
     if of_kind.is_empty() {
         return Ok((None, Vec::new()));
     }
-    let scan_id = if let Some(sid) = scan_override {
-        sid
-    } else {
-        let mut seen = std::collections::HashSet::new();
-        let mut ordered: Vec<Uuid> = Vec::new();
-        for o in of_kind.iter().rev() {
-            if seen.insert(o.scan_id.0) {
-                ordered.push(o.scan_id.0);
-            }
-        }
-        let idx = inventory
-            .map(inventory_index0)
-            .unwrap_or(0);
-        ordered
-            .get(idx)
-            .copied()
-            .or_else(|| ordered.first().copied())
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no scans for inventory".into()))?
-    };
+    let scan_id = pick_inventory_scan_id(of_kind.iter().rev(), scan_override, inventory)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no scans for inventory".into()))?;
     let mut out: Vec<_> = of_kind
         .into_iter()
         .filter(|o| o.scan_id.0 == scan_id)
@@ -2641,6 +2782,30 @@ async fn host_kind_rows(
         out.truncate(limit);
     }
     Ok((Some(scan_id), out))
+}
+
+/// Count observations for an inventory kind without serializing row payloads.
+async fn host_kind_count(
+    state: &AppState,
+    host_id: HostId,
+    kind: &str,
+    scan_override: Option<Uuid>,
+    inventory: Option<&str>,
+) -> Result<(Option<Uuid>, usize), ApiError> {
+    let rows = state
+        .store
+        .list_observations(Some(host_id), 50_000)
+        .await?;
+    let of_kind: Vec<_> = rows.iter().filter(|o| o.kind == kind).collect();
+    if of_kind.is_empty() {
+        return Ok((None, 0));
+    }
+    let Some(scan_id) = pick_inventory_scan_id(of_kind.iter().copied().rev(), scan_override, inventory)
+    else {
+        return Ok((None, 0));
+    };
+    let count = of_kind.iter().filter(|o| o.scan_id.0 == scan_id).count();
+    Ok((Some(scan_id), count))
 }
 
 /// Latest process inventory for a host (scan observations, or virtual ingest JSONL).
@@ -2662,25 +2827,6 @@ async fn host_processes(
         crate::platform_ch::ensure_virtual_local(&state, host.id.0).await;
     }
 
-    let (scan_id, rows) = host_kind_rows(
-        &state,
-        HostId(id),
-        "process",
-        limit,
-        q.scan_id,
-        q.inventory.as_deref(),
-    )
-    .await?;
-    let mut processes: Vec<serde_json::Value> = rows
-        .iter()
-        .filter_map(|o| match &o.data {
-            Observation::Process(p) => serde_json::to_value(p).ok(),
-            other => serde_json::to_value(other).ok(),
-        })
-        .collect();
-    let mut source = if !processes.is_empty() { "scan" } else { "none" };
-
-    // Virtual agents: fall back to ingest JSONL only for latest (no scan override).
     let want_latest = q.scan_id.is_none()
         && q.inventory
             .as_deref()
@@ -2691,15 +2837,59 @@ async fn host_processes(
                 )
             })
             .unwrap_or(true);
-    if is_virtual && want_latest && processes.is_empty() {
+
+    if q.count_only {
+        let (scan_id, mut count) =
+            host_kind_count(&state, HostId(id), "process", q.scan_id, q.inventory.as_deref())
+                .await?;
+        let mut source = if count > 0 { "scan" } else { "none" };
+        if is_virtual && want_latest && count == 0 {
+            let n = crate::sift_api::load_virtual_jsonl(&host).len();
+            if n > 0 {
+                count = n;
+                source = "virtual_ingest";
+            }
+        }
+        return Ok(Json(serde_json::json!({
+            "host_id": id,
+            "scan_id": scan_id,
+            "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
+            "source": source,
+            "count": count,
+            "processes": [],
+        })));
+    }
+
+    let (scan_id, rows) = host_kind_rows(
+        &state,
+        HostId(id),
+        "process",
+        limit,
+        q.scan_id,
+        q.inventory.as_deref(),
+    )
+    .await?;
+    let mut source = if !rows.is_empty() { "scan" } else { "none" };
+    let mut processes: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|o| match &o.data {
+            Observation::Process(p) => serde_json::to_value(p).ok(),
+            other => serde_json::to_value(other).ok(),
+        })
+        .collect();
+    let mut count = processes.len();
+
+    // Virtual agents: fall back to ingest JSONL only for latest (no scan override).
+    if is_virtual && want_latest && count == 0 {
         let raw = crate::sift_api::load_virtual_jsonl(&host);
         if !raw.is_empty() {
+            source = "virtual_ingest";
             processes = raw
                 .into_iter()
                 .take(limit)
                 .map(|e| virtual_process_row(&e))
                 .collect();
-            source = "virtual_ingest";
+            count = processes.len();
         }
     }
 
@@ -2708,7 +2898,7 @@ async fn host_processes(
         "scan_id": scan_id,
         "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
         "source": source,
-        "count": processes.len(),
+        "count": count,
         "processes": processes,
     })))
 }
@@ -2757,6 +2947,53 @@ async fn host_files(
 
     if is_virtual {
         crate::platform_ch::ensure_virtual_local(&state, host.id.0).await;
+    }
+
+    let want_latest = q.scan_id.is_none()
+        && q.inventory
+            .as_deref()
+            .map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "" | "latest" | "current" | "newest" | "1" | "0"
+                )
+            })
+            .unwrap_or(true);
+
+    if q.count_only {
+        let (mut scan_id, mut file_count) =
+            host_kind_count(&state, HostId(id), "file_meta", q.scan_id, q.inventory.as_deref())
+                .await?;
+        if file_count == 0 {
+            let (sid2, n) = host_kind_count(
+                &state,
+                HostId(id),
+                "file_entropy",
+                q.scan_id.or(scan_id),
+                q.inventory.as_deref(),
+            )
+            .await?;
+            if scan_id.is_none() {
+                scan_id = sid2;
+            }
+            file_count = n;
+        }
+        let mut source = if file_count > 0 { "scan" } else { "none" };
+        if is_virtual && want_latest && file_count == 0 {
+            let n = crate::sift_api::load_virtual_files_jsonl(&host).len();
+            if n > 0 {
+                file_count = n;
+                source = "virtual_ingest";
+            }
+        }
+        return Ok(Json(serde_json::json!({
+            "host_id": id,
+            "scan_id": scan_id,
+            "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
+            "source": source,
+            "count": file_count,
+            "files": [],
+        })));
     }
 
     // Prefer file_meta; if that scan has none, try file_entropy for the same pick.
@@ -2876,16 +3113,6 @@ async fn host_files(
 
     let mut source = if !files.is_empty() { "scan" } else { "none" };
 
-    let want_latest = q.scan_id.is_none()
-        && q.inventory
-            .as_deref()
-            .map(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "" | "latest" | "current" | "newest" | "1" | "0"
-                )
-            })
-            .unwrap_or(true);
     if is_virtual && want_latest && files.is_empty() {
         let raw = crate::sift_api::load_virtual_files_jsonl(&host);
         if !raw.is_empty() {
@@ -2927,6 +3154,28 @@ async fn host_connections(
 ) -> Result<impl IntoResponse, ApiError> {
     let host = state.store.get_host(HostId(id)).await?;
     let limit = q.limit.max(1);
+
+    if q.count_only {
+        let (scan_id, count) =
+            host_kind_count(&state, HostId(id), "socket", q.scan_id, q.inventory.as_deref())
+                .await?;
+        let source = if count > 0 {
+            "scan"
+        } else if host.agent_kind.eq_ignore_ascii_case("virtual") {
+            "virtual_ingest"
+        } else {
+            "none"
+        };
+        return Ok(Json(serde_json::json!({
+            "host_id": id,
+            "scan_id": scan_id,
+            "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
+            "source": source,
+            "count": count,
+            "connections": [],
+        })));
+    }
+
     let (scan_id, rows) = host_kind_rows(
         &state,
         HostId(id),
@@ -2943,6 +3192,7 @@ async fn host_connections(
             other => serde_json::to_value(other).ok(),
         })
         .collect();
+    let count = connections.len();
     let source = if scan_id.is_some() {
         "scan"
     } else if host.agent_kind.eq_ignore_ascii_case("virtual") {
@@ -2956,7 +3206,7 @@ async fn host_connections(
         "scan_id": scan_id,
         "inventory": q.inventory.clone().unwrap_or_else(|| "1".into()),
         "source": source,
-        "count": connections.len(),
+        "count": count,
         "connections": connections,
     })))
 }
@@ -3492,8 +3742,8 @@ async fn node_register(
         *guard = Some(pubk);
         if changed {
             // Persist so uploads work after restart even before the next node register.
-            let path = rustmite_crypto::default_cred_pub_path();
-            if let Err(e) = pubk.write_file(&path) {
+            let path = &state.cred_pubkey_path;
+            if let Err(e) = pubk.write_file(path) {
                 tracing::warn!(error = %e, path = %path.display(), "failed to persist cred.pub");
             } else {
                 tracing::info!(
@@ -3984,6 +4234,8 @@ async fn node_results(
             bytes_from_probe: 0,
             observation_count: body.observations.len() as u32,
             node_signature: None,
+        import_folders: vec![],
+        import_files: vec![],
         };
         state
             .store
