@@ -1,0 +1,14 @@
+<!-- Demo user for the embedded ClickHouse in the shareable image. -->
+<clickhouse>
+  <users>
+    <rustmite>
+      <password>rustmite</password>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <access_management>1</access_management>
+    </rustmite>
+  </users>
+</clickhouse>
