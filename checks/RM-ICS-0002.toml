@@ -1,0 +1,33 @@
+id = "RM-ICS-0002"
+version = 1
+name = "Hidden .icscap packet-capture toolkit (UTA0576)"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "file_meta"
+where = '''
+  file_meta.path != null
+  and (
+    file_meta.path.path_under("/data/.icscap")
+    or file_meta.path.path_under("/home/root/data/.icscap")
+    or file_meta.path contains "/.icscap/"
+  )
+'''
+title = "Hidden ICS capture toolkit path {{file_meta.path}}"
+evidence_fields = ["path", "mode", "uid", "gid", "size"]
+attack = ["T1040", "T1036", "T1027"]
+rationale = "Volexity UTA0576: renamed tcpdump (dsstatmond), rotating cap* PCAPs, and h.py LDAP/HTTP/NTLM harvest scripts under a stealth .icscap directory."
+references = [
+  "https://www.volexity.com/blog/2026/10/13/a-series-of-unauthenticated-events-chained-exploitation-of-ivanti-connect-secure-zero-days/",
+]
+collectors = ["file.ioc", "fs.anomaly"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "ICS capture toolkit"

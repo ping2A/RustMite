@@ -1,0 +1,63 @@
+id = "RM-ICS-0003"
+version = 1
+name = "Process executing from .icscap or UTA0576 helper scripts"
+type = "process"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "trivial"
+match = "process"
+where = '''
+  (
+    process.exe != null
+    and (
+      process.exe contains "/.icscap/"
+      or process.exe ends_with "/dsstatmond"
+      or process.exe.path_under("/data/.icscap")
+      or process.exe.path_under("/home/root/data/.icscap")
+      or (
+        process.exe.path_under("/tmp")
+        and (
+          process.exe ends_with "/ml.py"
+          or process.exe ends_with "/rq5.py"
+          or process.exe ends_with "/mk.py"
+          or process.exe ends_with "/rr.py"
+          or process.exe ends_with "/sp_run.py"
+          or process.exe ends_with "/h.py"
+        )
+      )
+    )
+  )
+  or (
+    process.cmdline != null
+    and (
+      process.cmdline contains "/.icscap/"
+      or process.cmdline contains "dsstatmond"
+      or process.cmdline contains "/tmp/ml.py"
+      or process.cmdline contains "/tmp/rq5.py"
+      or process.cmdline contains "/tmp/mk.py"
+      or process.cmdline contains "/tmp/rr.py"
+      or process.cmdline contains "/tmp/sp_run.py"
+      or process.cmdline contains "/data/.icscap/h.py"
+      or process.cmdline contains "ics-root-run-inband"
+      or process.cmdline contains "ics-root-result-inband"
+    )
+  )
+  or process.comm == "dsstatmond"
+'''
+title = "UTA0576-related process '{{process.comm}}' ({{process.exe}})"
+evidence_fields = ["pid", "comm", "exe", "cmdline", "cwd", "uid", "euid"]
+attack = ["T1040", "T1059.006", "T1036", "T1003"]
+rationale = "Live process evidence of UTA0576 tooling: sniffer masquerading as dsstatmond from .icscap, or Python helpers (ml/rq5/mk/rr/sp_run/h.py) and ICS in-band root payloads."
+references = [
+  "https://www.volexity.com/blog/2026/10/13/a-series-of-unauthenticated-events-chained-exploitation-of-ivanti-connect-secure-zero-days/",
+]
+collectors = ["process.inventory"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "UTA0576-related process"

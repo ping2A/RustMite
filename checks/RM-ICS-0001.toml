@@ -1,0 +1,43 @@
+id = "RM-ICS-0001"
+version = 1
+name = "UTA0576 Ivanti ICS post-exploitation tooling files"
+type = "file"
+severity = "critical"
+confidence = "high"
+enabled = true
+cost = "low"
+match = "file_meta"
+where = '''
+  file_meta.path != null
+  and (
+    file_meta.path == "/tmp/ml.py"
+    or file_meta.path == "/tmp/rq5.py"
+    or file_meta.path == "/tmp/mk.py"
+    or file_meta.path == "/tmp/rr.py"
+    or file_meta.path == "/tmp/pu.txt"
+    or file_meta.path == "/tmp/sp_out.txt"
+    or file_meta.path == "/tmp/spray_hits.json"
+    or file_meta.path == "/data/.icscap/h.py"
+    or file_meta.path == "/data/.icscap/dsstatmond"
+    or file_meta.path ends_with "/sp_run.py"
+    or file_meta.path matches "/tmp/(ml|rq5|mk|rr|sp_run)\\.py$"
+    or file_meta.path matches "/home/runtime/tmp/ics-root-(run|result)-inband-"
+    or file_meta.path matches "/tmp/ics-root-(run|result)-inband-"
+  )
+'''
+title = "UTA0576 / Ivanti ICS tooling artifact {{file_meta.path}}"
+evidence_fields = ["path", "mode", "uid", "gid", "size"]
+attack = ["T1059.006", "T1003", "T1558", "T1110"]
+rationale = "Volexity UTA0576 (CVE-2026-104935 chain): custom LDAP/Kerberos/password-spray helpers and ICS root in-band payloads written under /tmp and /home/runtime/tmp."
+references = [
+  "https://www.volexity.com/blog/2026/10/13/a-series-of-unauthenticated-events-chained-exploitation-of-ivanti-connect-secure-zero-days/",
+]
+collectors = ["file.ioc", "fs.anomaly"]
+
+[test]
+fires_on = ["hostile-catalog"]
+silent_on = ["clean-ubuntu2204"]
+source = "collector"
+
+[test.expect]
+title_contains = "UTA0576"
