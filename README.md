@@ -1,6 +1,8 @@
 # RustMite
 
-![RustMite](assets/logo.png)
+<p align="center">
+  <img src="assets/logo-readme.png" alt="RustMite" width="96" height="96" />
+</p>
 
 **Agentless Linux intrusion detection** — scan hosts over SSH, no agent to install.
 

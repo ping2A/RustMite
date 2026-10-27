@@ -458,10 +458,11 @@ body.sidebar-collapsed .sidebar-expand-btn {
   height: 64px;
   object-fit: contain;
   flex: 0 0 auto;
-  border-radius: 14px;
-  background: rgba(18, 22, 28, 0.55);
-  padding: 0.2rem;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 8px 18px rgba(0,0,0,0.22);
+  border-radius: 50%;
+  background: transparent;
+  padding: 0;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #c4a35a) 28%, transparent),
+              0 6px 16px rgba(0, 0, 0, 0.18);
 }
 .brand-mark {
   width: 34px; height: 34px; border-radius: 10px;
@@ -644,7 +645,8 @@ body.sidebar-collapsed .sidebar-expand-btn {
   width: 2rem;
   height: 2rem;
   object-fit: contain;
-  border-radius: 8px;
+  border-radius: 50%;
+  background: transparent;
   animation: page-logo-breathe 1.8s ease-in-out infinite;
   filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--accent) 25%, transparent));
 }
@@ -5054,7 +5056,7 @@ a.host-name-link {
   .brand-logo {
     width: 36px;
     height: 36px;
-    border-radius: 10px;
+    border-radius: 50%;
   }
   .brand-name { font-size: 1rem; }
   .brand-sub { display: none; }
@@ -7405,7 +7407,13 @@ body.rpl-resizing .rpl-resize-handle::after {
   font-size: 1.45rem;
   font-weight: 650;
 }
-.login-logo { align-self: flex-start; margin-bottom: 0.15rem; }
+.login-logo {
+  align-self: flex-start;
+  margin-bottom: 0.15rem;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #c4a35a) 22%, transparent);
+}
 .login-lead { margin: 0 0 0.25rem; font-size: 0.88rem; }
 .login-hint { margin: 0.15rem 0 0; font-size: 0.72rem; line-height: 1.35; }
 .login-error {

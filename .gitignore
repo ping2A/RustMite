@@ -22,6 +22,9 @@
 .env
 .env.*
 
+# Scratch tooling (logo processing, etc.)
+.tmp-*/
+
 # Packaged Docker images from ./scripts/share-image.sh
 /dist/
 
