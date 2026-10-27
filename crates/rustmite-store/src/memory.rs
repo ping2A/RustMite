@@ -19,6 +19,25 @@ use crate::types::{
     UpdateHost, UpsertHost, UpsertSshPlacement, UpsertSshZone,
 };
 
+/// Trim, split on commas, and de-dupe scan tags (case-insensitive).
+pub fn normalize_scan_tags(tags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for raw in tags {
+        for part in raw.split(',') {
+            let s = part.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let key = s.to_ascii_lowercase();
+            if seen.insert(key) {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 struct Inner {
     nodes: HashMap<Uuid, NodeRegistration>,
@@ -507,6 +526,56 @@ impl InMemoryStore {
             inner.activity.drain(0..drop_n);
         }
     }
+
+    /// Approximate serialized JSON size per clearable store component (for Data page).
+    pub fn estimate_component_bytes(&self) -> crate::types::ComponentBytes {
+        fn json_len<T: serde::Serialize>(v: &T) -> u64 {
+            serde_json::to_vec(v).map(|b| b.len() as u64).unwrap_or(0)
+        }
+        let hosts: Vec<HostRecord> = self.hosts.iter().map(|e| e.value().clone()).collect();
+        let Ok(inner) = self.inner.lock() else {
+            return crate::types::ComponentBytes::default();
+        };
+        let metas: Vec<&ScanMeta> = inner.metas.values().collect();
+        let baselines: Vec<BaselineRow> = inner
+            .baselines
+            .iter()
+            .map(|((host_id, name), payload)| BaselineRow {
+                host_id: *host_id,
+                name: name.clone(),
+                payload: payload.clone(),
+            })
+            .collect();
+        let host_keys: Vec<&HostKeyPin> = inner.host_keys.values().collect();
+        let ssh_keys: Vec<&SshKeyRecord> = inner.ssh_keys.values().collect();
+        let ssh_zones: Vec<&SshSecurityZone> = inner.ssh_zones.values().collect();
+        let credentials: Vec<&StoredCredential> = inner.credentials.values().collect();
+        let identity_bytes = credentials
+            .iter()
+            .filter(|c| c.kind == "identity")
+            .map(|c| json_len(*c))
+            .sum();
+        let password_bytes = credentials
+            .iter()
+            .filter(|c| c.kind == "password")
+            .map(|c| json_len(*c))
+            .sum();
+        crate::types::ComponentBytes {
+            hosts: json_len(&hosts),
+            findings: json_len(&inner.findings),
+            scans: json_len(&inner.jobs).saturating_add(json_len(&metas)),
+            observations: json_len(&inner.observations),
+            activity: json_len(&inner.activity),
+            baselines: json_len(&baselines),
+            host_keys: json_len(&host_keys),
+            ssh_hunter: json_len(&ssh_keys).saturating_add(json_len(&inner.ssh_placements)),
+            ssh_zones: json_len(&ssh_zones),
+            ssh_identities: identity_bytes,
+            ssh_passwords: password_bytes,
+            credentials: json_len(&credentials),
+            nodes: json_len(&inner.nodes),
+        }
+    }
 }
 
 impl Default for InMemoryStore {
@@ -992,6 +1061,40 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn update_scan_tags(
+        &self,
+        scan_id: ScanId,
+        tags: Vec<String>,
+    ) -> StoreResult<ScanMeta> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let meta = inner
+            .metas
+            .get_mut(&scan_id.0)
+            .ok_or_else(|| StoreError::NotFound(format!("scan meta {}", scan_id)))?;
+        meta.tags = normalize_scan_tags(tags);
+        let out = meta.clone();
+        drop(inner);
+        self.mark_dirty();
+        Ok(out)
+    }
+
+    async fn update_scan_inventory(
+        &self,
+        scan_id: ScanId,
+        inventory: rustmite_proto::ScanInventorySummary,
+    ) -> StoreResult<ScanMeta> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let meta = inner
+            .metas
+            .get_mut(&scan_id.0)
+            .ok_or_else(|| StoreError::NotFound(format!("scan meta {}", scan_id)))?;
+        meta.inventory = Some(inventory);
+        let out = meta.clone();
+        drop(inner);
+        self.mark_dirty();
+        Ok(out)
+    }
+
     async fn insert_observations(&self, rows: Vec<StoredObservation>) -> StoreResult<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1008,10 +1111,112 @@ impl Store for InMemoryStore {
             return Ok(());
         }
         let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
-        inner.findings.extend(findings);
+        // Inherit host×check false-positive so re-scans don't reopen the same alert.
+        let muted: Vec<(HostId, String, Option<String>)> = inner
+            .findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.status,
+                    rustmite_proto::FindingStatus::FalsePositive
+                        | rustmite_proto::FindingStatus::Suppressed
+                )
+            })
+            .map(|f| (f.host_id, f.check_id.as_str().to_string(), f.suppressed_by.clone()))
+            .collect();
+        let mut incoming = findings;
+        for f in &mut incoming {
+            if let Some((_, _, by)) = muted
+                .iter()
+                .find(|(h, c, _)| *h == f.host_id && c.as_str() == f.check_id.as_str())
+            {
+                f.status = rustmite_proto::FindingStatus::FalsePositive;
+                if f.suppressed_by.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+                    f.suppressed_by = by
+                        .clone()
+                        .or_else(|| Some("inherited".into()));
+                }
+            }
+        }
+        inner.findings.extend(incoming);
         drop(inner);
         self.mark_dirty();
         Ok(())
+    }
+
+    async fn update_finding_status(
+        &self,
+        id: rustmite_proto::FindingId,
+        status: rustmite_proto::FindingStatus,
+        suppressed_by: Option<String>,
+    ) -> StoreResult<Finding> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let Some(idx) = inner.findings.iter().position(|f| f.id == id) else {
+            return Err(StoreError::NotFound(format!("finding {}", id.0)));
+        };
+        let host_id = inner.findings[idx].host_id;
+        let check_id = inner.findings[idx].check_id.clone();
+        let who = match status {
+            rustmite_proto::FindingStatus::New => None,
+            _ => suppressed_by
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| inner.findings[idx].suppressed_by.clone())
+                .or_else(|| Some("operator".into())),
+        };
+        // FP: mute every occurrence of this check on this host (grouped alerts +
+        // future inserts inherit via insert_findings). Clear: lift only FP/suppressed
+        // siblings so true positives stay. TP stays per-finding.
+        match status {
+            rustmite_proto::FindingStatus::FalsePositive
+            | rustmite_proto::FindingStatus::Suppressed => {
+                for f in inner.findings.iter_mut() {
+                    if f.host_id == host_id && f.check_id == check_id {
+                        f.status = status;
+                        f.suppressed_by = who.clone();
+                    }
+                }
+            }
+            rustmite_proto::FindingStatus::New => {
+                for f in inner.findings.iter_mut() {
+                    if f.host_id == host_id
+                        && f.check_id == check_id
+                        && matches!(
+                            f.status,
+                            rustmite_proto::FindingStatus::FalsePositive
+                                | rustmite_proto::FindingStatus::Suppressed
+                                | rustmite_proto::FindingStatus::New
+                        )
+                    {
+                        f.status = rustmite_proto::FindingStatus::New;
+                        f.suppressed_by = None;
+                    }
+                }
+                // Always clear the finding that was clicked.
+                inner.findings[idx].status = rustmite_proto::FindingStatus::New;
+                inner.findings[idx].suppressed_by = None;
+            }
+            _ => {
+                let f = &mut inner.findings[idx];
+                f.status = status;
+                f.suppressed_by = who;
+            }
+        }
+        let out = inner.findings[idx].clone();
+        drop(inner);
+        self.mark_dirty();
+        Ok(out)
+    }
+
+    async fn delete_finding(&self, id: rustmite_proto::FindingId) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().map_err(|e| StoreError::Backend(e.to_string()))?;
+        let before = inner.findings.len();
+        inner.findings.retain(|f| f.id != id);
+        let removed = before != inner.findings.len();
+        drop(inner);
+        if removed {
+            self.mark_dirty();
+        }
+        Ok(removed)
     }
 
     async fn clear_findings_for_host_checks(
@@ -1891,8 +2096,10 @@ mod tests {
             bytes_from_probe: 0,
             observation_count: 1,
             node_signature: None,
-        import_folders: vec![],
-        import_files: vec![],
+            import_folders: vec![],
+            import_files: vec![],
+            tags: vec![],
+            inventory: None,
         };
         store
             .complete_scan(CompleteScan {
@@ -2256,8 +2463,10 @@ mod tests {
                         bytes_from_probe: 0,
                         observation_count: 0,
                         node_signature: None,
-                    import_folders: vec![],
-                    import_files: vec![],
+                        import_folders: vec![],
+                        import_files: vec![],
+                        tags: vec![],
+                        inventory: None,
                     },
                 );
             }
@@ -2343,5 +2552,354 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(back.agent_kind, "agentlite");
+    }
+
+    fn sample_finding(
+        host_id: HostId,
+        scan_id: ScanId,
+        check: &str,
+        title: &str,
+    ) -> Finding {
+        Finding {
+            id: FindingId::new_v7(),
+            scan_id,
+            host_id,
+            check_id: CheckId::new(check),
+            check_version: 1,
+            check_type: CheckType::Process,
+            severity: Severity::High,
+            confidence: Confidence::High,
+            title: title.into(),
+            evidence: serde_json::Map::new(),
+            observation_ref: ObservationRef {
+                scan_id,
+                seq: 0,
+                kind: "process".into(),
+            },
+            attack: vec![],
+            first_seen: "t0".into(),
+            last_seen: "t0".into(),
+            status: FindingStatus::New,
+            suppressed_by: None,
+            correlation_id: None,
+        }
+    }
+
+    async fn host_with_scan(store: &InMemoryStore, name: &str) -> (HostId, ScanId) {
+        let host = store
+            .upsert_host(UpsertHost {
+                id: None,
+                tenant_id: Uuid::nil(),
+                display_name: name.into(),
+                primary_addr: Some("10.0.0.50".into()),
+                ssh_port: Some(22),
+                labels: BTreeMap::new(),
+                timeouts: Default::default(),
+                agent_kind: None,
+                ingest_token: None,
+            })
+            .await
+            .unwrap();
+        let job = store
+            .enqueue_scan(EnqueueScan {
+                host_id: host.id,
+                check_set: "standard".into(),
+                priority: 10,
+            })
+            .await
+            .unwrap();
+        (host.id, job.id)
+    }
+
+    #[tokio::test]
+    async fn update_finding_status_true_positive_is_per_finding() {
+        let store = InMemoryStore::new();
+        let (host, scan_a) = host_with_scan(&store, "tp-host").await;
+        let f1 = sample_finding(host, scan_a, "RM-PROC-0001", "one");
+        let f2 = sample_finding(host, ScanId::new_v7(), "RM-PROC-0001", "two");
+        let id1 = f1.id;
+        let id2 = f2.id;
+        store.insert_findings(vec![f1, f2]).await.unwrap();
+
+        let updated = store
+            .update_finding_status(id1, FindingStatus::TruePositive, Some("alice".into()))
+            .await
+            .unwrap();
+        assert_eq!(updated.status, FindingStatus::TruePositive);
+        assert_eq!(updated.suppressed_by.as_deref(), Some("alice"));
+
+        let all = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let sibling = all.iter().find(|f| f.id == id2).unwrap();
+        assert_eq!(sibling.status, FindingStatus::New);
+        assert!(sibling.suppressed_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn false_positive_propagates_to_same_host_and_check() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "fp-host").await;
+        let other_host = store
+            .upsert_host(UpsertHost {
+                id: None,
+                tenant_id: Uuid::nil(),
+                display_name: "other".into(),
+                primary_addr: Some("10.0.0.51".into()),
+                ssh_port: Some(22),
+                labels: BTreeMap::new(),
+                timeouts: Default::default(),
+                agent_kind: None,
+                ingest_token: None,
+            })
+            .await
+            .unwrap()
+            .id;
+
+        let a = sample_finding(host, scan, "RM-PROC-0001", "a");
+        let b = sample_finding(host, ScanId::new_v7(), "RM-PROC-0001", "b");
+        let other_check = sample_finding(host, ScanId::new_v7(), "RM-NET-0001", "c");
+        let other_host_f = sample_finding(other_host, ScanId::new_v7(), "RM-PROC-0001", "d");
+        let id_a = a.id;
+        let id_b = b.id;
+        let id_other_check = other_check.id;
+        let id_other_host = other_host_f.id;
+        store
+            .insert_findings(vec![a, b, other_check, other_host_f])
+            .await
+            .unwrap();
+
+        store
+            .update_finding_status(id_a, FindingStatus::FalsePositive, Some("bob".into()))
+            .await
+            .unwrap();
+
+        let all = store
+            .list_findings(FindingFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let by_id = |id| all.iter().find(|f| f.id == id).unwrap();
+        assert_eq!(by_id(id_a).status, FindingStatus::FalsePositive);
+        assert_eq!(by_id(id_b).status, FindingStatus::FalsePositive);
+        assert_eq!(by_id(id_a).suppressed_by.as_deref(), Some("bob"));
+        assert_eq!(by_id(id_b).suppressed_by.as_deref(), Some("bob"));
+        assert_eq!(by_id(id_other_check).status, FindingStatus::New);
+        assert_eq!(by_id(id_other_host).status, FindingStatus::New);
+    }
+
+    #[tokio::test]
+    async fn insert_findings_inherits_false_positive_for_host_check() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "inherit-host").await;
+        let first = sample_finding(host, scan, "RM-KERN-0001", "first");
+        let first_id = first.id;
+        store.insert_findings(vec![first]).await.unwrap();
+        store
+            .update_finding_status(first_id, FindingStatus::FalsePositive, Some("carol".into()))
+            .await
+            .unwrap();
+
+        let next = sample_finding(host, ScanId::new_v7(), "RM-KERN-0001", "rescan");
+        let next_id = next.id;
+        store.insert_findings(vec![next]).await.unwrap();
+
+        let listed = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let inherited = listed.iter().find(|f| f.id == next_id).unwrap();
+        assert_eq!(inherited.status, FindingStatus::FalsePositive);
+        assert_eq!(inherited.suppressed_by.as_deref(), Some("carol"));
+
+        // Different check on same host stays New.
+        let other = sample_finding(host, ScanId::new_v7(), "RM-FS-0001", "other");
+        let other_id = other.id;
+        store.insert_findings(vec![other]).await.unwrap();
+        let listed = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().find(|f| f.id == other_id).unwrap().status,
+            FindingStatus::New
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_findings_inherits_from_suppressed_status() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "sup-host").await;
+        let first = sample_finding(host, scan, "RM-AUTH-0001", "first");
+        let first_id = first.id;
+        store.insert_findings(vec![first]).await.unwrap();
+        store
+            .update_finding_status(first_id, FindingStatus::Suppressed, Some("dave".into()))
+            .await
+            .unwrap();
+
+        let next = sample_finding(host, ScanId::new_v7(), "RM-AUTH-0001", "again");
+        let next_id = next.id;
+        store.insert_findings(vec![next]).await.unwrap();
+        let listed = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let inherited = listed.iter().find(|f| f.id == next_id).unwrap();
+        assert_eq!(inherited.status, FindingStatus::FalsePositive);
+        assert_eq!(inherited.suppressed_by.as_deref(), Some("dave"));
+    }
+
+    #[tokio::test]
+    async fn clear_to_new_lifts_fp_but_keeps_true_positives() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "clear-host").await;
+        let fp_a = sample_finding(host, scan, "RM-PROC-0002", "fp-a");
+        let fp_b = sample_finding(host, ScanId::new_v7(), "RM-PROC-0002", "fp-b");
+        let tp = sample_finding(host, ScanId::new_v7(), "RM-PROC-0002", "tp");
+        let id_a = fp_a.id;
+        let id_b = fp_b.id;
+        let id_tp = tp.id;
+        store
+            .insert_findings(vec![fp_a, fp_b, tp])
+            .await
+            .unwrap();
+        store
+            .update_finding_status(id_tp, FindingStatus::TruePositive, Some("eve".into()))
+            .await
+            .unwrap();
+        store
+            .update_finding_status(id_a, FindingStatus::FalsePositive, Some("eve".into()))
+            .await
+            .unwrap();
+        // FP propagation also muted the TP — re-mark TP for the keep-TP assertion.
+        store
+            .update_finding_status(id_tp, FindingStatus::TruePositive, Some("eve".into()))
+            .await
+            .unwrap();
+
+        store
+            .update_finding_status(id_a, FindingStatus::New, None)
+            .await
+            .unwrap();
+
+        let all = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let by_id = |id| all.iter().find(|f| f.id == id).unwrap();
+        assert_eq!(by_id(id_a).status, FindingStatus::New);
+        assert!(by_id(id_a).suppressed_by.is_none());
+        assert_eq!(by_id(id_b).status, FindingStatus::New);
+        assert_eq!(by_id(id_tp).status, FindingStatus::TruePositive);
+        assert_eq!(by_id(id_tp).suppressed_by.as_deref(), Some("eve"));
+
+        // After clear, a new insert must NOT inherit FP.
+        let fresh = sample_finding(host, ScanId::new_v7(), "RM-PROC-0002", "fresh");
+        let fresh_id = fresh.id;
+        store.insert_findings(vec![fresh]).await.unwrap();
+        let all = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().find(|f| f.id == fresh_id).unwrap().status,
+            FindingStatus::New
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_finding_removes_only_target() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "del-host").await;
+        let a = sample_finding(host, scan, "RM-PROC-0003", "a");
+        let b = sample_finding(host, ScanId::new_v7(), "RM-PROC-0003", "b");
+        let id_a = a.id;
+        let id_b = b.id;
+        store.insert_findings(vec![a, b]).await.unwrap();
+
+        assert!(store.delete_finding(id_a).await.unwrap());
+        assert!(!store.delete_finding(id_a).await.unwrap());
+
+        let listed = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id_b);
+    }
+
+    #[tokio::test]
+    async fn update_finding_status_missing_is_not_found() {
+        let store = InMemoryStore::new();
+        let err = store
+            .update_finding_status(
+                FindingId::new_v7(),
+                FindingStatus::FalsePositive,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn true_positive_does_not_seed_fp_inheritance() {
+        let store = InMemoryStore::new();
+        let (host, scan) = host_with_scan(&store, "tp-inherit").await;
+        let first = sample_finding(host, scan, "RM-NET-0009", "first");
+        let first_id = first.id;
+        store.insert_findings(vec![first]).await.unwrap();
+        store
+            .update_finding_status(first_id, FindingStatus::TruePositive, Some("frank".into()))
+            .await
+            .unwrap();
+
+        let next = sample_finding(host, ScanId::new_v7(), "RM-NET-0009", "next");
+        let next_id = next.id;
+        store.insert_findings(vec![next]).await.unwrap();
+        let listed = store
+            .list_findings(FindingFilter {
+                host_id: Some(host),
+                limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().find(|f| f.id == next_id).unwrap().status,
+            FindingStatus::New
+        );
     }
 }

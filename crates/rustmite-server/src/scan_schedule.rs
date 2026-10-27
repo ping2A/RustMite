@@ -210,7 +210,7 @@ fn parse_ts(raw: &str) -> Option<OffsetDateTime> {
         return Some(dt);
     }
     // `OffsetDateTime::to_string()` style used by the store for last_scan_at.
-    let fmt = time::format_description::parse(
+    let fmt = time::format_description::parse_borrowed::<2>(
         "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond] [offset_hour \
          sign:mandatory]:[offset_minute]:[offset_second]",
     )

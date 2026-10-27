@@ -155,7 +155,14 @@ pub fn operator_router(state: AppState) -> Router {
             axum::routing::post(capture_baseline).get(get_baseline),
         )
         .route("/v1/findings", get(list_findings).delete(clear_findings))
-        .route("/v1/scans/{id}", get(get_scan))
+        .route(
+            "/v1/findings/{id}",
+            axum::routing::patch(update_finding).delete(delete_finding),
+        )
+        .route(
+            "/v1/scans/{id}",
+            get(get_scan).patch(update_scan),
+        )
         .route("/v1/scans/{id}/coverage", get(scan_coverage))
         .route("/v1/hunt", axum::routing::post(hunt))
         .route("/v1/hunt/rpl", axum::routing::post(hunt_rpl))
@@ -231,6 +238,7 @@ pub fn operator_router(state: AppState) -> Router {
         )
         .route("/v1/audit", get(crate::audit::list_audit))
         .merge(crate::ingest_virtual::virtual_ingest_routes())
+        .merge(crate::fs_browse::fs_browse_routes())
         .merge(crate::virtual_agents::virtual_agent_routes())
         .merge(crate::anomark_api::anomark_routes())
         // Innermost → outermost: audit (needs AuthContext) → auth → CORS.
@@ -619,15 +627,32 @@ fn count_virtual_ingest_dirs() -> (usize, u64) {
             continue;
         }
         hosts += 1;
-        if let Ok(files) = std::fs::read_dir(&path) {
-            for f in files.flatten() {
-                if let Ok(meta) = f.metadata() {
-                    bytes = bytes.saturating_add(meta.len());
-                }
-            }
-        }
+        bytes = bytes.saturating_add(dir_size_bytes(&path));
     }
     (hosts, bytes)
+}
+
+fn file_size_bytes(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut bytes = 0u64;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let Ok(meta) = ent.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            bytes = bytes.saturating_add(dir_size_bytes(&p));
+        }
+    }
+    bytes
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -727,16 +752,60 @@ fn purge_cred_dir(dir: &str) -> usize {
 
 async fn data_summary(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let counts = state.store.data_counts().await?;
+    let component_bytes = state.store.estimate_component_bytes();
     let hosts = state.store.list_hosts().await.unwrap_or_default();
     let mut events: Option<u64> = None;
     let mut platform_blobs: Option<u64> = None;
     let mut clickhouse = false;
+    let mut clickhouse_db: Option<String> = None;
+    let mut clickhouse_tables: Vec<serde_json::Value> = Vec::new();
+    let mut clickhouse_bytes: Option<u64> = None;
+    let mut events_bytes: Option<u64> = None;
+    let mut detection_signals_bytes: Option<u64> = None;
+    let mut cp_entities_bytes: Option<u64> = None;
+    let mut platform_blobs_ch_bytes: Option<u64> = None;
     if let Some(ch) = &state.clickhouse {
         clickhouse = true;
+        clickhouse_db = Some(ch.database().to_string());
         events = ch.events_count().await.ok();
         platform_blobs = ch.platform_blobs_live_count().await.ok();
+        if let Ok(sizes) = ch.database_table_sizes().await {
+            let mut total = 0u64;
+            for t in sizes {
+                total = total.saturating_add(t.bytes);
+                match t.table.as_str() {
+                    "events" => events_bytes = Some(t.bytes),
+                    "detection_signals" => detection_signals_bytes = Some(t.bytes),
+                    "cp_entities" => cp_entities_bytes = Some(t.bytes),
+                    "rm_platform_blobs" => platform_blobs_ch_bytes = Some(t.bytes),
+                    _ => {}
+                }
+                clickhouse_tables.push(serde_json::json!({
+                    "table": t.table,
+                    "bytes": t.bytes,
+                    "rows": t.rows,
+                }));
+            }
+            clickhouse_bytes = Some(total);
+        }
     }
-    let (virtual_hosts, virtual_bytes) = count_virtual_ingest_dirs();
+    let hunt_events_bytes = match (events_bytes, detection_signals_bytes) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    };
+    let (disk_hosts, disk_bytes) = count_virtual_ingest_dirs();
+    let mut virtual_hosts = disk_hosts;
+    let mut virtual_bytes = disk_bytes;
+    let mut virtual_storage = if disk_hosts > 0 { "disk" } else { "none" };
+    if let Some(ch) = &state.clickhouse {
+        if let Ok((ch_hosts, ch_bytes)) = ch.virtual_ingest_blob_stats().await {
+            if ch_hosts > 0 || ch_bytes > 0 {
+                virtual_hosts = ch_hosts.max(disk_hosts);
+                virtual_bytes = ch_bytes;
+                virtual_storage = "clickhouse";
+            }
+        }
+    }
 
     let mut ssh_identities = list_stored_credentials(&state, Some("identity")).await?;
     let mut ssh_passwords = list_stored_credentials(&state, Some("password")).await?;
@@ -752,6 +821,36 @@ async fn data_summary(State(state): State<AppState>) -> Result<impl IntoResponse
         .filter(|h| h.labels.contains_key("ssh_password_file"))
         .count();
 
+    let identity_payload_bytes: u64 = ssh_identities.iter().map(|c| c.bytes).sum();
+    let password_payload_bytes: u64 = ssh_passwords.iter().map(|c| c.bytes).sum();
+    let cred_bytes = identity_payload_bytes.saturating_add(password_payload_bytes);
+    let store_path = state.legacy_json_store.clone();
+    let store_bytes = file_size_bytes(&store_path);
+    let platform_path = std::path::PathBuf::from(".dev/sift-platform");
+    let platform_bytes = if platform_path.is_dir() {
+        dir_size_bytes(&platform_path)
+    } else {
+        0
+    };
+    let ingest_root = crate::sift_api::ingest_dir();
+    let store_components_bytes = component_bytes.hosts
+        .saturating_add(component_bytes.findings)
+        .saturating_add(component_bytes.scans)
+        .saturating_add(component_bytes.observations)
+        .saturating_add(component_bytes.activity)
+        .saturating_add(component_bytes.baselines)
+        .saturating_add(component_bytes.host_keys)
+        .saturating_add(component_bytes.ssh_hunter)
+        .saturating_add(component_bytes.ssh_zones)
+        .saturating_add(component_bytes.credentials)
+        .saturating_add(component_bytes.nodes);
+    // Local footprint excludes ClickHouse-backed virtual ingest (counted in clickhouse_bytes).
+    let local_bytes = disk_bytes
+        .saturating_add(cred_bytes)
+        .saturating_add(store_bytes)
+        .saturating_add(platform_bytes);
+    let total_bytes = local_bytes.saturating_add(clickhouse_bytes.unwrap_or(0));
+
     Ok(Json(serde_json::json!({
         "hosts": counts.hosts,
         "findings": counts.findings,
@@ -766,10 +865,17 @@ async fn data_summary(State(state): State<AppState>) -> Result<impl IntoResponse
         "ssh_zones": counts.ssh_zones,
         "credentials": counts.credentials,
         "events": events,
+        "events_bytes": hunt_events_bytes,
         "platform_blobs": platform_blobs,
         "virtual_ingest_hosts": virtual_hosts,
         "virtual_ingest_bytes": virtual_bytes,
+        "virtual_ingest_storage": virtual_storage,
+        "virtual_ingest_local_bytes": disk_bytes,
+        "virtual_ingest_local_hosts": disk_hosts,
         "clickhouse": clickhouse,
+        "clickhouse_db": clickhouse_db,
+        "clickhouse_bytes": clickhouse_bytes,
+        "clickhouse_tables": clickhouse_tables,
         "ssh_identities_count": ssh_identities.len(),
         "ssh_passwords_count": ssh_passwords.len(),
         "hosts_with_ssh_identity": hosts_with_identity,
@@ -779,6 +885,58 @@ async fn data_summary(State(state): State<AppState>) -> Result<impl IntoResponse
         "ssh_identities_dir": "database",
         "ssh_secrets_dir": "database",
         "credential_storage": "database",
+        "component_bytes": {
+            "hosts": component_bytes.hosts,
+            "findings": component_bytes.findings,
+            "scans": component_bytes.scans,
+            "observations": component_bytes.observations,
+            "activity": component_bytes.activity,
+            "baselines": component_bytes.baselines,
+            "host_keys": component_bytes.host_keys,
+            "ssh_hunter": component_bytes.ssh_hunter,
+            "ssh_zones": component_bytes.ssh_zones,
+            "ssh_identities": identity_payload_bytes.max(component_bytes.ssh_identities),
+            "ssh_passwords": password_payload_bytes.max(component_bytes.ssh_passwords),
+            "nodes": component_bytes.nodes,
+            "virtual_ingest": virtual_bytes,
+            "events": hunt_events_bytes,
+            "detection_signals": detection_signals_bytes,
+            "cp_entities": cp_entities_bytes,
+            "platform_blobs": platform_bytes,
+            "platform_blobs_ch": platform_blobs_ch_bytes,
+            "clickhouse": clickhouse_bytes,
+            "store": store_bytes,
+            "store_components": store_components_bytes,
+            "credentials": cred_bytes,
+        },
+        "storage": {
+            "total_bytes": total_bytes,
+            "local_bytes": local_bytes,
+            "virtual_ingest_bytes": virtual_bytes,
+            "virtual_ingest_hosts": virtual_hosts,
+            "virtual_ingest_storage": virtual_storage,
+            "virtual_ingest_local_bytes": disk_bytes,
+            "virtual_ingest_local_hosts": disk_hosts,
+            "virtual_ingest_path": ingest_root.display().to_string(),
+            "credentials_bytes": cred_bytes,
+            "ssh_identities_bytes": identity_payload_bytes,
+            "ssh_passwords_bytes": password_payload_bytes,
+            "store_bytes": store_bytes,
+            "store_components_bytes": store_components_bytes,
+            "store_path": store_path.display().to_string(),
+            "platform_bytes": platform_bytes,
+            "platform_path": platform_path.display().to_string(),
+            "clickhouse": clickhouse,
+            "clickhouse_db": clickhouse_db,
+            "clickhouse_bytes": clickhouse_bytes,
+            "clickhouse_tables": clickhouse_tables,
+            "events": events,
+            "events_bytes": hunt_events_bytes,
+            "platform_blobs": platform_blobs,
+            "platform_blobs_ch_bytes": platform_blobs_ch_bytes,
+            "cp_entities_bytes": cp_entities_bytes,
+            "components": component_bytes,
+        },
         "groups": [
             {
                 "id": "operational",
@@ -968,7 +1126,10 @@ async fn data_clear(
     state.store.mark_dirty_public();
     // Persist immediately so a container restart cannot revive cleared hosts from
     // a stale JSON file or an unflushed ClickHouse snapshot.
-    flush_control_plane_now(&state).await;
+    // `force_empty` is required when hosts were cleared — the normal save guard
+    // refuses to overwrite a non-empty ClickHouse fleet with 0 hosts.
+    let force_empty = want("hosts") || all;
+    flush_control_plane_now(&state, force_empty).await;
 
     Ok(Json(serde_json::json!({
         "purged": purged,
@@ -998,16 +1159,20 @@ pub fn discard_legacy_json_store(path: &std::path::Path) {
     let _ = std::fs::remove_file(tmp);
 }
 
-async fn flush_control_plane_now(state: &AppState) {
+async fn flush_control_plane_now(state: &AppState, force_empty: bool) {
     let Some(ch) = state.clickhouse.as_ref() else {
         return;
     };
     match state.store.export_snapshot() {
-        Ok(snap) => match ch.save_control_plane(&snap).await {
+        Ok(snap) => match ch.save_control_plane_ex(&snap, force_empty).await {
             Ok(n) => {
                 state.store.clear_dirty();
                 discard_legacy_json_store(&state.legacy_json_store);
-                tracing::info!(rows = n, "control-plane store flushed after data clear");
+                tracing::info!(
+                    rows = n,
+                    force_empty,
+                    "control-plane store flushed after data clear"
+                );
             }
             Err(e) => tracing::warn!(
                 error = %e,
@@ -1686,6 +1851,8 @@ async fn list_checks(State(state): State<AppState>) -> impl IntoResponse {
                 "rationale": m.rationale,
                 "false_positives": m.false_positives,
                 "evidence_fields": m.evidence_fields,
+                "references": m.references,
+                "kill_chain": m.kill_chain,
                 "scan_sets": in_sets,
                 "is_anomark": m.is_anomark_rule(),
                 "anomark": m.anomark_options().map(|o| serde_json::json!({
@@ -1724,6 +1891,7 @@ fn check_json(
         "false_positives": m.false_positives,
         "evidence_fields": m.evidence_fields,
         "references": m.references,
+        "kill_chain": m.kill_chain,
         "path": path.display().to_string(),
         "toml": toml_text,
         "scan_sets": scan_sets,
@@ -1988,9 +2156,16 @@ pub struct ValidateCheckBody {
     /// Full TOML manifest (draft). When omitted with `{id}` routes, the saved file is used.
     #[serde(default)]
     pub toml: Option<String>,
-    /// Optional host scope for dry-run observations.
+    /// Optional single-host scope for dry-run observations (legacy; merged into `host_ids`).
     #[serde(default)]
     pub host_id: Option<Uuid>,
+    /// Optional multi-host scope for dry-run observations.
+    #[serde(default)]
+    pub host_ids: Option<Vec<Uuid>>,
+    /// Optional scan scope — when set, only observations from this scan are evaluated
+    /// (intended with a single host).
+    #[serde(default)]
+    pub scan_id: Option<Uuid>,
     /// Max observations to load for dry-run (default 5000).
     #[serde(default = "default_validate_obs_limit")]
     pub limit: usize,
@@ -2003,6 +2178,16 @@ pub struct ValidateCheckBody {
     /// Optional inline observations (JSON Observation enum values) instead of store data.
     #[serde(default)]
     pub observations: Option<Vec<Observation>>,
+}
+
+fn coalesce_validate_host_ids(body: &ValidateCheckBody) -> Vec<Uuid> {
+    let mut ids = body.host_ids.clone().unwrap_or_default();
+    if let Some(id) = body.host_id {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 fn default_validate_obs_limit() -> usize {
@@ -2018,15 +2203,29 @@ fn validate_check_response(
     observations: &[Observation],
     sample_limit: usize,
     source: &str,
+    scope: &serde_json::Value,
+    host_ids: &[Uuid],
+    host_names: &[String],
 ) -> serde_json::Value {
     let started = std::time::Instant::now();
     let hits = engine.evaluate(observations);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let sample: Vec<_> = hits.iter().take(sample_limit.max(1)).collect();
     let m = engine.manifests().first();
+    let hunt_rpl = m
+        .map(|x| {
+            crate::check_rpl::check_to_hunt_rpl(
+                &x.match_on,
+                &x.where_expr,
+                host_ids,
+                host_names,
+            )
+        })
+        .unwrap_or_default();
     serde_json::json!({
         "ok": true,
         "source": source,
+        "scope": scope,
         "compile": {
             "id": m.map(|x| x.id.as_str()),
             "name": m.map(|x| x.name.clone()),
@@ -2035,6 +2234,7 @@ fn validate_check_response(
             "collectors": m.map(|x| x.required_collectors()),
             "enabled": m.map(|x| x.enabled),
         },
+        "hunt_rpl": hunt_rpl,
         "dry_run": {
             "observations_scanned": observations.len(),
             "hit_count": hits.len(),
@@ -2045,21 +2245,73 @@ fn validate_check_response(
     })
 }
 
+async fn host_names_for_ids(state: &AppState, host_ids: &[Uuid]) -> Vec<String> {
+    let mut names = Vec::with_capacity(host_ids.len());
+    for id in host_ids {
+        let name = state
+            .store
+            .get_host(HostId(*id))
+            .await
+            .ok()
+            .map(|h| h.display_name)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| id.to_string());
+        names.push(name);
+    }
+    names
+}
+
 async fn load_obs_for_validate(
     state: &AppState,
-    host_id: Option<Uuid>,
+    host_ids: &[Uuid],
+    scan_id: Option<Uuid>,
     limit: usize,
     inline: Option<Vec<Observation>>,
-) -> Result<Vec<Observation>, ApiError> {
+) -> Result<(Vec<Observation>, serde_json::Value), ApiError> {
+    let scope = serde_json::json!({
+        "host_id": host_ids.first().copied(),
+        "host_ids": host_ids,
+        "scan_id": scan_id,
+    });
     if let Some(obs) = inline {
-        return Ok(obs);
+        return Ok((obs, scope));
     }
     let lim = limit.clamp(1, 50_000);
-    let rows = state
-        .store
-        .list_observations(host_id.map(HostId), lim)
-        .await?;
-    Ok(rows.into_iter().map(|o| o.data).collect())
+    // When filtering by scan (or multi-host), pull a wide window first so older
+    // snapshots / per-host rows are not truncated before filters run.
+    let fetch = if scan_id.is_some() || host_ids.len() > 1 {
+        50_000usize
+    } else {
+        lim
+    };
+    let mut out: Vec<Observation> = Vec::new();
+    if host_ids.is_empty() {
+        let rows = state.store.list_observations(None, fetch).await?;
+        out = rows
+            .into_iter()
+            .filter(|o| scan_id.map(|s| o.scan_id.0 == s).unwrap_or(true))
+            .map(|o| o.data)
+            .collect();
+    } else {
+        // Fair share across selected hosts so one noisy host does not starve others.
+        let per = (fetch / host_ids.len()).max(1);
+        for hid in host_ids {
+            let rows = state
+                .store
+                .list_observations(Some(HostId(*hid)), per)
+                .await?;
+            out.extend(
+                rows.into_iter()
+                    .filter(|o| scan_id.map(|s| o.scan_id.0 == s).unwrap_or(true))
+                    .map(|o| o.data),
+            );
+        }
+    }
+    if out.len() > lim {
+        let skip = out.len() - lim;
+        out = out.split_off(skip);
+    }
+    Ok((out, scope))
 }
 
 /// Type-check a candidate check manifest and dry-run over recent (or inline) observations.
@@ -2080,9 +2332,25 @@ async fn validate_check(
             format!("check compile failed: {e}"),
         )
     })?;
-    let observations =
-        load_obs_for_validate(&state, body.host_id, body.limit, body.observations).await?;
-    let mut resp = validate_check_response(&engine, &observations, body.sample_limit, "draft_toml");
+    let host_ids = coalesce_validate_host_ids(&body);
+    let host_names = host_names_for_ids(&state, &host_ids).await;
+    let (observations, scope) = load_obs_for_validate(
+        &state,
+        &host_ids,
+        body.scan_id,
+        body.limit,
+        body.observations,
+    )
+    .await?;
+    let mut resp = validate_check_response(
+        &engine,
+        &observations,
+        body.sample_limit,
+        "draft_toml",
+        &scope,
+        &host_ids,
+        &host_names,
+    );
     if body.create_findings {
         resp["create_findings"] = serde_json::json!({
             "supported": false,
@@ -2123,13 +2391,24 @@ async fn validate_check_by_id(
             ));
         }
     }
-    let observations =
-        load_obs_for_validate(&state, body.host_id, body.limit, body.observations).await?;
+    let host_ids = coalesce_validate_host_ids(&body);
+    let host_names = host_names_for_ids(&state, &host_ids).await;
+    let (observations, scope) = load_obs_for_validate(
+        &state,
+        &host_ids,
+        body.scan_id,
+        body.limit,
+        body.observations,
+    )
+    .await?;
     Ok(Json(validate_check_response(
         &engine,
         &observations,
         body.sample_limit,
         "saved_or_override",
+        &scope,
+        &host_ids,
+        &host_names,
     )))
 }
 
@@ -2155,9 +2434,25 @@ async fn test_check_by_id(
             format!("check compile failed: {e}"),
         )
     })?;
-    let observations =
-        load_obs_for_validate(&state, body.host_id, body.limit, body.observations).await?;
-    let mut resp = validate_check_response(&engine, &observations, body.sample_limit, "test");
+    let host_ids = coalesce_validate_host_ids(&body);
+    let host_names = host_names_for_ids(&state, &host_ids).await;
+    let (observations, scope) = load_obs_for_validate(
+        &state,
+        &host_ids,
+        body.scan_id,
+        body.limit,
+        body.observations,
+    )
+    .await?;
+    let mut resp = validate_check_response(
+        &engine,
+        &observations,
+        body.sample_limit,
+        "test",
+        &scope,
+        &host_ids,
+        &host_names,
+    );
     resp["mode"] = serde_json::json!("dry_run");
     resp["check_id"] = serde_json::json!(id);
     Ok(Json(resp))
@@ -2294,6 +2589,16 @@ pub struct UpdateHostBody {
     pub auth_checked_at: Option<String>,
     #[serde(default)]
     pub agent_kind: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub os_id: Option<String>,
+    #[serde(default)]
+    pub os_version: Option<String>,
 }
 
 async fn update_host(
@@ -2301,6 +2606,11 @@ async fn update_host(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateHostBody>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let platform = crate::ingest_tree::platform_patch(
+        body.arch.as_deref(),
+        body.kernel.as_deref(),
+        body.os.as_deref(),
+    );
     let host = state
         .store
         .update_host(
@@ -2316,6 +2626,21 @@ async fn update_host(
                 auth_detail: body.auth_detail,
                 auth_checked_at: body.auth_checked_at,
                 agent_kind: body.agent_kind,
+                arch: platform.arch.or(body.arch),
+                kernel: platform.kernel.or(body.kernel),
+                os: platform.os.or(body.os),
+                os_id: body
+                    .os_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                os_version: body
+                    .os_version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
                 ..Default::default()
             },
         )
@@ -2618,7 +2943,8 @@ async fn delete_host(
     let name = host.display_name.clone();
     state.store.delete_host(HostId(id)).await?;
     crate::platform_ch::purge_host_artifacts(&state, id, Some(name.as_str())).await;
-    flush_control_plane_now(&state).await;
+    let remaining = state.store.list_hosts().await.map(|h| h.len()).unwrap_or(1);
+    flush_control_plane_now(&state, remaining == 0).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2674,7 +3000,8 @@ async fn delete_hosts_bulk(
         )
         .await;
     }
-    flush_control_plane_now(&state).await;
+    let remaining = state.store.list_hosts().await.map(|h| h.len()).unwrap_or(1);
+    flush_control_plane_now(&state, remaining == 0).await;
     Ok(Json(result))
 }
 
@@ -2711,12 +3038,44 @@ pub struct HostInventoryQuery {
     #[serde(default)]
     pub inventory: Option<String>,
     /// When true, return only `count` (empty row arrays) — used by scan overview badges.
-    #[serde(default)]
+    /// Accepts true/false and common 1/0 / yes/no forms from query strings.
+    #[serde(default, deserialize_with = "deserialize_query_bool")]
     pub count_only: bool,
 }
 
 fn default_inventory_limit() -> usize {
     10_000
+}
+
+fn deserialize_query_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    struct BoolVisitor;
+    impl<'de> Visitor<'de> for BoolVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean (true/false, 1/0, yes/no)")
+        }
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "t" | "yes" | "y" | "on" => Ok(true),
+                "0" | "false" | "f" | "no" | "n" | "off" | "" => Ok(false),
+                other => Err(E::custom(format!("invalid boolean `{other}`"))),
+            }
+        }
+    }
+    deserializer.deserialize_any(BoolVisitor)
 }
 
 fn inventory_index0(inventory: &str) -> usize {
@@ -2844,7 +3203,12 @@ async fn host_processes(
                 .await?;
         let mut source = if count > 0 { "scan" } else { "none" };
         if is_virtual && want_latest && count == 0 {
-            let n = crate::sift_api::load_virtual_jsonl(&host).len();
+            let n = crate::sift_api::virtual_ingest_count_preferred(
+                &state,
+                &host,
+                crate::platform_ch::KIND_VIRTUAL_PROCESSES,
+            )
+            .await;
             if n > 0 {
                 count = n;
                 source = "virtual_ingest";
@@ -2879,9 +3243,9 @@ async fn host_processes(
         .collect();
     let mut count = processes.len();
 
-    // Virtual agents: fall back to ingest JSONL only for latest (no scan override).
+    // Virtual agents: ClickHouse platform blob (disk fallback) for latest inventory.
     if is_virtual && want_latest && count == 0 {
-        let raw = crate::sift_api::load_virtual_jsonl(&host);
+        let raw = crate::sift_api::load_virtual_jsonl_preferred(&state, &host).await;
         if !raw.is_empty() {
             source = "virtual_ingest";
             processes = raw
@@ -2980,7 +3344,12 @@ async fn host_files(
         }
         let mut source = if file_count > 0 { "scan" } else { "none" };
         if is_virtual && want_latest && file_count == 0 {
-            let n = crate::sift_api::load_virtual_files_jsonl(&host).len();
+            let n = crate::sift_api::virtual_ingest_count_preferred(
+                &state,
+                &host,
+                crate::platform_ch::KIND_VIRTUAL_FILES,
+            )
+            .await;
             if n > 0 {
                 file_count = n;
                 source = "virtual_ingest";
@@ -3114,11 +3483,11 @@ async fn host_files(
     let mut source = if !files.is_empty() { "scan" } else { "none" };
 
     if is_virtual && want_latest && files.is_empty() {
-        let raw = crate::sift_api::load_virtual_files_jsonl(&host);
+        let raw =
+            crate::sift_api::load_virtual_files_jsonl_preferred(&state, &host, limit).await;
         if !raw.is_empty() {
             files = raw
                 .into_iter()
-                .take(limit)
                 .map(|e| {
                     serde_json::json!({
                         "path": { "s": e.path },
@@ -3209,32 +3578,6 @@ async fn host_connections(
         "count": count,
         "connections": connections,
     })))
-}
-
-fn latest_kind_inventory(
-    rows: &[rustmite_store::StoredObservation],
-    kind: &str,
-) -> (Option<Uuid>, Vec<serde_json::Value>) {
-    // Prefer the chronologically last matching row's scan (append order), not
-    // max(UUID), so inventory tracks the most recent successful collection.
-    let latest_scan = rows
-        .iter()
-        .rev()
-        .find(|o| o.kind == kind)
-        .map(|o| o.scan_id.0);
-    let Some(scan_id) = latest_scan else {
-        return (None, Vec::new());
-    };
-    let out: Vec<serde_json::Value> = rows
-        .iter()
-        .filter(|o| o.kind == kind && o.scan_id.0 == scan_id)
-        .filter_map(|o| match &o.data {
-            Observation::Process(p) => serde_json::to_value(p).ok(),
-            Observation::Socket(s) => serde_json::to_value(s).ok(),
-            other => serde_json::to_value(other).ok(),
-        })
-        .collect();
-    (Some(scan_id), out)
 }
 
 #[derive(Deserialize)]
@@ -3370,6 +3713,131 @@ async fn list_findings(
     Ok(Json(findings))
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateFindingBody {
+    /// `new` | `acknowledged` | `true_positive` | `false_positive` | `suppressed` | `resolved`
+    status: String,
+    #[serde(default)]
+    suppressed_by: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn update_finding(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    axum::Extension(ctx): axum::Extension<crate::operator_auth::AuthContext>,
+    Json(body): Json<UpdateFindingBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let status = rustmite_proto::FindingStatus::parse(&body.status).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid status {:?} — use new, acknowledged, true_positive, false_positive, suppressed, or resolved",
+                body.status
+            ),
+        )
+    })?;
+    let who = body
+        .suppressed_by
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| body.note.filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| ctx.username.clone());
+    let finding = state
+        .store
+        .update_finding_status(rustmite_proto::FindingId(id), status, Some(who.clone()))
+        .await?;
+    let _ = state
+        .store
+        .push_activity(ActivityEvent {
+            id: Uuid::new_v4(),
+            ts: crate::sys_metrics::utc_now_rfc3339(),
+            level: "info".into(),
+            kind: format!("finding.{}", status.as_str()),
+            message: match status {
+                rustmite_proto::FindingStatus::FalsePositive
+                | rustmite_proto::FindingStatus::Suppressed => format!(
+                    "{} marked {} / {} false positive (host+check)",
+                    ctx.username,
+                    finding.check_id.as_str(),
+                    short_finding_id(&finding),
+                ),
+                rustmite_proto::FindingStatus::New => format!(
+                    "{} cleared classification for {} / {}",
+                    ctx.username,
+                    finding.check_id.as_str(),
+                    short_finding_id(&finding),
+                ),
+                _ => format!(
+                    "{} classified finding {} as {}",
+                    ctx.username,
+                    short_finding_id(&finding),
+                    status.as_str()
+                ),
+            },
+            scan_id: Some(finding.scan_id),
+            host_id: Some(finding.host_id),
+            node_id: None,
+            detail: Some(serde_json::json!({
+                "finding_id": finding.id.0,
+                "status": status.as_str(),
+                "by": who,
+                "check_id": finding.check_id.as_str(),
+                "host_id": finding.host_id.0,
+                "scope": match status {
+                    rustmite_proto::FindingStatus::FalsePositive
+                    | rustmite_proto::FindingStatus::Suppressed
+                    | rustmite_proto::FindingStatus::New => "host_check",
+                    _ => "finding",
+                },
+            })),
+        })
+        .await;
+    Ok(Json(finding))
+}
+
+async fn delete_finding(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    axum::Extension(ctx): axum::Extension<crate::operator_auth::AuthContext>,
+) -> Result<impl IntoResponse, ApiError> {
+    let removed = state
+        .store
+        .delete_finding(rustmite_proto::FindingId(id))
+        .await?;
+    if !removed {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("finding {id} not found"),
+        ));
+    }
+    let sid = id.to_string();
+    let short = sid.get(..8).unwrap_or(&sid);
+    let _ = state
+        .store
+        .push_activity(ActivityEvent {
+            id: Uuid::new_v4(),
+            ts: crate::sys_metrics::utc_now_rfc3339(),
+            level: "info".into(),
+            kind: "finding.deleted".into(),
+            message: format!("{} deleted finding {short}", ctx.username),
+            scan_id: None,
+            host_id: None,
+            node_id: None,
+            detail: Some(serde_json::json!({
+                "finding_id": id,
+                "by": ctx.username,
+            })),
+        })
+        .await;
+    Ok(Json(serde_json::json!({ "deleted": true, "id": id })))
+}
+
+fn short_finding_id(f: &rustmite_proto::Finding) -> String {
+    let s = f.id.0.to_string();
+    s.get(..8).unwrap_or(&s).to_string()
+}
+
 async fn clear_findings(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let purged = state.store.clear_all_findings().await?;
     let _ = state
@@ -3393,7 +3861,49 @@ async fn get_scan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(state.store.get_scan(ScanId(id)).await?))
+    let mut status = state.store.get_scan(ScanId(id)).await?;
+    if let Some(meta) = status.meta.as_mut() {
+        let _ = crate::platform_ch::enrich_virtual_scan_inventory(&state, meta).await;
+    }
+    Ok(Json(status))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateScanBody {
+    /// Replace scan tags (empty clears). Accepts a list and/or comma-separated `scan_tag`.
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    scan_tags: Option<Vec<String>>,
+    #[serde(default)]
+    scan_tag: Option<String>,
+}
+
+async fn update_scan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateScanBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.tags.is_none() && body.scan_tags.is_none() && body.scan_tag.is_none() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "provide tags, scan_tags, or scan_tag".into(),
+        ));
+    }
+    let mut raw = body.tags.unwrap_or_default();
+    if let Some(extra) = body.scan_tags {
+        raw.extend(extra);
+    }
+    if let Some(t) = body.scan_tag {
+        if !t.trim().is_empty() {
+            raw.push(t);
+        }
+    }
+    let meta = state
+        .store
+        .update_scan_tags(ScanId(id), raw)
+        .await?;
+    Ok(Json(serde_json::json!({ "scan_id": id, "meta": meta })))
 }
 
 async fn scan_coverage(
@@ -4234,8 +4744,10 @@ async fn node_results(
             bytes_from_probe: 0,
             observation_count: body.observations.len() as u32,
             node_signature: None,
-        import_folders: vec![],
-        import_files: vec![],
+            import_folders: vec![],
+            import_files: vec![],
+            tags: vec![],
+            inventory: None,
         };
         state
             .store

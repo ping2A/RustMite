@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::routes::{ApiError, AppState};
-use crate::sift_api::load_virtual_jsonl;
+use crate::sift_api::load_virtual_jsonl_preferred;
 
 fn default_suspect() -> f64 {
     95.0
@@ -229,9 +229,9 @@ async fn collect_host_commands(
         }
         return Ok(cmds);
     }
-    // Virtual hosts: fall back to current ingest JSONL only for latest inventory.
+    // Virtual hosts: ClickHouse platform blob (disk fallback) for latest inventory.
     if host.agent_kind.eq_ignore_ascii_case("virtual") && is_latest_inventory(inventory) {
-        for row in load_virtual_jsonl(host) {
+        for row in load_virtual_jsonl_preferred(state, host).await {
             let cmd = cmdline_from_raw(&row);
             if !cmd.is_empty() {
                 cmds.push(cmd);

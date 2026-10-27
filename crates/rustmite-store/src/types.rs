@@ -254,6 +254,37 @@ pub struct DataCounts {
     pub credentials: usize,
 }
 
+/// Approximate JSON-serialized size of each store component (Data page).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ComponentBytes {
+    #[serde(default)]
+    pub hosts: u64,
+    #[serde(default)]
+    pub findings: u64,
+    #[serde(default)]
+    pub scans: u64,
+    #[serde(default)]
+    pub observations: u64,
+    #[serde(default)]
+    pub activity: u64,
+    #[serde(default)]
+    pub baselines: u64,
+    #[serde(default)]
+    pub host_keys: u64,
+    #[serde(default)]
+    pub ssh_hunter: u64,
+    #[serde(default)]
+    pub ssh_zones: u64,
+    #[serde(default)]
+    pub ssh_identities: u64,
+    #[serde(default)]
+    pub ssh_passwords: u64,
+    #[serde(default)]
+    pub credentials: u64,
+    #[serde(default)]
+    pub nodes: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct QueueSnapshot {
     pub queued: usize,

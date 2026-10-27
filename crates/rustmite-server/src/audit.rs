@@ -568,6 +568,16 @@ fn describe_action(
 
         // —— Findings / scans ——
         ("DELETE", ["findings"]) => ("Clear findings".into(), body_hint(body)),
+        ("PATCH", ["findings", id]) => {
+            let st = json_str(body, "status").unwrap_or("?");
+            (
+                "Classify finding".into(),
+                format!("finding={} status={st}", short_id(id)),
+            )
+        }
+        ("DELETE", ["findings", id]) => {
+            ("Delete finding".into(), format!("finding={}", short_id(id)))
+        }
         ("POST", ["findings", id, rest @ ..]) => (
             "Update finding".into(),
             format!("finding={} {}", short_id(id), rest.join("/")),

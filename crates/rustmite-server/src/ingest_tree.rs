@@ -8,7 +8,19 @@
 //!   PulseSecure-Periodicsnapshot-standalone-EDGEVPN01…/
 //!     *.jsonl
 //! ```
+//!
+//! Or a campaign parent that contains several day folders:
+//! ```text
+//! /…/vpn/
+//!   2026-05-03/
+//!     PulseSecure-Periodicsnapshot-standalone-HOST…/
+//!   2026-05-10/
+//!     …
+//! ```
+//! Pass the parent path (and optional `days`) to import every selected day with the
+//! same naming / virtual-agent options.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +29,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use rustmite_proto::{
-    Arch, BigInt, DeliveryReport, FileMetaObs, Observation, PathBytes, ProcessObs, ScanMeta,
-    ScanOutcome, SocketObs,
+    Arch, BigInt, DeliveryReport, FileMetaObs, Observation, PathBytes, ProcessObs,
+    ScanInventorySummary, ScanMeta, ScanOutcome, SocketObs,
 };
 use rustmite_sift::{parse_jsonl_process_line, RawFileEntry, RawLogEntry};
 use rustmite_store::{
@@ -65,6 +77,33 @@ pub struct ImportTreeBody {
     /// Named virtual-agent profile (Settings → Virtual agents) applied to every host.
     #[serde(default)]
     pub virtual_agent_id: Option<String>,
+    /// Optional platform identity applied to every imported host.
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Host labels (env / profile / region / tags / …) applied to every imported host.
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
+    /// Tags applied to each scan created by this tree import.
+    #[serde(default)]
+    pub scan_tags: Option<Vec<String>>,
+    /// Comma-separated convenience (merged into `scan_tags`).
+    #[serde(default)]
+    pub scan_tag: Option<String>,
+    /// When the root is a campaign folder of `YYYY-MM-DD` day dirs, only import these
+    /// day names. Empty / omitted = all day folders under the root (auto-detected).
+    #[serde(default)]
+    pub days: Option<Vec<String>>,
+    /// Force campaign (day-folder) expansion even if the root is mixed.
+    #[serde(default)]
+    pub campaign: Option<bool>,
+    /// Optional filter: only import these host subdirectory names (exact match).
+    /// Used by the UI to import one host at a time for live progress.
+    #[serde(default)]
+    pub host_dirs: Option<Vec<String>>,
 }
 
 /// Browser folder upload: same as [`ImportTreeBody`] but files arrive inline with
@@ -87,6 +126,21 @@ pub struct ImportTreeUploadBody {
     pub source_label: Option<String>,
     #[serde(default)]
     pub virtual_agent_id: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Host labels (env / profile / region / tags / …) applied to every imported host.
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
+    /// Tags applied to each scan created by this tree import.
+    #[serde(default)]
+    pub scan_tags: Option<Vec<String>>,
+    /// Comma-separated convenience (merged into `scan_tags`).
+    #[serde(default)]
+    pub scan_tag: Option<String>,
     /// Relative path + contents (e.g. `HOSTDIR/snapshot.jsonl`).
     pub files: Vec<crate::ingest_virtual::InlineIngestFile>,
 }
@@ -101,6 +155,42 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) fn coalesce_scan_tags(
+    tags: Option<Vec<String>>,
+    tag: Option<String>,
+) -> Vec<String> {
+    let mut v = tags.unwrap_or_default();
+    if let Some(t) = tag {
+        if !t.trim().is_empty() {
+            v.push(t);
+        }
+    }
+    rustmite_store::normalize_scan_tags(v)
+}
+
+/// Parent folder name used as a scan tag so multi-day imports of the same host
+/// stay distinguishable (day folder `YYYY-MM-DD`, or the immediate parent dir).
+fn parent_dir_scan_tag(host_dir: &Path, day: Option<&str>) -> Option<String> {
+    if let Some(d) = day.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(d.to_string());
+    }
+    host_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn with_parent_scan_tag(base: &[String], parent: Option<&str>) -> Vec<String> {
+    let mut v = base.to_vec();
+    if let Some(p) = parent.map(str::trim).filter(|s| !s.is_empty()) {
+        v.push(p.to_string());
+    }
+    rustmite_store::normalize_scan_tags(v)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportTreeHostResult {
     pub dir: String,
@@ -113,6 +203,9 @@ pub struct ImportTreeHostResult {
     pub sockets: usize,
     pub skipped: usize,
     pub error: Option<String>,
+    /// Day folder name when importing a campaign parent (`YYYY-MM-DD`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,7 +215,26 @@ pub struct ImportTreeSummary {
     pub hosts_failed: usize,
     #[serde(default)]
     pub hosts_skipped: usize,
+    /// True when root was treated as a parent of day folders.
+    #[serde(default)]
+    pub campaign: bool,
+    /// Day folders that were imported (campaign mode).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<String>,
     pub results: Vec<ImportTreeHostResult>,
+}
+
+/// `YYYY-MM-DD` day-folder name (campaign layout).
+pub fn looks_like_iso_day_folder(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.len() != 10 {
+        return false;
+    }
+    b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Extract hostname from PulseSecure snapshot directory names.
@@ -213,6 +325,83 @@ pub fn parse_mixed_snapshot_jsonl(
     )
 }
 
+/// Parse one NDJSON line into process / file / socket (or skip).
+pub enum MixedLine {
+    Process(RawLogEntry),
+    File(RawFileEntry),
+    Socket(SocketObs),
+    Skip,
+}
+
+pub fn parse_mixed_snapshot_line(
+    line: &str,
+    default_machine: &str,
+    map: &crate::ingest_map::VirtualIngestMap,
+) -> MixedLine {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+        return MixedLine::Skip;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return MixedLine::Skip;
+    };
+    let event_type = v
+        .get("event_type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match event_type.as_str() {
+        "process" => {
+            match crate::ingest_map::process_from_value(&v, map, default_machine)
+                .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
+            {
+                Some(e) => MixedLine::Process(e),
+                None => MixedLine::Skip,
+            }
+        }
+        "file_information" | "file" | "file_meta" => {
+            match crate::ingest_map::file_from_value(&v, map, default_machine)
+                .or_else(|| file_entry_from_value(&v, default_machine))
+            {
+                Some(e) => MixedLine::File(e),
+                None => MixedLine::Skip,
+            }
+        }
+        "network_connection" | "socket" | "connection" => match socket_from_value(&v) {
+            Some(s) => MixedLine::Socket(s),
+            None => MixedLine::Skip,
+        },
+        "iptables_rule" | "iptables" => MixedLine::Skip,
+        "" => {
+            if has_process_hints(&v) {
+                if let Some(e) = crate::ingest_map::process_from_value(&v, map, default_machine)
+                    .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
+                {
+                    MixedLine::Process(e)
+                } else if let Some(e) = crate::ingest_map::file_from_value(&v, map, default_machine)
+                    .or_else(|| file_entry_from_value(&v, default_machine))
+                {
+                    MixedLine::File(e)
+                } else {
+                    MixedLine::Skip
+                }
+            } else if let Some(e) = crate::ingest_map::file_from_value(&v, map, default_machine)
+                .or_else(|| file_entry_from_value(&v, default_machine))
+            {
+                MixedLine::File(e)
+            } else if let Some(e) = crate::ingest_map::process_from_value(&v, map, default_machine)
+                .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
+            {
+                MixedLine::Process(e)
+            } else {
+                MixedLine::Skip
+            }
+        }
+        _ => MixedLine::Skip,
+    }
+}
+
 /// Like [`parse_mixed_snapshot_jsonl`], preferring the host/profile field map when set.
 pub fn parse_mixed_snapshot_jsonl_with_map(
     content: &str,
@@ -225,74 +414,16 @@ pub fn parse_mixed_snapshot_jsonl_with_map(
     let mut skipped = 0usize;
 
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            skipped += 1;
-            continue;
-        };
-        let event_type = v
-            .get("event_type")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        match event_type.as_str() {
-            "process" => {
-                match crate::ingest_map::process_from_value(&v, map, default_machine)
-                    .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
-                {
-                    Some(e) => procs.push(e),
-                    None => skipped += 1,
-                }
-            }
-            "file_information" | "file" | "file_meta" => {
-                match crate::ingest_map::file_from_value(&v, map, default_machine)
-                    .or_else(|| file_entry_from_value(&v, default_machine))
-                {
-                    Some(e) => files.push(e),
-                    None => skipped += 1,
-                }
-            }
-            "network_connection" | "socket" | "connection" => {
-                match socket_from_value(&v) {
-                    Some(s) => sockets.push(s),
-                    None => skipped += 1,
-                }
-            }
-            "iptables_rule" | "iptables" => {
-                skipped += 1;
-            }
-            "" => {
-                if has_process_hints(&v) {
-                    if let Some(e) = crate::ingest_map::process_from_value(&v, map, default_machine)
-                        .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
-                    {
-                        procs.push(e);
-                    } else if let Some(e) =
-                        crate::ingest_map::file_from_value(&v, map, default_machine)
-                            .or_else(|| file_entry_from_value(&v, default_machine))
-                    {
-                        files.push(e);
-                    } else {
-                        skipped += 1;
-                    }
-                } else if let Some(e) = crate::ingest_map::file_from_value(&v, map, default_machine)
-                    .or_else(|| file_entry_from_value(&v, default_machine))
-                {
-                    files.push(e);
-                } else if let Some(e) =
-                    crate::ingest_map::process_from_value(&v, map, default_machine)
-                        .or_else(|| parse_jsonl_process_line(line, default_machine).ok())
-                {
-                    procs.push(e);
-                } else {
+        match parse_mixed_snapshot_line(line, default_machine, map) {
+            MixedLine::Process(e) => procs.push(e),
+            MixedLine::File(e) => files.push(e),
+            MixedLine::Socket(s) => sockets.push(s),
+            MixedLine::Skip => {
+                let t = line.trim();
+                if !t.is_empty() && !t.starts_with('#') && !t.starts_with("//") {
                     skipped += 1;
                 }
             }
-            _ => skipped += 1,
         }
     }
     (procs, files, sockets, skipped)
@@ -405,15 +536,27 @@ fn parse_port(v: Option<&serde_json::Value>) -> u16 {
 }
 
 fn process_obs_from_raw(e: &RawLogEntry) -> Observation {
+    // Heal older imports that basenamed `[kworker/0:0H]` → `0:0H]`.
+    let name = {
+        let n = e.name.trim();
+        let p = e.path.trim();
+        if rustmite_sift::looks_like_kernel_thread_name(p)
+            && !rustmite_sift::looks_like_kernel_thread_name(n)
+        {
+            p.to_string()
+        } else {
+            e.name.clone()
+        }
+    };
     let (comm, exe, cmdline) = if e.path.is_empty() && !e.args.is_empty() {
-        let parts: Vec<PathBytes> = std::iter::once(e.name.as_str())
+        let parts: Vec<PathBytes> = std::iter::once(name.as_str())
             .chain(e.args.split_whitespace())
             .map(PathBytes::from_str)
             .collect();
-        (e.name.clone(), None, parts)
+        (name, None, parts)
     } else {
         let mut cmdline = vec![PathBytes::from_str(if e.path.is_empty() {
-            e.name.as_str()
+            name.as_str()
         } else {
             e.path.as_str()
         })];
@@ -427,7 +570,7 @@ fn process_obs_from_raw(e: &RawLogEntry) -> Observation {
         } else {
             Some(PathBytes::from_str(&e.path))
         };
-        (e.name.clone(), exe, cmdline)
+        (name, exe, cmdline)
     };
     Observation::Process(ProcessObs {
         pid: e.pid as i32,
@@ -508,11 +651,63 @@ fn parse_ls_mode(s: &str) -> u32 {
     mode
 }
 
+/// Normalize optional arch / kernel / OS strings for host updates.
+pub fn platform_patch(
+    arch: Option<&str>,
+    kernel: Option<&str>,
+    os: Option<&str>,
+) -> UpdateHost {
+    let mut patch = UpdateHost::default();
+    if let Some(a) = arch.map(str::trim).filter(|s| !s.is_empty()) {
+        let known = Arch::from_uname(a);
+        patch.arch = Some(if known == Arch::Unknown {
+            a.to_string()
+        } else {
+            known.as_str().to_string()
+        });
+    }
+    if let Some(k) = kernel.map(str::trim).filter(|s| !s.is_empty()) {
+        patch.kernel = Some(k.to_string());
+    }
+    if let Some(o) = os.map(str::trim).filter(|s| !s.is_empty()) {
+        patch.os = Some(o.to_string());
+    }
+    patch
+}
+
+fn host_scan_arch(host: &HostRecord) -> Arch {
+    host.arch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Arch::from_uname)
+        .unwrap_or(Arch::Unknown)
+}
+
+fn merge_operator_labels(
+    labels: &mut BTreeMap<String, String>,
+    extra: Option<&BTreeMap<String, String>>,
+) {
+    let Some(extra) = extra else {
+        return;
+    };
+    for (k, v) in extra {
+        let key = k.trim();
+        let val = v.trim();
+        if key.is_empty() || val.is_empty() {
+            continue;
+        }
+        labels.insert(key.to_string(), val.to_string());
+    }
+}
+
 async fn ensure_virtual_host(
     state: &AppState,
     display_name: &str,
     source_label: Option<&str>,
     profile: Option<&crate::virtual_agents::VirtualAgentProfile>,
+    platform: Option<&UpdateHost>,
+    extra_labels: Option<&BTreeMap<String, String>>,
 ) -> Result<(HostRecord, bool), ApiError> {
     let before = state.store.list_hosts().await?;
     let prev = before.iter().find(|h| h.display_name == display_name);
@@ -520,6 +715,7 @@ async fn ensure_virtual_host(
     let mut labels = prev
         .map(|h| h.labels.clone())
         .unwrap_or_default();
+    merge_operator_labels(&mut labels, extra_labels);
     labels.insert("agent".into(), "virtual".into());
     if let Some(src) = source_label {
         labels.insert("source".into(), src.to_string());
@@ -546,20 +742,47 @@ async fn ensure_virtual_host(
             },
         })
         .await?;
-    let host = state
-        .store
-        .update_host(
-            host.id,
-            UpdateHost {
-                auth_status: Some("virtual".into()),
-                auth_detail: Some("virtual agent — snapshot ingest".into()),
-                auth_checked_at: Some(crate::sys_metrics::utc_now_rfc3339()),
-                agent_kind: Some("virtual".into()),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let mut patch = UpdateHost {
+        auth_status: Some("virtual".into()),
+        auth_detail: Some("virtual agent — snapshot ingest".into()),
+        auth_checked_at: Some(crate::sys_metrics::utc_now_rfc3339()),
+        agent_kind: Some("virtual".into()),
+        ..Default::default()
+    };
+    if let Some(p) = platform {
+        if p.arch.is_some() {
+            patch.arch = p.arch.clone();
+        }
+        if p.kernel.is_some() {
+            patch.kernel = p.kernel.clone();
+        }
+        if p.os.is_some() {
+            patch.os = p.os.clone();
+        }
+    }
+    let host = state.store.update_host(host.id, patch).await?;
     Ok((host, !existed))
+}
+
+async fn emit_tree_progress(
+    state: &AppState,
+    message: String,
+    detail: Option<serde_json::Value>,
+) {
+    let _ = state
+        .store
+        .push_activity(rustmite_store::ActivityEvent {
+            id: Uuid::new_v4(),
+            ts: crate::sys_metrics::utc_now_rfc3339(),
+            level: "progress".into(),
+            kind: "import.tree".into(),
+            message,
+            scan_id: None,
+            host_id: None,
+            node_id: None,
+            detail,
+        })
+        .await;
 }
 
 /// Operator: import a directory tree of host snapshots.
@@ -603,36 +826,171 @@ pub async fn import_virtual_tree(
             .or(profile.as_ref().map(|p| p.kind.as_str()))
             .unwrap_or("auto"),
     );
-    let source_label = body
-        .source_label
-        .clone()
-        .or_else(|| {
-            root.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| format!("tree:{s}"))
-        });
-
-    let mut subdirs: Vec<PathBuf> = fs::read_dir(&root)
+    let mut child_dirs: Vec<PathBuf> = fs::read_dir(&root)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
-    subdirs.sort();
+    child_dirs.sort();
 
-    if subdirs.is_empty() {
+    if child_dirs.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!("no subdirectories under {}", root.display()),
         ));
     }
 
+    let day_children: Vec<(String, PathBuf)> = child_dirs
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            if looks_like_iso_day_folder(&name) {
+                Some((name, p.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let force_campaign = body.campaign == Some(true) || body.days.as_ref().is_some_and(|d| !d.is_empty());
+    let auto_campaign = !day_children.is_empty() && day_children.len() == child_dirs.len();
+    let campaign = force_campaign || auto_campaign;
+
+    // Each work unit is (host_subdir_root, optional day label for source=tree:YYYY-MM-DD).
+    let mut host_roots: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut days_imported: Vec<String> = Vec::new();
+
+    if campaign {
+        if day_children.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "campaign import expected YYYY-MM-DD day folders under {}",
+                    root.display()
+                ),
+            ));
+        }
+        let selected: Vec<(String, PathBuf)> = if let Some(want) = body.days.as_ref() {
+            let want: Vec<String> = want
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if want.is_empty() {
+                day_children
+            } else {
+                let mut picked = Vec::new();
+                for name in &want {
+                    if !looks_like_iso_day_folder(name) {
+                        return Err(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid day folder name: {name} (expected YYYY-MM-DD)"),
+                        ));
+                    }
+                    let path = root.join(name);
+                    if !path.is_dir() {
+                        return Err(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            format!("day folder not found: {}", path.display()),
+                        ));
+                    }
+                    picked.push((name.clone(), path));
+                }
+                picked
+            }
+        } else {
+            day_children
+        };
+        for (day, day_path) in selected {
+            let mut host_dirs: Vec<PathBuf> = fs::read_dir(&day_path)
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            host_dirs.sort();
+            days_imported.push(day.clone());
+            for dir in host_dirs {
+                host_roots.push((dir, Some(day.clone())));
+            }
+        }
+        if host_roots.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "no host subdirectories under selected day folders in {}",
+                    root.display()
+                ),
+            ));
+        }
+    } else {
+        for dir in child_dirs {
+            host_roots.push((dir, None));
+        }
+    }
+
+    if let Some(want) = body.host_dirs.as_ref().filter(|v| !v.is_empty()) {
+        let want: std::collections::BTreeSet<String> = want
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        host_roots.retain(|(dir, _)| {
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .map(|n| want.contains(n))
+                .unwrap_or(false)
+        });
+        if host_roots.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "no matching host directories for host_dirs filter under {}",
+                    root.display()
+                ),
+            ));
+        }
+    }
+
     let mut results = Vec::new();
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let platform = platform_patch(body.arch.as_deref(), body.kernel.as_deref(), body.os.as_deref());
+    let platform_ref = if platform.arch.is_some()
+        || platform.kernel.is_some()
+        || platform.os.is_some()
+    {
+        Some(&platform)
+    } else {
+        None
+    };
+    let scan_tags = coalesce_scan_tags(body.scan_tags.clone(), body.scan_tag.clone());
+    let hosts_total = host_roots.len();
+    emit_tree_progress(
+        &state,
+        format!(
+            "Tree import start · {} host folder(s){} under {}",
+            hosts_total,
+            if campaign {
+                format!(" across {} day(s)", days_imported.len())
+            } else {
+                String::new()
+            },
+            root.display()
+        ),
+        Some(serde_json::json!({
+            "phase": "start",
+            "campaign": campaign,
+            "days": days_imported,
+            "hosts_total": hosts_total,
+            "root": root.display().to_string(),
+        })),
+    )
+    .await;
 
-    for dir in subdirs {
+    for (idx, (dir, day)) in host_roots.into_iter().enumerate() {
+        let index = idx + 1;
         let dirname = dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -640,6 +998,41 @@ pub async fn import_virtual_tree(
             .to_string();
         let display_name =
             resolve_host_name_ex(&dirname, &host_from, parent_dir_field, delimiter);
+        let source_label = body.source_label.clone().or_else(|| {
+            day.as_ref()
+                .map(|d| format!("tree:{d}"))
+                .or_else(|| {
+                    root.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| format!("tree:{s}"))
+                })
+        });
+        let day_prefix = day
+            .as_ref()
+            .map(|d| format!("{d} · "))
+            .unwrap_or_default();
+        emit_tree_progress(
+            &state,
+            format!("[{index}/{hosts_total}] {day_prefix}importing {display_name}"),
+            Some(serde_json::json!({
+                "phase": "host_start",
+                "index": index,
+                "total": hosts_total,
+                "day": day,
+                "dir": dirname,
+                "display_name": display_name,
+            })),
+        )
+        .await;
+        tracing::info!(
+            index,
+            total = hosts_total,
+            day = day.as_deref().unwrap_or(""),
+            %display_name,
+            dir = %dirname,
+            "tree import host start"
+        );
+
         let mut row = ImportTreeHostResult {
             dir: dirname.clone(),
             host_id: Uuid::nil(),
@@ -651,7 +1044,11 @@ pub async fn import_virtual_tree(
             sockets: 0,
             skipped: 0,
             error: None,
+            day: day.clone(),
         };
+
+        let parent_tag = parent_dir_scan_tag(&dir, day.as_deref());
+        let host_scan_tags = with_parent_scan_tag(&scan_tags, parent_tag.as_deref());
 
         match import_one_host_dir(
             &state,
@@ -662,16 +1059,62 @@ pub async fn import_virtual_tree(
             body.create_scan,
             kind,
             profile.as_ref(),
+            platform_ref,
+            &host_scan_tags,
+            body.labels.as_ref(),
         )
         .await
         {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.day = day.clone();
+                emit_tree_progress(
+                    &state,
+                    format!(
+                        "[{index}/{hosts_total}] {day_prefix}ok {}{} · {}p / {}f / {}s",
+                        r.display_name,
+                        if r.created { " (new)" } else { "" },
+                        r.processes,
+                        r.files,
+                        r.sockets
+                    ),
+                    Some(serde_json::json!({
+                        "phase": "host_ok",
+                        "index": index,
+                        "total": hosts_total,
+                        "day": day,
+                        "dir": dirname,
+                        "display_name": r.display_name,
+                        "created": r.created,
+                        "processes": r.processes,
+                        "files": r.files,
+                        "sockets": r.sockets,
+                        "scan_id": r.scan_id,
+                    })),
+                )
+                .await;
                 row = r;
                 ok += 1;
             }
             Err(e) => {
                 // Empty snapshot folders (no .jsonl) are common in PulseSecure day trees.
                 let soft = e.starts_with("no .jsonl under ");
+                emit_tree_progress(
+                    &state,
+                    format!(
+                        "[{index}/{hosts_total}] {day_prefix}{} {display_name}: {e}",
+                        if soft { "skip" } else { "fail" }
+                    ),
+                    Some(serde_json::json!({
+                        "phase": if soft { "host_skip" } else { "host_fail" },
+                        "index": index,
+                        "total": hosts_total,
+                        "day": day,
+                        "dir": dirname,
+                        "display_name": display_name,
+                        "error": e,
+                    })),
+                )
+                .await;
                 row.error = Some(e);
                 if soft {
                     skipped += 1;
@@ -681,7 +1124,30 @@ pub async fn import_virtual_tree(
             }
         }
         results.push(row);
+        // Let concurrent /v1/activity polls and other requests run between hosts.
+        tokio::task::yield_now().await;
     }
+
+    emit_tree_progress(
+        &state,
+        format!(
+            "Tree import done · {ok} ok · {failed} failed · {skipped} skipped{}",
+            if campaign {
+                format!(" · {} day(s)", days_imported.len())
+            } else {
+                String::new()
+            }
+        ),
+        Some(serde_json::json!({
+            "phase": "done",
+            "hosts_ok": ok,
+            "hosts_failed": failed,
+            "hosts_skipped": skipped,
+            "campaign": campaign,
+            "days": days_imported,
+        })),
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "ok": failed == 0,
@@ -690,6 +1156,8 @@ pub async fn import_virtual_tree(
             hosts_ok: ok,
             hosts_failed: failed,
             hosts_skipped: skipped,
+            campaign,
+            days: days_imported,
             results,
         }
     })))
@@ -791,6 +1259,14 @@ pub async fn import_virtual_tree_upload(
     let mut by_dir: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     let mut root_files: Vec<(String, String)> = Vec::new();
+    // Last peeled path segment (often a YYYY-MM-DD day folder) → scan tag.
+    let peeled_parent: Option<String> = if start > 0 {
+        entries
+            .first()
+            .and_then(|(parts, _)| parts.get(start - 1).cloned())
+    } else {
+        None
+    };
     for (parts, content) in entries {
         if parts.len() <= start + 1 {
             root_files.push((parts.join("/"), content));
@@ -820,6 +1296,19 @@ pub async fn import_virtual_tree_upload(
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let platform = platform_patch(body.arch.as_deref(), body.kernel.as_deref(), body.os.as_deref());
+    let platform_ref = if platform.arch.is_some()
+        || platform.kernel.is_some()
+        || platform.os.is_some()
+    {
+        Some(&platform)
+    } else {
+        None
+    };
+    let scan_tags = with_parent_scan_tag(
+        &coalesce_scan_tags(body.scan_tags.clone(), body.scan_tag.clone()),
+        peeled_parent.as_deref(),
+    );
 
     for (dirname, files) in by_dir {
         let display_name =
@@ -835,6 +1324,7 @@ pub async fn import_virtual_tree_upload(
             sockets: 0,
             skipped: 0,
             error: None,
+            day: peeled_parent.clone().filter(|d| looks_like_iso_day_folder(d)),
         };
         match import_one_host_files(
             &state,
@@ -846,10 +1336,14 @@ pub async fn import_virtual_tree_upload(
             kind,
             profile.as_ref(),
             &files,
+            platform_ref,
+            &scan_tags,
+            body.labels.as_ref(),
         )
         .await
         {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.day = row.day.clone();
                 row = r;
                 ok += 1;
             }
@@ -864,6 +1358,7 @@ pub async fn import_virtual_tree_upload(
             }
         }
         results.push(row);
+        tokio::task::yield_now().await;
     }
 
     Ok(Json(serde_json::json!({
@@ -873,9 +1368,24 @@ pub async fn import_virtual_tree_upload(
             hosts_ok: ok,
             hosts_failed: failed,
             hosts_skipped: skipped,
+            campaign: false,
+            days: Vec::new(),
             results,
         }
     })))
+}
+
+/// Caps for in-memory scan embedding while streaming large host trees.
+const MAX_PROC_OBS_IN_VIRTUAL_SCAN: usize = 5_000;
+const MAX_SOCK_OBS_IN_VIRTUAL_SCAN: usize = 2_000;
+const STREAM_FLUSH_LINES: usize = 400;
+
+/// Inventory totals for a virtual-import scan (may exceed embedded observation caps).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VirtualImportInventoryTotals {
+    pub processes: usize,
+    pub files: usize,
+    pub sockets: usize,
 }
 
 async fn import_one_host_dir(
@@ -887,39 +1397,188 @@ async fn import_one_host_dir(
     create_scan: bool,
     _kind: VirtualIngestKind,
     profile: Option<&crate::virtual_agents::VirtualAgentProfile>,
+    platform: Option<&UpdateHost>,
+    scan_tags: &[String],
+    extra_labels: Option<&BTreeMap<String, String>>,
 ) -> Result<ImportTreeHostResult, String> {
+    use std::io::{BufRead, BufReader};
+
     let mut jsonl_paths = Vec::new();
     collect_jsonl_files_under(dir, true, &mut jsonl_paths)?;
     jsonl_paths.sort();
     if jsonl_paths.is_empty() {
         return Err(format!("no .jsonl under {}", dir.display()));
     }
-    let mut files = Vec::new();
+    let dirname = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("host");
+
+    let (host, created) =
+        ensure_virtual_host(state, display_name, source_label, profile, platform, extra_labels)
+            .await
+            .map_err(|e| e.1.clone())?;
+    let map = crate::ingest_map::map_for_host(&host);
+
+    // Stream JSONL → disk NDJSON. Never load every source file into RAM at once
+    // (PulseSecure vpn trees are multi‑GB and used to wedge the control plane).
+    if replace {
+        let _ = replace_virtual_process_logs(&host, "");
+        let _ = replace_virtual_file_logs(&host, "");
+    }
+
+    let mut proc_ndjson = String::new();
+    let mut file_ndjson = String::new();
+    let mut proc_batch = 0usize;
+    let mut file_batch = 0usize;
+    let mut proc_total = 0usize;
+    let mut file_total = 0usize;
+    let mut sock_total = 0usize;
+    let mut skipped = 0usize;
+    let mut sample_procs: Vec<RawLogEntry> = Vec::new();
+    let mut sample_files: Vec<RawFileEntry> = Vec::new();
+    let mut sample_socks: Vec<SocketObs> = Vec::new();
+    let mut ingest_names: Vec<String> = Vec::new();
+    let mut lines_seen = 0usize;
+
     for p in &jsonl_paths {
-        let content = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
         let name = p
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("snapshot.jsonl")
             .to_string();
-        files.push((name, content));
+        ingest_names.push(name);
+        let file = fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let reader = BufReader::with_capacity(256 * 1024, file);
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("{}: {e}", p.display()))?;
+            lines_seen += 1;
+            match parse_mixed_snapshot_line(&line, display_name, &map) {
+                MixedLine::Process(mut e) => {
+                    if e.machine_id.is_empty() || e.machine_id == "_" {
+                        e.machine_id = display_name.to_string();
+                    }
+                    if sample_procs.len() < MAX_PROC_OBS_IN_VIRTUAL_SCAN {
+                        sample_procs.push(e.clone());
+                    }
+                    proc_ndjson
+                        .push_str(&serde_json::to_string(&e).map_err(|e| e.to_string())?);
+                    proc_ndjson.push('\n');
+                    proc_batch += 1;
+                    proc_total += 1;
+                }
+                MixedLine::File(mut e) => {
+                    if e.machine_id.is_empty() {
+                        e.machine_id = display_name.to_string();
+                    }
+                    if sample_files.len() < MAX_FILE_OBS_IN_VIRTUAL_SCAN {
+                        sample_files.push(e.clone());
+                    }
+                    file_ndjson
+                        .push_str(&serde_json::to_string(&e).map_err(|e| e.to_string())?);
+                    file_ndjson.push('\n');
+                    file_batch += 1;
+                    file_total += 1;
+                }
+                MixedLine::Socket(s) => {
+                    if sample_socks.len() < MAX_SOCK_OBS_IN_VIRTUAL_SCAN {
+                        sample_socks.push(s);
+                    }
+                    sock_total += 1;
+                }
+                MixedLine::Skip => {
+                    let t = line.trim();
+                    if !t.is_empty() && !t.starts_with('#') && !t.starts_with("//") {
+                        skipped += 1;
+                    }
+                }
+            }
+            if proc_batch >= STREAM_FLUSH_LINES {
+                crate::sift_api::append_virtual_process_logs(&host, &proc_ndjson)?;
+                proc_ndjson.clear();
+                proc_batch = 0;
+            }
+            if file_batch >= STREAM_FLUSH_LINES {
+                crate::sift_api::append_virtual_file_logs(&host, &file_ndjson)?;
+                file_ndjson.clear();
+                file_batch = 0;
+            }
+            if lines_seen % 2_000 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
-    let dirname = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("host");
-    import_one_host_files(
-        state,
-        dirname,
-        display_name,
-        source_label,
+    if !proc_ndjson.is_empty() {
+        crate::sift_api::append_virtual_process_logs(&host, &proc_ndjson)?;
+    }
+    if !file_ndjson.is_empty() {
+        crate::sift_api::append_virtual_file_logs(&host, &file_ndjson)?;
+    }
+
+    let _ = crate::sift_api::record_virtual_import_provenance(
+        &host,
+        Some(dirname),
+        &ingest_names,
         replace,
-        create_scan,
-        _kind,
-        profile,
-        &files,
-    )
-    .await
+    );
+    let (folders, file_names) = crate::sift_api::load_virtual_import_provenance(&host);
+    let folders = if folders.is_empty() {
+        import_folders_from_files(Some(dirname), &ingest_names)
+    } else {
+        folders
+    };
+    let file_names = if file_names.is_empty() {
+        ingest_names
+    } else {
+        file_names
+    };
+
+    let mut scan_id = None;
+    if create_scan {
+        match create_virtual_import_scan_with_provenance(
+            state,
+            &host,
+            &sample_procs,
+            &sample_files,
+            &sample_socks,
+            &format!("tree-import:{dirname}"),
+            &folders,
+            &file_names,
+            scan_tags,
+            Some(VirtualImportInventoryTotals {
+                processes: proc_total,
+                files: file_total,
+                sockets: sock_total,
+            }),
+        )
+        .await
+        {
+            Ok(sid) => scan_id = Some(sid),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    host = %display_name,
+                    "tree import: host saved but scan record failed"
+                );
+            }
+        }
+    }
+
+    crate::platform_ch::sync_virtual_host_from_state(state, host.id.0).await;
+
+    Ok(ImportTreeHostResult {
+        dir: dirname.to_string(),
+        host_id: host.id.0,
+        display_name: host.display_name,
+        created,
+        scan_id,
+        processes: proc_total,
+        files: file_total,
+        sockets: sock_total,
+        skipped,
+        error: None,
+        day: None,
+    })
 }
 
 async fn import_one_host_files(
@@ -932,6 +1591,9 @@ async fn import_one_host_files(
     _kind: VirtualIngestKind,
     profile: Option<&crate::virtual_agents::VirtualAgentProfile>,
     files: &[(String, String)],
+    platform: Option<&UpdateHost>,
+    scan_tags: &[String],
+    extra_labels: Option<&BTreeMap<String, String>>,
 ) -> Result<ImportTreeHostResult, String> {
     let ingest_files: Vec<(String, String)> = files
         .iter()
@@ -948,9 +1610,10 @@ async fn import_one_host_files(
         return Err(format!("no ingest files under {dirname}"));
     }
 
-    let (host, created) = ensure_virtual_host(state, display_name, source_label, profile)
-        .await
-        .map_err(|e| e.1.clone())?;
+    let (host, created) =
+        ensure_virtual_host(state, display_name, source_label, profile, platform, extra_labels)
+            .await
+            .map_err(|e| e.1.clone())?;
 
     let map = crate::ingest_map::map_for_host(&host);
     let mut all_proc = Vec::new();
@@ -1030,15 +1693,25 @@ async fn import_one_host_files(
 
     let mut scan_id = None;
     if create_scan {
+        let totals = VirtualImportInventoryTotals {
+            processes: all_proc.len(),
+            files: all_file.len(),
+            sockets: all_sock.len(),
+        };
+        let proc_sample = &all_proc[..all_proc.len().min(MAX_PROC_OBS_IN_VIRTUAL_SCAN)];
+        let file_sample = &all_file[..all_file.len().min(MAX_FILE_OBS_IN_VIRTUAL_SCAN)];
+        let sock_sample = &all_sock[..all_sock.len().min(MAX_SOCK_OBS_IN_VIRTUAL_SCAN)];
         match create_virtual_import_scan_with_provenance(
             state,
             &host,
-            &all_proc,
-            &all_file,
-            &all_sock,
+            proc_sample,
+            file_sample,
+            sock_sample,
             &format!("tree-import:{dirname}"),
             &folders,
             &file_names,
+            scan_tags,
+            Some(totals),
         )
         .await
         {
@@ -1069,6 +1742,7 @@ async fn import_one_host_files(
         sockets: all_sock.len(),
         skipped,
         error: None,
+        day: None,
     })
 }
 
@@ -1120,11 +1794,17 @@ pub async fn create_virtual_import_scan(
         source,
         &[],
         &[],
+        &[],
+        None,
     )
     .await
 }
 
 /// Like [`create_virtual_import_scan`], also recording which folders/files fed the JSONL.
+///
+/// `procs` / `files` / `socks` are the rows embedded in the scan (already capped by the
+/// caller when needed). Pass [`VirtualImportInventoryTotals`] when the true inventory is
+/// larger than these slices so the UI can show “N of M” and deep-link to Hunt.
 pub async fn create_virtual_import_scan_with_provenance(
     state: &AppState,
     host: &HostRecord,
@@ -1134,6 +1814,8 @@ pub async fn create_virtual_import_scan_with_provenance(
     source: &str,
     import_folders: &[String],
     import_files: &[String],
+    scan_tags: &[String],
+    inventory_totals: Option<VirtualImportInventoryTotals>,
 ) -> Result<Uuid, String> {
     // Clear any stuck active scan for this host by completing as cancelled isn't available —
     // enqueue will conflict; try enqueue and surface a clear error.
@@ -1147,19 +1829,29 @@ pub async fn create_virtual_import_scan_with_provenance(
         .await
         .map_err(|e| e.to_string())?;
 
-    let files_total = files.len();
+    let procs_kept = procs.len().min(MAX_PROC_OBS_IN_VIRTUAL_SCAN);
     let files_kept = files.len().min(MAX_FILE_OBS_IN_VIRTUAL_SCAN);
+    let socks_kept = socks.len().min(MAX_SOCK_OBS_IN_VIRTUAL_SCAN);
+    let totals = inventory_totals.unwrap_or(VirtualImportInventoryTotals {
+        processes: procs.len(),
+        files: files.len(),
+        sockets: socks.len(),
+    });
+    let procs_total = totals.processes.max(procs_kept);
+    let files_total = totals.files.max(files_kept);
+    let socks_total = totals.sockets.max(socks_kept);
+    let procs_truncated = procs_total > procs_kept;
     let files_truncated = files_total > files_kept;
 
     let mut observations: Vec<Observation> =
-        Vec::with_capacity(procs.len() + files_kept + socks.len());
-    for e in procs {
+        Vec::with_capacity(procs_kept + files_kept + socks_kept);
+    for e in &procs[..procs_kept] {
         observations.push(process_obs_from_raw(e));
     }
     for e in &files[..files_kept] {
         observations.push(file_obs_from_raw(e));
     }
-    for s in socks {
+    for s in &socks[..socks_kept] {
         observations.push(Observation::Socket(s.clone()));
     }
 
@@ -1174,11 +1866,27 @@ pub async fn create_virtual_import_scan_with_provenance(
 
     let now = crate::sys_metrics::utc_now_rfc3339();
     let mut reason = source.to_string();
+    let mut cap_bits = Vec::new();
+    if procs_truncated {
+        cap_bits.push(format!("{procs_kept}/{procs_total} processes"));
+    }
     if files_truncated {
+        cap_bits.push(format!("{files_kept}/{files_total} files"));
+    }
+    if !cap_bits.is_empty() {
         reason.push_str(&format!(
-            " (scan embeds {files_kept}/{files_total} file rows; full inventory in ingest JSONL)"
+            " (scan embeds {}; full inventory in ingest / Hunt)",
+            cap_bits.join(", ")
         ));
     }
+    let inventory = Some(ScanInventorySummary {
+        processes: procs_total as u32,
+        files: files_total as u32,
+        sockets: socks_total as u32,
+        processes_in_scan: procs_kept as u32,
+        files_in_scan: files_kept as u32,
+        sockets_in_scan: socks_kept as u32,
+    });
     let meta = ScanMeta {
         scan_id: job.id,
         host_id: host.id,
@@ -1193,11 +1901,18 @@ pub async fn create_virtual_import_scan_with_provenance(
             fallback_reason: Some(reason),
         },
         probe_version: "virtual-import".into(),
-        arch: Arch::X86_64,
-        kernel: String::new(),
-        os: Some("virtual-snapshot".into()),
-        os_id: Some("virtual".into()),
-        os_version: None,
+        // Prefer operator-set host identity; never invent x86_64 for virtual imports.
+        arch: host_scan_arch(host),
+        kernel: host.kernel.clone().unwrap_or_default(),
+        os: host
+            .os
+            .clone()
+            .or_else(|| Some("virtual-snapshot".into())),
+        os_id: host
+            .os_id
+            .clone()
+            .or_else(|| Some("virtual".into())),
+        os_version: host.os_version.clone(),
         boot_id: String::new(),
         caps: Default::default(),
         collectors: vec![],
@@ -1212,6 +1927,8 @@ pub async fn create_virtual_import_scan_with_provenance(
         node_signature: None,
         import_folders: import_folders.to_vec(),
         import_files: import_files.to_vec(),
+        tags: rustmite_store::normalize_scan_tags(scan_tags.to_vec()),
+        inventory,
     };
 
     state
@@ -1232,12 +1949,17 @@ pub async fn create_virtual_import_scan_with_provenance(
             level: "info".into(),
             kind: "scan.virtual_import".into(),
             message: format!(
-                "Imported snapshot for {} ({} proc / {} file{trunc} / {} sock)",
+                "Imported snapshot for {} ({} proc{ptrunc} / {} file{ftrunc} / {} sock)",
                 host.display_name,
-                procs.len(),
+                procs_total,
                 files_total,
-                socks.len(),
-                trunc = if files_truncated {
+                socks_total,
+                ptrunc = if procs_truncated {
+                    format!(", {procs_kept} in scan")
+                } else {
+                    String::new()
+                },
+                ftrunc = if files_truncated {
                     format!(", {files_kept} in scan")
                 } else {
                     String::new()
@@ -1249,9 +1971,14 @@ pub async fn create_virtual_import_scan_with_provenance(
             detail: Some(serde_json::json!({
                 "source": source,
                 "check_set": "virtual-import",
+                "tags": scan_tags,
+                "processes_total": procs_total,
+                "processes_in_scan": procs_kept,
+                "processes_truncated": procs_truncated,
                 "files_total": files_total,
                 "files_in_scan": files_kept,
                 "files_truncated": files_truncated,
+                "sockets_total": socks_total,
                 "import_folders": import_folders,
                 "import_files": import_files,
             })),

@@ -10,7 +10,7 @@ pub mod types;
 pub mod postgres;
 
 pub use error::{StoreError, StoreResult};
-pub use memory::{InMemoryStore, StoreSnapshot};
+pub use memory::{normalize_scan_tags, InMemoryStore, StoreSnapshot};
 pub use traits::Store;
 pub use types::*;
 pub use rustmite_proto::{HostId, NodeId, ScanId};

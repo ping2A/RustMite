@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS rustmite.events
     `process_id` UInt32 DEFAULT 0,
     `user` LowCardinality(String) DEFAULT '',
     `path` String DEFAULT '',
+    `args` String DEFAULT '',
+    `cmdline` String DEFAULT '',
     `src_ip` String DEFAULT '',
     `dest_ip` String DEFAULT '',
     `file_hash` String DEFAULT '',
@@ -29,6 +31,8 @@ CREATE TABLE IF NOT EXISTS rustmite.events
     `exe_memfd` UInt8 DEFAULT 0,
     `ext` String DEFAULT '{}',
     INDEX idx_message_tokens message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_args_tokens args TYPE tokenbf_v1(16384, 3, 0) GRANULARITY 4,
+    INDEX idx_cmdline_tokens cmdline TYPE tokenbf_v1(16384, 3, 0) GRANULARITY 4,
     INDEX idx_host host_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_kind kind TYPE bloom_filter GRANULARITY 4
 )

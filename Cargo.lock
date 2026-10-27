@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-analyze"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-anomark"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-checks"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "regex",
  "rustmite-expr",
@@ -3790,7 +3790,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-cli"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "anyhow",
  "clap",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-collect"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "rustmite-analyze",
  "rustmite-proto",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-crypto"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
@@ -3835,7 +3835,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-expr"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "regex",
  "rustmite-proto",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-loader"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "lz4_flex",
  "rustix",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-node"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-notify"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "hex",
  "hmac 0.12.1",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-probe"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "rustix",
  "rustmite-collect",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-proto"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3921,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-rpl"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "nom",
  "regex",
@@ -3932,7 +3932,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-server"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -3951,6 +3951,7 @@ dependencies = [
  "password-hash 0.5.0",
  "rand 0.8.8",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls 0.23.45",
  "rustmite-anomark",
@@ -3982,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-sift"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4016,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-store"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -4033,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-sys"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "rustix",
  "tempfile",
@@ -4042,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "rustmite-transport"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "bytes",
  "futures",
@@ -5897,7 +5898,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.3.26"
 dependencies = [
  "anyhow",
  "clap",

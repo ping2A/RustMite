@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use rustmite_sift::RawLogEntry;
+use rustmite_sift::{
+    looks_like_kernel_thread_name, parse_command_line, RawLogEntry,
+};
 use rustmite_store::HostRecord;
 use serde::{Deserialize, Serialize};
 
@@ -316,6 +318,23 @@ fn first_u32(v: &serde_json::Value, keys: &[String]) -> Option<u32> {
     None
 }
 
+/// Basename for display name — keep Linux kernel thread names like `[kworker/0:0H]` intact
+/// (`Path::file_name` would wrongly yield `0:0H]`).
+fn process_basename(token: &str) -> String {
+    let t = token.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if looks_like_kernel_thread_name(t) {
+        return t.to_string();
+    }
+    std::path::Path::new(t)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(t)
+        .to_string()
+}
+
 /// Map one JSON object into a process [`RawLogEntry`] using the host field map.
 pub fn process_from_value(
     v: &serde_json::Value,
@@ -337,37 +356,17 @@ pub fn process_from_value(
     let (name, path, args) = match pm.compose {
         CommandCompose::CommandField => {
             if let Some(cmd) = command {
-                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                if parts.is_empty() {
+                let (parsed_name, parsed_path, parsed_args) = parse_command_line(&cmd);
+                if parsed_name.is_empty() && parsed_path.is_empty() {
                     return None;
                 }
-                let n = if name.is_empty() {
-                    std::path::Path::new(parts[0])
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(parts[0])
-                        .to_string()
-                } else {
-                    name
-                };
-                let p = if path.is_empty() {
-                    parts[0].to_string()
-                } else {
-                    path
-                };
-                let a = if args.is_empty() && parts.len() > 1 {
-                    parts[1..].join(" ")
-                } else {
-                    args
-                };
+                let n = if name.is_empty() { parsed_name } else { name };
+                let p = if path.is_empty() { parsed_path } else { path };
+                let a = if args.is_empty() { parsed_args } else { args };
                 (n, p, a)
             } else if !path.is_empty() || !name.is_empty() {
                 let n = if name.is_empty() {
-                    std::path::Path::new(&path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(path.as_str())
-                        .to_string()
+                    process_basename(&path)
                 } else {
                     name
                 };
@@ -381,30 +380,13 @@ pub fn process_from_value(
                 return None;
             }
             if let Some(cmd) = command.filter(|_| path.is_empty()) {
-                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                let p = parts.first().copied().unwrap_or("").to_string();
-                let a = if parts.len() > 1 {
-                    parts[1..].join(" ")
-                } else {
-                    args
-                };
-                let n = if name.is_empty() {
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&p)
-                        .to_string()
-                } else {
-                    name
-                };
-                (n, p, a)
+                let (parsed_name, parsed_path, parsed_args) = parse_command_line(&cmd);
+                let n = if name.is_empty() { parsed_name } else { name };
+                let a = if args.is_empty() { parsed_args } else { args };
+                (n, parsed_path, a)
             } else {
                 let n = if name.is_empty() {
-                    std::path::Path::new(&path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(path.as_str())
-                        .to_string()
+                    process_basename(&path)
                 } else {
                     name
                 };
@@ -416,14 +398,9 @@ pub fn process_from_value(
                 return None;
             }
             if let Some(cmd) = command.filter(|_| name.is_empty()) {
-                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                let n = parts.first().copied().unwrap_or("").to_string();
-                let a = if parts.len() > 1 {
-                    parts[1..].join(" ")
-                } else {
-                    args
-                };
-                (n, path, a)
+                let (parsed_name, _parsed_path, parsed_args) = parse_command_line(&cmd);
+                let a = if args.is_empty() { parsed_args } else { args };
+                (parsed_name, path, a)
             } else {
                 (name, path, args)
             }
@@ -527,4 +504,45 @@ pub fn sniff_keys(content: &str, limit_lines: usize) -> Vec<String> {
         }
     }
     keys.into_iter().map(|(k, _)| k).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulsesecure_kworker_command_keeps_full_comm() {
+        let map = VirtualIngestMap::default();
+        let v = serde_json::json!({
+            "timestamp": "2026-04-27T00:10:05",
+            "event_type": "process",
+            "user": "0",
+            "command": "[kworker/0:0H]",
+            "pid": 5,
+            "ppid": 2
+        });
+        let e = process_from_value(&v, &map, "host-a").expect("parse");
+        assert_eq!(e.name, "[kworker/0:0H]");
+        assert_eq!(e.path, "[kworker/0:0H]");
+        assert!(e.args.is_empty());
+        assert_eq!(e.pid, 5);
+        assert_eq!(e.ppid, 2);
+        assert_eq!(e.uid, 0);
+    }
+
+    #[test]
+    fn normal_path_still_basenames() {
+        let map = VirtualIngestMap::default();
+        let v = serde_json::json!({
+            "event_type": "process",
+            "command": "/usr/sbin/sshd -D",
+            "pid": 42,
+            "ppid": 1,
+            "user": "0"
+        });
+        let e = process_from_value(&v, &map, "host-a").expect("parse");
+        assert_eq!(e.name, "sshd");
+        assert_eq!(e.path, "/usr/sbin/sshd");
+        assert_eq!(e.args, "-D");
+    }
 }

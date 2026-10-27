@@ -534,6 +534,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // If ClickHouse hosts were wiped (e.g. old truncate-then-insert race) but
+        // ingest/{uuid}/ JSONL remains, recreate the virtual host records so the
+        // fleet is usable again without a full re-import.
+        if store.host_count() == 0 {
+            let n =
+                rustmite_server::platform_ch::rehydrate_hosts_from_ingest_dirs(store.as_ref()).await;
+            if n > 0 {
+                tracing::warn!(
+                    recovered = n,
+                    "control plane had 0 hosts — rehydrated virtual hosts from on-disk ingest"
+                );
+            }
+        }
+
         tracing::info!(
             backend = "clickhouse",
             hosts = store.host_count(),
@@ -551,6 +565,16 @@ async fn main() -> anyhow::Result<()> {
             InMemoryStore::open(&args.store)
                 .with_context(|| format!("open store {}", args.store.display()))?,
         );
+        if store.host_count() == 0 {
+            let n =
+                rustmite_server::platform_ch::rehydrate_hosts_from_ingest_dirs(store.as_ref()).await;
+            if n > 0 {
+                tracing::warn!(
+                    recovered = n,
+                    "JSON store had 0 hosts — rehydrated virtual hosts from on-disk ingest"
+                );
+            }
+        }
         tracing::info!(
             backend = "json",
             path = %args.store.display(),
@@ -625,6 +649,16 @@ async fn main() -> anyhow::Result<()> {
                     // Hunt rows already in ClickHouse → skip restore+reindex.
                     // Local JSONL is filled on demand (inventory views) and now
                     // lives under the data volume (`…/ingest`), so it persists.
+                    // Prefer on-disk ingest when present — avoid loading ~10–50 MiB
+                    // JSONL per host into memory on every boot (was OOM-killing).
+                    let ingest = rustmite_server::sift_api::ingest_dir()
+                        .join(h.id.0.to_string());
+                    let local_ready = ingest.join("processes.jsonl").is_file()
+                        || ingest.join("files.jsonl").is_file();
+                    if local_ready {
+                        skipped += 1;
+                        continue;
+                    }
                     if rustmite_server::platform_ch::virtual_host_events_present(
                         ch_bg.as_ref(),
                         h.id.0,
@@ -639,15 +673,8 @@ async fn main() -> anyhow::Result<()> {
                         h.id.0,
                     )
                     .await;
-                    let _ = rustmite_server::platform_ch::sync_virtual_host(ch_bg.as_ref(), h.id.0)
-                        .await;
-                    let _ = rustmite_server::platform_ch::index_virtual_host_events(
-                        store_bg.as_ref(),
-                        ch_bg.as_ref(),
-                        h.id.0,
-                        false,
-                    )
-                    .await;
+                    // Do not sync/reindex full PulseSecure file inventories on boot.
+                    // Inventory views read local JSONL; Hunt is filled at import time.
                 }
                 tracing::info!(
                     virtual_hosts = n,
@@ -819,6 +846,20 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let _ = rustmite_server::credentials::import_filesystem_credentials(&state).await;
+
+    // Make sure rehydrated / partially-persisted virtual hosts are fully durable in
+    // ClickHouse: platform blobs + virtual-import scans + Hunt events.
+    if state.clickhouse.is_some() {
+        let state_bg = state.clone();
+        tokio::spawn(async move {
+            tracing::info!("background: ensuring virtual fleet is fully in ClickHouse");
+            rustmite_server::platform_ch::ensure_virtual_fleet_in_clickhouse(&state_bg).await;
+            // Stale Hunt file caps (old 5k → 50k) are upgraded slowly so boot stays light.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tracing::info!("background: upgrading stale Hunt file indexes");
+            rustmite_server::platform_ch::upgrade_stale_virtual_hunt_indexes(&state_bg).await;
+        });
+    }
 
     let op = operator_router(state.clone());
     let node = node_router(state);

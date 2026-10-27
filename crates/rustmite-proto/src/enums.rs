@@ -120,8 +120,117 @@ impl Arch {
 pub enum FindingStatus {
     New,
     Acknowledged,
+    /// Confirmed real alert (keep visible; triage complete).
+    TruePositive,
+    /// Benign / noise — hide from the default findings view.
+    FalsePositive,
     Suppressed,
     Resolved,
+}
+
+impl FindingStatus {
+    /// Parse UI / API status strings (accepts aliases like `tp` / `fp`).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "new" | "open" => Some(Self::New),
+            "acknowledged" | "ack" => Some(Self::Acknowledged),
+            "true_positive" | "true-positive" | "tp" | "confirmed" => Some(Self::TruePositive),
+            "false_positive" | "false-positive" | "fp" | "benign" => Some(Self::FalsePositive),
+            "suppressed" => Some(Self::Suppressed),
+            "resolved" | "closed" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Acknowledged => "acknowledged",
+            Self::TruePositive => "true_positive",
+            Self::FalsePositive => "false_positive",
+            Self::Suppressed => "suppressed",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    /// Hidden from the default findings list unless the operator asks for them.
+    pub fn is_hidden_by_default(self) -> bool {
+        matches!(self, Self::FalsePositive | Self::Suppressed)
+    }
+}
+
+#[cfg(test)]
+mod finding_status_tests {
+    use super::FindingStatus;
+
+    #[test]
+    fn parse_canonical_and_aliases() {
+        assert_eq!(FindingStatus::parse("new"), Some(FindingStatus::New));
+        assert_eq!(FindingStatus::parse(" OPEN "), Some(FindingStatus::New));
+        assert_eq!(FindingStatus::parse("ack"), Some(FindingStatus::Acknowledged));
+        assert_eq!(
+            FindingStatus::parse("acknowledged"),
+            Some(FindingStatus::Acknowledged)
+        );
+        assert_eq!(FindingStatus::parse("tp"), Some(FindingStatus::TruePositive));
+        assert_eq!(
+            FindingStatus::parse("true-positive"),
+            Some(FindingStatus::TruePositive)
+        );
+        assert_eq!(
+            FindingStatus::parse("confirmed"),
+            Some(FindingStatus::TruePositive)
+        );
+        assert_eq!(FindingStatus::parse("fp"), Some(FindingStatus::FalsePositive));
+        assert_eq!(
+            FindingStatus::parse("false_positive"),
+            Some(FindingStatus::FalsePositive)
+        );
+        assert_eq!(FindingStatus::parse("benign"), Some(FindingStatus::FalsePositive));
+        assert_eq!(
+            FindingStatus::parse("suppressed"),
+            Some(FindingStatus::Suppressed)
+        );
+        assert_eq!(FindingStatus::parse("resolved"), Some(FindingStatus::Resolved));
+        assert_eq!(FindingStatus::parse("closed"), Some(FindingStatus::Resolved));
+        assert_eq!(FindingStatus::parse(""), None);
+        assert_eq!(FindingStatus::parse("nope"), None);
+        assert_eq!(FindingStatus::parse("true positive"), None);
+    }
+
+    #[test]
+    fn as_str_roundtrips_through_parse() {
+        for st in [
+            FindingStatus::New,
+            FindingStatus::Acknowledged,
+            FindingStatus::TruePositive,
+            FindingStatus::FalsePositive,
+            FindingStatus::Suppressed,
+            FindingStatus::Resolved,
+        ] {
+            assert_eq!(FindingStatus::parse(st.as_str()), Some(st));
+        }
+    }
+
+    #[test]
+    fn hidden_by_default_only_fp_and_suppressed() {
+        assert!(!FindingStatus::New.is_hidden_by_default());
+        assert!(!FindingStatus::Acknowledged.is_hidden_by_default());
+        assert!(!FindingStatus::TruePositive.is_hidden_by_default());
+        assert!(!FindingStatus::Resolved.is_hidden_by_default());
+        assert!(FindingStatus::FalsePositive.is_hidden_by_default());
+        assert!(FindingStatus::Suppressed.is_hidden_by_default());
+    }
+
+    #[test]
+    fn serde_snake_case() {
+        let j = serde_json::to_string(&FindingStatus::TruePositive).unwrap();
+        assert_eq!(j, "\"true_positive\"");
+        let back: FindingStatus = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, FindingStatus::TruePositive);
+        let fp: FindingStatus = serde_json::from_str("\"false_positive\"").unwrap();
+        assert_eq!(fp, FindingStatus::FalsePositive);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

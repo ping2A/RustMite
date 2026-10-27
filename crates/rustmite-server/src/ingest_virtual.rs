@@ -1,14 +1,17 @@
 //! Virtual agent — agentless log ingest from external sinks.
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rustmite_store::{HostId, Store, UpdateHost, UpsertHost};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::platform_ch::{
+    virtual_blob_filename, virtual_blob_kind_from_slug, VIRTUAL_INGEST_BLOB_KINDS,
+};
 use crate::routes::{ApiError, AppState};
 use crate::sift_api::{
     append_virtual_file_logs, append_virtual_process_logs, host_by_ingest_token,
@@ -52,6 +55,19 @@ pub struct CreateVirtualHostBody {
     /// Named virtual-agent profile id (Settings → Virtual agents). Applies field mapping labels.
     #[serde(default)]
     pub virtual_agent_id: Option<String>,
+    /// Optional platform identity (shown on Hosts → Arch / kernel).
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Tags applied to the scan created for this import (first import or update).
+    #[serde(default)]
+    pub scan_tags: Option<Vec<String>>,
+    /// Comma-separated convenience (merged into `scan_tags`).
+    #[serde(default)]
+    pub scan_tag: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -143,26 +159,37 @@ pub async fn create_virtual_host(
         })
         .await?;
 
-    // Ensure auth_status reflects virtual (no SSH health).
-    let host = state
-        .store
-        .update_host(
-            host.id,
-            UpdateHost {
-                auth_status: Some("virtual".into()),
-                auth_detail: Some("virtual agent — log ingest only".into()),
-                auth_checked_at: Some(crate::sys_metrics::utc_now_rfc3339()),
-                agent_kind: Some("virtual".into()),
-                ingest_token: host.ingest_token.clone().or(Some(token.clone())),
-                ..Default::default()
-            },
-        )
-        .await?;
+    // Ensure auth_status reflects virtual (no SSH health) + optional platform identity.
+    let mut patch = UpdateHost {
+        auth_status: Some("virtual".into()),
+        auth_detail: Some("virtual agent — log ingest only".into()),
+        auth_checked_at: Some(crate::sys_metrics::utc_now_rfc3339()),
+        agent_kind: Some("virtual".into()),
+        ingest_token: host.ingest_token.clone().or(Some(token.clone())),
+        ..Default::default()
+    };
+    let platform = crate::ingest_tree::platform_patch(
+        body.arch.as_deref(),
+        body.kernel.as_deref(),
+        body.os.as_deref(),
+    );
+    if platform.arch.is_some() {
+        patch.arch = platform.arch;
+    }
+    if platform.kernel.is_some() {
+        patch.kernel = platform.kernel;
+    }
+    if platform.os.is_some() {
+        patch.os = platform.os;
+    }
+    let host = state.store.update_host(host.id, patch).await?;
 
     let mut import_summary = None;
     let mut import_error = None;
     let mut scan_id = None;
     let mut scan_error = None;
+    let scan_tags =
+        crate::ingest_tree::coalesce_scan_tags(body.scan_tags.clone(), body.scan_tag.clone());
     if wants_import {
         let kind = VirtualIngestKind::parse(
             body.kind
@@ -189,6 +216,7 @@ pub async fn create_virtual_host(
                         &state,
                         &host,
                         body.path.as_deref().unwrap_or("upload"),
+                        &scan_tags,
                     )
                     .await
                     {
@@ -379,13 +407,29 @@ pub struct ImportVirtualFeedBody {
     /// Optional profile to (re)apply before import — updates host `ingest_map` labels.
     #[serde(default)]
     pub virtual_agent_id: Option<String>,
+    /// Optional platform identity update during feed import.
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Tags applied to the scan created for this feed import.
+    #[serde(default)]
+    pub scan_tags: Option<Vec<String>>,
+    /// Comma-separated convenience (merged into `scan_tags`).
+    #[serde(default)]
+    pub scan_tag: Option<String>,
 }
 
 async fn record_virtual_feed_scan(
     state: &AppState,
     host: &rustmite_store::HostRecord,
     source: &str,
+    scan_tags: &[String],
 ) -> Result<Uuid, String> {
+    // Disk is authoritative here: callers write JSONL then create the scan before
+    // ClickHouse blob sync, so CH-first would risk reading a stale platform blob.
     let procs = load_virtual_jsonl(host);
     let files = load_virtual_files_jsonl(host);
     if procs.is_empty() && files.is_empty() {
@@ -393,15 +437,24 @@ async fn record_virtual_feed_scan(
     }
     // Prefer accumulated provenance (covers chunked uploads); fall back to empty.
     let (folders, file_names) = crate::sift_api::load_virtual_import_provenance(host);
+    let totals = crate::ingest_tree::VirtualImportInventoryTotals {
+        processes: procs.len(),
+        files: files.len(),
+        sockets: 0,
+    };
+    let proc_sample = &procs[..procs.len().min(5_000)];
+    let file_sample = &files[..files.len().min(1_500)];
     crate::ingest_tree::create_virtual_import_scan_with_provenance(
         state,
         host,
-        &procs,
-        &files,
+        proc_sample,
+        file_sample,
         &[],
         &format!("feed-import:{source}"),
         &folders,
         &file_names,
+        scan_tags,
+        Some(totals),
     )
     .await
 }
@@ -414,6 +467,13 @@ pub async fn import_virtual_feed(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut host = state.store.get_host(HostId(id)).await?;
     let mut kind_from_profile: Option<String> = None;
+    let platform = crate::ingest_tree::platform_patch(
+        body.arch.as_deref(),
+        body.kernel.as_deref(),
+        body.os.as_deref(),
+    );
+    let wants_platform =
+        platform.arch.is_some() || platform.kernel.is_some() || platform.os.is_some();
     if let Some(pid) = body
         .virtual_agent_id
         .as_deref()
@@ -430,16 +490,18 @@ pub async fn import_virtual_feed(
         crate::virtual_agents::apply_profile_to_labels(&mut labels, &profile)
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         kind_from_profile = Some(profile.kind.clone());
-        host = state
-            .store
-            .update_host(
-                host.id,
-                UpdateHost {
-                    labels: Some(labels),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let mut patch = UpdateHost {
+            labels: Some(labels),
+            ..Default::default()
+        };
+        if wants_platform {
+            patch.arch = platform.arch.clone();
+            patch.kernel = platform.kernel.clone();
+            patch.os = platform.os.clone();
+        }
+        host = state.store.update_host(host.id, patch).await?;
+    } else if wants_platform {
+        host = state.store.update_host(host.id, platform).await?;
     }
     let kind = VirtualIngestKind::parse(
         body.kind
@@ -471,8 +533,10 @@ pub async fn import_virtual_feed(
 
     let mut scan_id = None;
     let mut scan_error = None;
+    let scan_tags =
+        crate::ingest_tree::coalesce_scan_tags(body.scan_tags.clone(), body.scan_tag.clone());
     if body.create_scan {
-        match record_virtual_feed_scan(&state, &host, &source_label).await {
+        match record_virtual_feed_scan(&state, &host, &source_label, &scan_tags).await {
             Ok(sid) => scan_id = Some(sid),
             Err(e) => {
                 tracing::warn!(error = %e, host = %host.display_name, "virtual feed: scan record failed");
@@ -494,6 +558,133 @@ pub async fn import_virtual_feed(
     })))
 }
 
+async fn list_virtual_blobs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _host = state
+        .store
+        .get_host(HostId(id))
+        .await
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    let Some(ch) = state.clickhouse.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "host_id": id,
+            "storage": "local_cache",
+            "blobs": [],
+            "clickhouse": false,
+        })));
+    };
+    let rows = ch
+        .list_platform_blobs_for_id(&id.to_string())
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let blobs: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter(|r| {
+            r.get("kind")
+                .and_then(|v| v.as_str())
+                .map(|k| VIRTUAL_INGEST_BLOB_KINDS.contains(&k))
+                .unwrap_or(false)
+        })
+        .map(|r| {
+            let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let meta = r
+                .get("meta")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .or_else(|| r.get("meta").cloned())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let bytes = r
+                .get("bytes")
+                .and_then(|v| v.as_u64())
+                .or_else(|| meta.get("bytes").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            let slug = match kind {
+                crate::platform_ch::KIND_VIRTUAL_PROCESSES => "processes",
+                crate::platform_ch::KIND_VIRTUAL_FILES => "files",
+                crate::platform_ch::KIND_VIRTUAL_PROVENANCE => "provenance",
+                other => other,
+            };
+            serde_json::json!({
+                "kind": kind,
+                "slug": slug,
+                "filename": virtual_blob_filename(kind),
+                "bytes": bytes,
+                "lines": meta.get("lines"),
+                "updated_at": r.get("updated_at"),
+                "download_url": format!("/v1/hosts/{id}/virtual/blobs/{slug}"),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "host_id": id,
+        "storage": "clickhouse",
+        "clickhouse": true,
+        "blobs": blobs,
+    })))
+}
+
+async fn download_virtual_blob(
+    State(state): State<AppState>,
+    Path((id, slug)): Path<(Uuid, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _host = state
+        .store
+        .get_host(HostId(id))
+        .await
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    let kind = virtual_blob_kind_from_slug(&slug).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "unknown blob kind (use processes, files, or provenance)".into(),
+        )
+    })?;
+    let Some(ch) = state.clickhouse.as_ref() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ClickHouse not configured".into(),
+        ));
+    };
+    let (_meta, payload) = ch
+        .get_platform_blob(kind, &id.to_string())
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "blob not found".into()))?;
+    if payload.is_empty() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "blob empty".into()));
+    }
+    let filename = virtual_blob_filename(kind);
+    let mut headers = HeaderMap::new();
+    let ctype = if kind == crate::platform_ch::KIND_VIRTUAL_PROVENANCE {
+        "application/json; charset=utf-8"
+    } else {
+        "application/x-ndjson; charset=utf-8"
+    };
+    if let Ok(v) = HeaderValue::from_str(ctype) {
+        headers.insert(header::CONTENT_TYPE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok((StatusCode::OK, headers, payload))
+}
+
+async fn reingest_virtual_host(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _host = state
+        .store
+        .get_host(HostId(id))
+        .await
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
+    let out = crate::platform_ch::reingest_virtual_host_from_blobs(&state, id)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(out))
+}
+
 /// Nested router with a raised body limit for create/import payloads.
 pub fn virtual_ingest_routes() -> Router<AppState> {
     Router::new()
@@ -507,6 +698,12 @@ pub fn virtual_ingest_routes() -> Router<AppState> {
             post(crate::ingest_tree::import_virtual_tree_upload),
         )
         .route("/v1/hosts/{id}/ingest/import", post(import_virtual_feed))
+        .route("/v1/hosts/{id}/virtual/blobs", get(list_virtual_blobs))
+        .route(
+            "/v1/hosts/{id}/virtual/blobs/{slug}",
+            get(download_virtual_blob),
+        )
+        .route("/v1/hosts/{id}/virtual/reingest", post(reingest_virtual_host))
         .route("/v1/ingest/logs", post(ingest_logs))
         .route("/v1/ingest/logs/{id}", post(ingest_logs_for_host))
         .layer(DefaultBodyLimit::max(VIRTUAL_INGEST_BODY_LIMIT))

@@ -57,10 +57,6 @@ fn schema_v1() -> u32 {
     1
 }
 
-fn default_path() -> PathBuf {
-    PathBuf::from(".dev/virtual-agents.json")
-}
-
 fn now_rfc3339() -> String {
     crate::sys_metrics::utc_now_rfc3339()
 }

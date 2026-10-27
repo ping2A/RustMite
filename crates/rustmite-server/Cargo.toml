@@ -23,6 +23,7 @@ rustmite-sift = { workspace = true }
 rustmite-anomark = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
+regex = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }

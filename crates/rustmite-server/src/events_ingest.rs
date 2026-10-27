@@ -31,6 +31,8 @@ fn observation_to_event(ctx: &EventContext<'_>, ts: &str, o: &Observation) -> Va
     let mut process_id: u32 = 0;
     let mut user = String::new();
     let mut path = String::new();
+    let mut args = String::new();
+    let mut cmdline = String::new();
     let mut src_ip = String::new();
     let mut dest_ip = String::new();
     let mut file_hash = String::new();
@@ -44,18 +46,34 @@ fn observation_to_event(ctx: &EventContext<'_>, ts: &str, o: &Observation) -> Va
             process_id = p.pid.max(0) as u32;
             user = p.uids.first().copied().unwrap_or(0).to_string();
             path = path_str(p.exe.as_ref());
+            let (a, c) = process_argv_strings(p.exe.as_ref(), &p.cmdline);
+            args = a;
+            cmdline = c;
+            if cmdline.is_empty() && !path.is_empty() {
+                cmdline = path.clone();
+            }
             exe_memfd = u8::from(p.exe_memfd);
             severity = if p.exe_memfd || p.exe_deleted {
                 "high".into()
             } else {
                 "info".into()
             };
-            format!(
-                "process pid={} comm={} exe={}",
-                p.pid,
-                p.comm,
-                if path.is_empty() { "—" } else { &path }
-            )
+            if args.is_empty() {
+                format!(
+                    "process pid={} comm={} exe={}",
+                    p.pid,
+                    p.comm,
+                    if path.is_empty() { "—" } else { &path }
+                )
+            } else {
+                format!(
+                    "process pid={} comm={} exe={} args={}",
+                    p.pid,
+                    p.comm,
+                    if path.is_empty() { "—" } else { &path },
+                    args
+                )
+            }
         }
         Observation::HiddenProcess(p) => {
             process_name = p.comm.clone().unwrap_or_default();
@@ -227,6 +245,8 @@ fn observation_to_event(ctx: &EventContext<'_>, ts: &str, o: &Observation) -> Va
         "process_id": process_id,
         "user": user,
         "path": path,
+        "args": args,
+        "cmdline": cmdline,
         "src_ip": src_ip,
         "dest_ip": dest_ip,
         "file_hash": file_hash,
@@ -274,17 +294,63 @@ fn path_str(p: Option<&PathBytes>) -> String {
     p.map(|p| p.to_string_lossy()).unwrap_or_default()
 }
 
+fn path_bytes_join(parts: &[PathBytes]) -> String {
+    parts
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Full command line (argv) and arguments-only string for Hunt (`args` / `cmdline` columns).
+fn process_argv_strings(exe: Option<&PathBytes>, cmdline: &[PathBytes]) -> (String, String) {
+    let full = path_bytes_join(cmdline);
+    if full.is_empty() {
+        let exe_s = path_str(exe);
+        return (String::new(), exe_s);
+    }
+    let exe_s = path_str(exe);
+    let args = if cmdline.len() > 1 {
+        path_bytes_join(&cmdline[1..])
+    } else if !exe_s.is_empty() && full == exe_s {
+        String::new()
+    } else if !exe_s.is_empty() && full.starts_with(&exe_s) {
+        full[exe_s.len()..].trim_start().to_string()
+    } else {
+        // cmdline[0] is often the exe; treat remainder as args when present.
+        String::new()
+    };
+    (args, full)
+}
+
 /// Map virtual-agent process JSONL rows → ClickHouse `events` for RPL hunt.
+///
+/// `timestamp` is clamped to "now" when the vendor stamp is older than the events
+/// table TTL (90 days) — otherwise rows are inserted then immediately dropped.
 pub fn virtual_processes_to_events(
     host_id: Uuid,
     host_name: &str,
     rows: &[RawLogEntry],
 ) -> Vec<Value> {
+    let now = utc_now_rfc3339();
     rows.iter()
         .map(|e| {
-            let ts = clickhouse_ts(e.timestamp.as_deref().unwrap_or(""));
+            let ts = hunt_event_ts(e.timestamp.as_deref(), &now);
             let path = e.path.clone();
-            let message = if e.args.trim().is_empty() {
+            let args = e.args.trim().to_string();
+            let cmdline = if args.is_empty() {
+                if path.is_empty() {
+                    e.name.clone()
+                } else {
+                    path.clone()
+                }
+            } else if path.is_empty() {
+                format!("{} {}", e.name, args)
+            } else {
+                format!("{path} {args}")
+            };
+            let message = if args.is_empty() {
                 format!("process pid={} comm={} exe={}", e.pid, e.name, path_or_dash(&path))
             } else {
                 format!(
@@ -292,7 +358,7 @@ pub fn virtual_processes_to_events(
                     e.pid,
                     e.name,
                     path_or_dash(&path),
-                    e.args
+                    args
                 )
             };
             serde_json::json!({
@@ -312,6 +378,8 @@ pub fn virtual_processes_to_events(
                 "process_id": e.pid,
                 "user": e.uid.to_string(),
                 "path": path,
+                "args": args,
+                "cmdline": cmdline,
                 "src_ip": "",
                 "dest_ip": "",
                 "file_hash": "",
@@ -329,13 +397,14 @@ pub fn virtual_files_to_events(
     host_name: &str,
     rows: &[RawFileEntry],
 ) -> Vec<Value> {
+    let now = utc_now_rfc3339();
     rows.iter()
         .map(|e| {
-            let ts = clickhouse_ts(
+            let ts = hunt_event_ts(
                 e.timestamp
                     .as_deref()
-                    .or(e.mtime.as_deref())
-                    .unwrap_or(""),
+                    .or(e.mtime.as_deref()),
+                &now,
             );
             let message = format!("file_meta {}", e.path);
             serde_json::json!({
@@ -372,6 +441,37 @@ fn path_or_dash(path: &str) -> &str {
     } else {
         path
     }
+}
+
+/// Prefer vendor time when it is within the events TTL window; otherwise use now
+/// so virtual-import Hunt rows are not TTL-deleted on insert.
+fn hunt_event_ts(raw: Option<&str>, now: &str) -> String {
+    let fallback = clickhouse_ts(now);
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return fallback;
+    };
+    let candidate = clickhouse_ts(raw);
+    // Rough check: if the normalized stamp year-month looks older than ~80 days,
+    // ClickHouse TTL (timestamp + 90d) would drop the row immediately.
+    // Compare as strings `YYYY-MM-DD` prefix when both look like dates.
+    let now_day = fallback.get(..10).unwrap_or("");
+    let cand_day = candidate.get(..10).unwrap_or("");
+    if cand_day.len() == 10 && now_day.len() == 10 && cand_day < now_day {
+        // days between via simple ordinal approximation on YYYY-MM-DD
+        if let (Ok(a), Ok(b)) = (ymd_ord(cand_day), ymd_ord(now_day)) {
+            if b.saturating_sub(a) > 80 {
+                return fallback;
+            }
+        }
+    }
+    candidate
+}
+
+fn ymd_ord(ymd: &str) -> Result<i64, ()> {
+    let y: i64 = ymd.get(0..4).ok_or(())?.parse().map_err(|_| ())?;
+    let m: i64 = ymd.get(5..7).ok_or(())?.parse().map_err(|_| ())?;
+    let d: i64 = ymd.get(8..10).ok_or(())?.parse().map_err(|_| ())?;
+    Ok(y * 372 + m * 31 + d)
 }
 
 /// Normalize a timestamp into a ClickHouse `DateTime64(6)`-friendly string.
@@ -458,7 +558,10 @@ mod tests {
             exe: Some(PathBytes::from_str("/sbin/init")),
             exe_deleted: false,
             exe_memfd: false,
-            cmdline: vec![],
+            cmdline: vec![
+                PathBytes::from_str("/sbin/init"),
+                PathBytes::from_str("auto"),
+            ],
             cwd: None,
             root: None,
             uids: [0, 0, 0, 0],
@@ -497,6 +600,9 @@ mod tests {
         assert_eq!(rows[0]["process_name"], "systemd");
         assert_eq!(rows[0]["kind"], "process");
         assert_eq!(rows[0]["process_id"], 1);
+        assert_eq!(rows[0]["args"], "auto");
+        assert_eq!(rows[0]["cmdline"], "/sbin/init auto");
+        assert!(rows[0]["message"].as_str().unwrap().contains("args=auto"));
     }
 
     #[test]
@@ -519,6 +625,8 @@ mod tests {
         assert_eq!(rows[0]["source"], "virtual_ingest");
         assert_eq!(rows[0]["process_name"], "nc");
         assert_eq!(rows[0]["host_name"], "virt-host");
+        assert_eq!(rows[0]["args"], "-lvp 4444");
+        assert_eq!(rows[0]["cmdline"], "/usr/bin/nc -lvp 4444");
         assert!(rows[0]["message"].as_str().unwrap().contains("nc"));
     }
 

@@ -65,15 +65,16 @@ The shareable image is an **appliance**: RustMite control plane + **embedded Cli
 **Run a packaged image**
 
 ```bash
-gunzip -c rustmite-0.1.0-amd64.tar.gz | docker load
-# or: docker pull your-registry/rustmite:0.1.0
+# <version> matches [workspace.package] in Cargo.toml (same as ./dev.sh / share-image)
+gunzip -c rustmite-0.3.26-amd64.tar.gz | docker load
+# or: docker pull your-registry/rustmite:0.3.26
 
 docker run --rm -p 8080:8080 -p 8443:8443 -p 8123:8123 \
   -v rustmite-data:/opt/rustmite/data \
   -v rustmite-tls:/opt/rustmite/tls \
   -v rustmite-vault:/opt/rustmite/vault \
   -v rustmite-ch-data:/var/lib/clickhouse \
-  rustmite:0.1.0
+  rustmite:0.3.26
 # → https://127.0.0.1:8080/  (admin / admin; accept self-signed cert)
 # → ClickHouse HTTP :8123   (rustmite / rustmite)
 ```

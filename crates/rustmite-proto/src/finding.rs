@@ -73,6 +73,27 @@ pub struct ScanMeta {
     /// Virtual-import: relative file paths ingested into this snapshot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_files: Vec<String>,
+    /// Operator tags for this scan (e.g. import batch / campaign labels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Virtual-import inventory sizes. `*_in_scan` may be lower than the totals when
+    /// embedding was capped to keep the control plane small; full rows live in ingest / Hunt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<ScanInventorySummary>,
+}
+
+/// Inventory counts for a virtual-import (or similar) snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScanInventorySummary {
+    pub processes: u32,
+    pub files: u32,
+    pub sockets: u32,
+    #[serde(default)]
+    pub processes_in_scan: u32,
+    #[serde(default)]
+    pub files_in_scan: u32,
+    #[serde(default)]
+    pub sockets_in_scan: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

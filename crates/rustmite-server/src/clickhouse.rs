@@ -22,6 +22,25 @@ pub struct ClickHouseClient {
     http: reqwest::Client,
 }
 
+/// Per-table on-disk footprint from `system.parts` (active parts only).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ClickHouseTableSize {
+    pub table: String,
+    pub bytes: u64,
+    pub rows: u64,
+}
+
+fn json_u64(v: Option<&Value>) -> u64 {
+    let Some(v) = v else {
+        return 0;
+    };
+    v.as_u64()
+        .or_else(|| v.as_i64().map(|n| n.max(0) as u64))
+        .or_else(|| v.as_f64().map(|n| n.max(0.0) as u64))
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0)
+}
+
 fn env_flag_disabled(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
@@ -305,6 +324,38 @@ impl ClickHouseClient {
         Ok(raw.trim().parse().unwrap_or(0))
     }
 
+    /// On-disk size of each table in this client's database (`system.parts`).
+    pub async fn database_table_sizes(&self) -> Result<Vec<ClickHouseTableSize>, ClickHouseError> {
+        let db = self.database.replace('\'', "\\'");
+        let sql = format!(
+            "SELECT table AS name, \
+                    sum(bytes_on_disk) AS bytes, \
+                    sum(rows) AS rows \
+             FROM system.parts \
+             WHERE active AND database = '{db}' \
+             GROUP BY table \
+             ORDER BY bytes DESC"
+        );
+        let rows = self.query_json_each_row(&sql).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name = row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            out.push(ClickHouseTableSize {
+                table: name,
+                bytes: json_u64(row.get("bytes")),
+                rows: json_u64(row.get("rows")),
+            });
+        }
+        Ok(out)
+    }
+
     /// Live (non-deleted) platform blob rows across all kinds.
     pub async fn platform_blobs_live_count(&self) -> Result<u64, ClickHouseError> {
         self.ensure_platform_blobs_schema().await?;
@@ -349,6 +400,8 @@ impl ClickHouseClient {
                process_id UInt32 DEFAULT 0, \
                user LowCardinality(String) DEFAULT '', \
                path String DEFAULT '', \
+               args String DEFAULT '', \
+               cmdline String DEFAULT '', \
                src_ip String DEFAULT '', \
                dest_ip String DEFAULT '', \
                file_hash String DEFAULT '', \
@@ -363,6 +416,13 @@ impl ClickHouseClient {
              SETTINGS index_granularity = 8192",
         )
         .await?;
+        // Existing deployments created before args/cmdline — add columns if missing.
+        let _ = self
+            .query_raw("ALTER TABLE events ADD COLUMN IF NOT EXISTS args String DEFAULT ''")
+            .await;
+        let _ = self
+            .query_raw("ALTER TABLE events ADD COLUMN IF NOT EXISTS cmdline String DEFAULT ''")
+            .await;
         let _ = self
             .query_raw(
                 "CREATE TABLE IF NOT EXISTS detection_signals \
@@ -497,6 +557,38 @@ impl ClickHouseClient {
             .collect())
     }
 
+    /// List live platform blobs for one id (host UUID), without loading payloads.
+    pub async fn list_platform_blobs_for_id(
+        &self,
+        id: &str,
+    ) -> Result<Vec<serde_json::Value>, ClickHouseError> {
+        self.ensure_platform_blobs_schema().await?;
+        let id_esc = id.replace('\'', "\\'");
+        let sql = format!(
+            "SELECT kind, id, meta, length(payload) AS bytes, updated_at \
+             FROM rm_platform_blobs FINAL \
+             WHERE id = '{id_esc}' AND deleted = 0 \
+             ORDER BY kind"
+        );
+        self.query_json_each_row(&sql).await
+    }
+
+    /// Summarize virtual ingest blobs: distinct host ids + total payload bytes.
+    pub async fn virtual_ingest_blob_stats(&self) -> Result<(usize, u64), ClickHouseError> {
+        self.ensure_platform_blobs_schema().await?;
+        let sql = "SELECT \
+             uniqExact(id) AS hosts, \
+             sum(length(payload)) AS bytes \
+           FROM rm_platform_blobs FINAL \
+           WHERE deleted = 0 \
+             AND kind IN ('virtual_processes', 'virtual_files', 'virtual_provenance')";
+        let rows = self.query_json_each_row(sql).await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok((0, 0));
+        };
+        Ok((json_u64(row.get("hosts")) as usize, json_u64(row.get("bytes"))))
+    }
+
     pub async fn delete_platform_blob(&self, kind: &str, id: &str) -> Result<(), ClickHouseError> {
         self.ensure_platform_blobs_schema().await?;
         let row = serde_json::json!({
@@ -508,6 +600,30 @@ impl ClickHouseClient {
             "payload": "",
         });
         self.insert_json_each_row("rm_platform_blobs", &[row]).await?;
+        Ok(())
+    }
+
+    /// Hard-remove virtual ingest platform blobs and reclaim disk (`OPTIMIZE FINAL`).
+    /// Soft-deletes alone leave payload bytes in `system.parts` until merges run.
+    pub async fn clear_virtual_ingest_blobs(&self) -> Result<(), ClickHouseError> {
+        self.ensure_platform_blobs_schema().await?;
+        self.query_raw(
+            "ALTER TABLE rm_platform_blobs DELETE WHERE kind IN \
+             ('virtual_processes','virtual_files','virtual_provenance')",
+        )
+        .await?;
+        // Force mutations/merges so Data tab `bytes_on_disk` drops immediately.
+        let _ = self
+            .query_raw("OPTIMIZE TABLE rm_platform_blobs FINAL")
+            .await;
+        Ok(())
+    }
+
+    /// Compact `rm_platform_blobs` after soft-deletes (best-effort).
+    pub async fn optimize_platform_blobs(&self) -> Result<(), ClickHouseError> {
+        self.ensure_platform_blobs_schema().await?;
+        self.query_raw("OPTIMIZE TABLE rm_platform_blobs FINAL")
+            .await?;
         Ok(())
     }
 
@@ -557,6 +673,17 @@ impl ClickHouseClient {
     pub async fn control_plane_entity_count(&self) -> Result<u64, ClickHouseError> {
         let raw = self
             .query_raw("SELECT count() FROM cp_entities FINAL WHERE deleted = 0")
+            .await?;
+        Ok(raw.trim().parse().unwrap_or(0))
+    }
+
+    /// Count live `host` rows only (zones/activity must not block an empty-fleet flush).
+    pub async fn control_plane_host_count(&self) -> Result<u64, ClickHouseError> {
+        let raw = self
+            .query_raw(
+                "SELECT count() FROM cp_entities FINAL \
+                 WHERE deleted = 0 AND entity = 'host'",
+            )
             .await?;
         Ok(raw.trim().parse().unwrap_or(0))
     }
@@ -672,26 +799,35 @@ impl ClickHouseClient {
     }
 
     /// Persist a full control-plane snapshot (ReplacingMergeTree keeps latest per id).
+    ///
+    /// Writes into `cp_entities__next` first, then atomically `EXCHANGE TABLES` so a
+    /// failed / timed-out insert cannot leave an empty control plane after TRUNCATE.
     pub async fn save_control_plane(
         &self,
         snap: &rustmite_store::StoreSnapshot,
     ) -> Result<usize, ClickHouseError> {
-        self.ensure_control_plane_schema().await?;
+        self.save_control_plane_ex(snap, false).await
+    }
 
-        // Safety: never TRUNCATE a populated fleet with an empty in-memory snapshot.
-        // That happens when ClickHouse load fails on upgrade (auth/URL blip) and the
-        // flusher would otherwise wipe durable hosts on the next dirty tick.
-        let existing = self.control_plane_entity_count().await.unwrap_or(0);
-        if snap.hosts.is_empty() && existing > 0 {
+    /// Like [`Self::save_control_plane`], but `force_empty` allows wiping a non-empty
+    /// fleet (used by Data → Clear all / clear hosts).
+    pub async fn save_control_plane_ex(
+        &self,
+        snap: &rustmite_store::StoreSnapshot,
+        force_empty: bool,
+    ) -> Result<usize, ClickHouseError> {
+        self.ensure_control_plane_schema().await?;
+        self.ensure_control_plane_swap_schema().await?;
+
+        // Safety: never replace a populated *fleet* with an empty in-memory snapshot
+        // unless the operator explicitly cleared data (`force_empty`).
+        let existing_hosts = self.control_plane_host_count().await.unwrap_or(0);
+        if !force_empty && snap.hosts.is_empty() && existing_hosts > 0 {
             return Err(ClickHouseError::Msg(format!(
-                "refusing to overwrite non-empty control plane ({existing} rows) with 0 hosts — \
-                 check ClickHouse connectivity / volume mounts; use --reset-store to wipe deliberately"
+                "refusing to overwrite non-empty control plane ({existing_hosts} hosts) with 0 hosts — \
+                 check ClickHouse connectivity / volume mounts; use Data → Clear or --reset-store to wipe deliberately"
             )));
         }
-
-        // Drop prior live rows so deletes (removed hosts/findings) actually disappear.
-        // Truncate + reinsert is fine for lab / mid-size fleets and matches snapshot semantics.
-        self.query_raw("TRUNCATE TABLE cp_entities").await?;
 
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let ts = snap.saved_at.clone();
@@ -705,9 +841,8 @@ impl ClickHouseClient {
         for m in &snap.metas {
             rows.push(entity_row("scan_meta", &m.scan_id.to_string(), &ts, m)?);
         }
-        for (i, o) in snap.observations.iter().enumerate() {
+        for o in &snap.observations {
             let id = format!("{}:{}", o.scan_id, o.seq);
-            let _ = i;
             rows.push(entity_row("observation", &id, &ts, o)?);
         }
         for f in &snap.findings {
@@ -740,8 +875,37 @@ impl ClickHouseClient {
             rows.push(entity_row("credential", &c.id, &ts, c)?);
         }
 
-        let n = self.insert_json_each_row("cp_entities", &rows).await?;
+        // Build + insert into the swap table first. Live `cp_entities` stays intact
+        // until EXCHANGE, so a timeout mid-insert cannot wipe the fleet.
+        self.query_raw("TRUNCATE TABLE cp_entities__next").await?;
+        const CHUNK: usize = 400;
+        let mut n = 0usize;
+        for chunk in rows.chunks(CHUNK) {
+            n += self.insert_json_each_row("cp_entities__next", chunk).await?;
+        }
+        self.query_raw("EXCHANGE TABLES cp_entities AND cp_entities__next")
+            .await?;
+        // Old live data now sits in __next — drop it so the next flush starts clean.
+        let _ = self.query_raw("TRUNCATE TABLE cp_entities__next").await;
         Ok(n)
+    }
+
+    async fn ensure_control_plane_swap_schema(&self) -> Result<(), ClickHouseError> {
+        self.query_raw(
+            "CREATE TABLE IF NOT EXISTS cp_entities__next \
+             ( \
+               entity LowCardinality(String), \
+               id String, \
+               updated_at DateTime64(6, 'UTC') DEFAULT now64(6), \
+               deleted UInt8 DEFAULT 0, \
+               payload String \
+             ) \
+             ENGINE = ReplacingMergeTree(updated_at) \
+             ORDER BY (entity, id) \
+             SETTINGS index_granularity = 8192",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn query_raw(&self, sql: &str) -> Result<String, ClickHouseError> {

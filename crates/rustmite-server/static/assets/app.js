@@ -76,6 +76,87 @@
   const $ = (sel, el = document) => el.querySelector(sel);
   const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 
+  let _pageLoadingDepth = 0;
+  let _pageLoadingHideTimer = 0;
+
+  function pageLoadingHintFor(message) {
+    const m = String(message || "").toLowerCase();
+    if (m.includes("host")) return "Fetching inventory and scan history";
+    if (m.includes("scan")) return "Opening scan detail";
+    if (m.includes("fleet sift") || m.includes("sift")) return "Loading runs and detection config";
+    if (m.includes("anomark")) return "Loading models and recent scores";
+    if (m.includes("ssh")) return "Building key · user · host graph data";
+    if (m.includes("data")) return "Summarizing ClickHouse tables";
+    if (m.includes("render")) return "Building the table view";
+    if (m.includes("fleet")) return "Syncing hosts, scans, and findings";
+    return "This can take a moment on large fleets";
+  }
+
+  function showPageLoading(message) {
+    _pageLoadingDepth += 1;
+    if (_pageLoadingHideTimer) {
+      clearTimeout(_pageLoadingHideTimer);
+      _pageLoadingHideTimer = 0;
+    }
+    const el = $("#pageLoading");
+    if (!el) return;
+    const label = $("#pageLoadingLabel");
+    const hint = $("#pageLoadingHint");
+    const msg = message || "Loading…";
+    if (label) label.textContent = msg;
+    if (hint) hint.textContent = pageLoadingHintFor(msg);
+    el.hidden = false;
+    el.classList.remove("hidden");
+    el.setAttribute("aria-hidden", "false");
+    document.body.classList.add("is-page-loading");
+    // Next frame so CSS transitions run after display toggles on.
+    requestAnimationFrame(() => el.classList.add("is-visible"));
+  }
+
+  function hidePageLoading() {
+    _pageLoadingDepth = Math.max(0, _pageLoadingDepth - 1);
+    if (_pageLoadingDepth > 0) return;
+    const el = $("#pageLoading");
+    if (!el) return;
+    el.classList.remove("is-visible");
+    document.body.classList.remove("is-page-loading");
+    if (_pageLoadingHideTimer) clearTimeout(_pageLoadingHideTimer);
+    _pageLoadingHideTimer = window.setTimeout(() => {
+      _pageLoadingHideTimer = 0;
+      if (_pageLoadingDepth > 0) return;
+      el.hidden = true;
+      el.classList.add("hidden");
+      el.setAttribute("aria-hidden", "true");
+    }, 220);
+  }
+
+  async function withPageLoading(work, message) {
+    showPageLoading(message);
+    // Let the spinner paint before heavy sync work / awaits.
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    try {
+      return await (typeof work === "function" ? work() : work);
+    } finally {
+      hidePageLoading();
+    }
+  }
+
+  function pageLoadingInlineHtml(message) {
+    const msg = message || "Loading…";
+    return `<div class="page-loading-inline" role="status">
+      <div class="page-loading-mark" aria-hidden="true">
+        <span class="page-loading-ring"></span>
+        <span class="page-loading-ring page-loading-ring--delay"></span>
+        <img class="page-loading-logo" src="/ui/assets/logo-mark.png" width="28" height="28" alt="" />
+      </div>
+      <div class="page-loading-copy">
+        <div class="page-loading-label">${esc(msg)}</div>
+        <div class="page-loading-hint">${esc(pageLoadingHintFor(msg))}</div>
+      </div>
+      <div class="page-loading-bar" aria-hidden="true" style="width:min(12rem,70%)"><span></span></div>
+    </div>`;
+  }
+
   function sessionToken() {
     return localStorage.getItem(SESSION_KEY) || "";
   }
@@ -86,14 +167,7 @@
   }
 
   function token() {
-    return sessionToken()
-      || localStorage.getItem("rustmite_api_token")
-      || ($("#apiToken")?.value || "").trim();
-  }
-
-  function saveToken(v) {
-    if (v) localStorage.setItem("rustmite_api_token", v);
-    else localStorage.removeItem("rustmite_api_token");
+    return sessionToken() || localStorage.getItem("rustmite_api_token") || "";
   }
 
   function showLogin(show) {
@@ -511,14 +585,46 @@
     btn.classList.toggle("active", n > 0);
   }
 
-  function fmtBytes(n) {
-    const v = Number(n) || 0;
-    if (v < 1024) return `${v} B`;
-    const u = ["KB", "MB", "GB", "TB"];
+  function updateNavFindingsCount() {
+    const el = $("#navFindingsCount");
+    if (!el) return;
+    const open = (state.findings || []).filter((f) => !findingIsHiddenByDefault(f));
+    const n = open.length;
+    const total = (state.findings || []).length;
+    el.textContent = n > 9999 ? `${Math.floor(n / 1000)}k` : String(n);
+    el.title = total === n
+      ? `${n.toLocaleString()} finding${n === 1 ? "" : "s"}`
+      : `${n.toLocaleString()} open · ${total.toLocaleString()} total`;
+    el.hidden = n <= 0;
+    el.classList.toggle("is-hot", n > 0);
+  }
+
+  function fmtBytesParts(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 0) return { num: "0", unit: "B" };
+    if (v < 1024) return { num: String(Math.round(v)), unit: "B" };
+    const u = ["KiB", "MiB", "GiB", "TiB"];
     let x = v / 1024;
     let i = 0;
     while (x >= 1024 && i < u.length - 1) { x /= 1024; i++; }
-    return `${x.toFixed(x >= 10 ? 0 : 1)} ${u[i]}`;
+    return { num: x >= 100 ? x.toFixed(0) : x.toFixed(1), unit: u[i] };
+  }
+
+  function fmtBytes(n) {
+    const p = fmtBytesParts(n);
+    return `${p.num} ${p.unit}`;
+  }
+
+  /** Tabular-aligned size: number + unit in fixed columns. */
+  function sizeHtml(n, opts = {}) {
+    if (n == null || n === "") {
+      return `<span class="size size--na">${esc(opts.na != null ? String(opts.na) : "—")}</span>`;
+    }
+    const p = fmtBytesParts(n);
+    const title = opts.title != null
+      ? opts.title
+      : `${Math.round(Number(n)).toLocaleString()} bytes`;
+    return `<span class="size"${title ? ` title="${esc(title)}"` : ""}><span class="size-n">${esc(p.num)}</span><span class="size-u">${esc(p.unit)}</span></span>`;
   }
 
   function fmtUptime(secs) {
@@ -897,7 +1003,7 @@
             ${statusGraph()}
           </section>
           <section class="panel">
-            <div class="panel-head"><h3>Active scans</h3><button class="btn ghost" data-goto="activity">Logs</button></div>
+            <div class="panel-head"><h3>Active scans</h3><button class="btn ghost" data-goto="queue">Queue</button></div>
             ${cards
               ? `<div class="scan-cards">${cards}</div>`
               : `<div class="empty">No active scans — queue will top up automatically</div>`}
@@ -945,7 +1051,7 @@
     if (typingFilter) return;
     if (
       state.view === "queue"
-      || state.view === "activity"
+      || state.view === "settings"
       || state.view === "dashboard"
       || state.view === "hosts"
     ) {
@@ -954,60 +1060,67 @@
   }
 
   async function loadAll() {
-    const [summary, hosts, findings, scans, checks, nodes, health, activity, queue, metrics, settings, version, checkSets, virtAgents] = await Promise.all([
-      api("/v1/summary"),
-      api("/v1/hosts"),
-      api("/v1/findings?limit=20000"),
-      api("/v1/scans?limit=5000"),
-      api("/v1/checks"),
-      api("/v1/nodes"),
-      api("/v1/health").catch(() => ({ status: "error" })),
-      api("/v1/activity?limit=200").catch(() => []),
-      api("/v1/queue").catch(() => null),
-      api("/v1/metrics").catch(() => null),
-      api("/v1/settings").catch(() => null),
-      api("/v1/version").catch(() => null),
-      api("/v1/check-sets").catch(() => null),
-      api("/v1/virtual-agents").catch(() => null),
-    ]);
-    state.summary = summary;
-    state.hosts = hosts || [];
-    state.hostById = Object.fromEntries(state.hosts.map((h) => [h.id, h]));
-    state.findings = findings || [];
-    state.scans = scans || [];
-    state.checks = checks || [];
-    state.nodes = nodes || [];
-    state.activity = activity || [];
-    state.queue = queue;
-    if (metrics) state.metrics = metrics;
-    if (settings) state.settings = settings;
-    if (version) state.version = version;
-    if (checkSets) state.checkSets = checkSets;
-    if (virtAgents && Array.isArray(virtAgents.profiles)) {
-      state.virtualAgents = virtAgents.profiles;
-    } else if (Array.isArray(virtAgents)) {
-      state.virtualAgents = virtAgents;
+    showPageLoading("Loading fleet…");
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    try {
+      const [summary, hosts, findings, scans, checks, nodes, health, activity, queue, metrics, settings, version, checkSets, virtAgents] = await Promise.all([
+        api("/v1/summary"),
+        api("/v1/hosts"),
+        api("/v1/findings?limit=20000"),
+        api("/v1/scans?limit=5000"),
+        api("/v1/checks"),
+        api("/v1/nodes"),
+        api("/v1/health").catch(() => ({ status: "error" })),
+        api("/v1/activity?limit=200").catch(() => []),
+        api("/v1/queue").catch(() => null),
+        api("/v1/metrics").catch(() => null),
+        api("/v1/settings").catch(() => null),
+        api("/v1/version").catch(() => null),
+        api("/v1/check-sets").catch(() => null),
+        api("/v1/virtual-agents").catch(() => null),
+      ]);
+      state.summary = summary;
+      state.hosts = hosts || [];
+      state.hostById = Object.fromEntries(state.hosts.map((h) => [h.id, h]));
+      state.findings = findings || [];
+      state.scans = scans || [];
+      state.checks = checks || [];
+      state.nodes = nodes || [];
+      state.activity = activity || [];
+      state.queue = queue;
+      if (metrics) state.metrics = metrics;
+      if (settings) state.settings = settings;
+      if (version) state.version = version;
+      if (checkSets) state.checkSets = checkSets;
+      if (virtAgents && Array.isArray(virtAgents.profiles)) {
+        state.virtualAgents = virtAgents.profiles;
+      } else if (Array.isArray(virtAgents)) {
+        state.virtualAgents = virtAgents;
+      }
+      if (String(state.view || "").startsWith("ssh-")) {
+        await loadSshHunter().catch(() => {});
+      }
+      const pill = $("#healthPill");
+      if (health && health.status === "ok") {
+        const cpu = Math.round(health.cpu_pct ?? metrics?.cpu_pct ?? 0);
+        const mem = Math.round(health.mem_pct ?? metrics?.mem_pct ?? 0);
+        const ver = version?.server?.version || health.version || settings?.effective?.version || "";
+        pill.textContent = ver
+          ? `healthy · v${ver}`
+          : "API healthy";
+        pill.title = `CPU ${cpu}% · MEM ${mem}% · ${(summary?.hosts || 0).toLocaleString()} hosts`;
+        pill.className = "health ok";
+      } else {
+        pill.textContent = "API unreachable";
+        pill.className = "health bad";
+      }
+      updateQueueBadge();
+      updateNavFindingsCount();
+      renderLiveStrip();
+      render();
+    } finally {
+      hidePageLoading();
     }
-    if (String(state.view || "").startsWith("ssh-")) {
-      await loadSshHunter().catch(() => {});
-    }
-    const pill = $("#healthPill");
-    if (health && health.status === "ok") {
-      const cpu = Math.round(health.cpu_pct ?? metrics?.cpu_pct ?? 0);
-      const mem = Math.round(health.mem_pct ?? metrics?.mem_pct ?? 0);
-      const ver = version?.server?.version || health.version || settings?.effective?.version || "";
-      pill.textContent = ver
-        ? `healthy · v${ver}`
-        : "API healthy";
-      pill.title = `CPU ${cpu}% · MEM ${mem}% · ${(summary?.hosts || 0).toLocaleString()} hosts`;
-      pill.className = "health ok";
-    } else {
-      pill.textContent = "API unreachable";
-      pill.className = "health bad";
-    }
-    updateQueueBadge();
-    renderLiveStrip();
-    render();
   }
 
   function openDrawer(title, html, opts) {
@@ -1032,10 +1145,10 @@
     }
     state.selectedFinding = null;
     const hash = String(location.hash || "");
-    // Scan detail is a full page that owns `#/scans/…` — don't clobber it when closing a drawer.
-    if (hash.startsWith("#finding/")) {
-      const next = `#/${state.view || "findings"}`;
-      history.replaceState(null, "", next);
+    // Leave finding/host deep links when the overlay closes (scan detail owns `#/scans/…`).
+    if (hash.startsWith("#finding/") || hash.startsWith("#host/")) {
+      const next = `#/${state.view || "hosts"}`;
+      if (location.hash !== next) history.replaceState(null, "", next);
     }
   }
 
@@ -1081,8 +1194,8 @@
     };
   }
 
-  function setSshHunterOpen(open) {
-    const group = $("#navSshHunter");
+  function setNavGroupOpen(groupId, open) {
+    const group = document.getElementById(groupId);
     if (!group) return;
     group.classList.toggle("open", !!open);
     const sub = group.querySelector(".nav-sub");
@@ -1091,21 +1204,63 @@
     if (toggle) toggle.setAttribute("aria-expanded", String(!!open));
   }
 
-  function setView(view, opts) {
+  function setSshHunterOpen(open) {
+    setNavGroupOpen("navSshHunter", open);
+  }
+
+  function isAdvancedView(view) {
+    return view === "fleet-sift" || view === "anomark";
+  }
+
+  function applySidebarCollapsed(collapsed) {
+    const on = !!collapsed;
+    document.body.classList.toggle("sidebar-collapsed", on);
+    const shell = $("#app");
+    if (shell) shell.classList.toggle("sidebar-collapsed", on);
+    const collapseBtn = $("#btnSidebarCollapse");
+    if (collapseBtn) {
+      collapseBtn.setAttribute("aria-expanded", String(!on));
+      collapseBtn.title = on ? "Expand sidebar" : "Collapse sidebar";
+      collapseBtn.setAttribute("aria-label", on ? "Expand sidebar" : "Collapse sidebar");
+    }
+    const expandBtn = $("#btnSidebarExpand");
+    if (expandBtn) expandBtn.hidden = !on;
+    try {
+      localStorage.setItem("rustmite_sidebar_collapsed", on ? "1" : "0");
+    } catch (_) {}
+  }
+
+  async function setView(view, opts) {
+    // Activity feed lives under Settings → Audit log (nav item removed).
+    if (view === "activity") {
+      state._settingsTab = (opts && opts.settingsTab) || "audit";
+      view = "settings";
+    }
+    if (opts && opts.settingsTab) state._settingsTab = opts.settingsTab;
+    if (view !== "hunt") {
+      state._rplFullscreen = false;
+      document.body.classList.remove("rpl-fs-open");
+    }
     state.view = view;
     const skipHash = opts && opts.skipHash;
     const isSsh = String(view).startsWith("ssh-");
+    const isAdvanced = isAdvancedView(view);
     $$(".nav-item").forEach((b) => {
       const active = b.dataset.view === view
         || (view === "scan-detail" && b.dataset.view === "scans");
       b.classList.toggle("active", active);
     });
-    const group = $("#navSshHunter");
-    if (group) {
-      const toggle = group.querySelector(".nav-group-toggle");
+    const sshGroup = $("#navSshHunter");
+    if (sshGroup) {
+      const toggle = sshGroup.querySelector(".nav-group-toggle");
       if (toggle) toggle.classList.toggle("active", isSsh);
-      // Keep SSH Hunter collapsed unless an SSH view is active.
-      setSshHunterOpen(isSsh);
+      setNavGroupOpen("navSshHunter", isSsh);
+    }
+    const advGroup = $("#navAdvanced");
+    if (advGroup) {
+      const toggle = advGroup.querySelector(".nav-group-toggle");
+      if (toggle) toggle.classList.toggle("active", isAdvanced);
+      setNavGroupOpen("navAdvanced", isAdvanced);
     }
     const titles = {
       dashboard: ["Dashboard", "Fleet posture, live queue, and status graph"],
@@ -1114,13 +1269,12 @@
       scans: ["Scans", "Job history, outcomes, and coverage accounting"],
       "scan-detail": ["Scan detail", "Full scan inventory, findings, and collectors"],
       queue: ["Task queue", "Active scan jobs and node workload — Sandfly Task Queues"],
-      activity: ["Activity", "Streaming scan progress and operator events"],
-      hunt: ["Hunt", "RPL queries over ClickHouse events"],
+      hunt: ["Hunt", "Search fleet events with RPL — query, scope time, inspect hits"],
+      settings: ["Settings", "Versions, digests, ClickHouse, probe limits, audit log, and exportable config"],
       "fleet-sift": ["Fleet Sift", "Where's Waldo? — TF-IDF + DBSCAN across the fleet (IronSift)"],
       anomark: ["AnoMark", "Train multiple Markov models, score hosts, auto-check after scans"],
       checks: ["Rules", "Detection catalog — browse, edit, validate, and test rules per scan profile"],
       data: ["Data", "Browse and clear findings, scans, observations, hunt events, virtual ingest, and more"],
-      settings: ["Settings", "Versions, digests, ClickHouse, probe limits, and exportable config"],
       "ssh-summary": ["SSH Summary", "Track SSH keys, users, and host access across the fleet"],
       "ssh-graph": ["Access Graph", "Interactive key · user · host graph — drag, pan, zoom"],
       "ssh-zones": ["Security Zones", "Group hosts and keys into audit / alert zones"],
@@ -1132,37 +1286,74 @@
     const [t, s] = titles[view] || ["RustMite", ""];
     $("#pageTitle").textContent = t;
     $("#pageSub").textContent = s;
-    if (isSsh && !state.ssh) {
-      loadSshHunter()
-        .then(() => render())
-        .catch((e) => toast(e.message));
-    }
-    if (view === "data") {
-      loadDataSummary()
-        .then(() => render())
-        .catch((e) => toast(e.message));
-    }
-    if (view === "fleet-sift") {
-      Promise.all([refreshSiftRuns(), refreshSiftDetectionConfigs()])
-        .then(() => render())
-        .catch(() => {});
-    }
-    if (view === "anomark") {
-      refreshAnoMark()
-        .then(() => render())
-        .catch((e) => toast(e.message || "AnoMark load failed"));
-    }
-    if (!skipHash
-      && !String(location.hash || "").startsWith("#finding/")
-      && !String(location.hash || "").startsWith("#host/")
-      && !String(location.hash || "").startsWith("#/scans/")) {
+    if (!skipHash) {
+      const hash = String(location.hash || "");
+      // Explicit nav away from a host/finding overlay: close it so the UI matches the URL.
+      if (hash.startsWith("#host/") || hash.startsWith("#finding/")) {
+        const drawer = $("#drawer");
+        if (drawer && !drawer.classList.contains("hidden")) {
+          drawer.classList.add("hidden");
+          drawer.setAttribute("aria-hidden", "true");
+          const panel = drawer.querySelector(".drawer-panel");
+          if (panel) panel.classList.remove("is-wide", "is-fullscreen");
+        }
+        state.selectedFinding = null;
+      }
+      // Scan detail keeps `#/scans/…` while that view is active; otherwise set `#/<view>`.
       let next = `#/${view}`;
-      if (view === "checks" && state.selectedCheckId) {
+      if (view === "scan-detail" && hash.startsWith("#/scans/")) {
+        next = hash;
+      } else if (view === "checks" && state.selectedCheckId) {
         next = `#/checks/${encodeURIComponent(state.selectedCheckId)}`;
       }
       if (location.hash !== next) {
         history.replaceState(null, "", next);
       }
+    }
+
+    const loaders = [];
+    let loadMsg = `Loading ${t}…`;
+    if (isSsh && !state.ssh) {
+      loaders.push(loadSshHunter().catch((e) => { toast(e.message); }));
+      loadMsg = "Loading SSH Hunter…";
+    }
+    if (view === "data") {
+      loaders.push(loadDataSummary().catch((e) => { toast(e.message); }));
+      loadMsg = "Loading data summary…";
+    }
+    if (view === "fleet-sift") {
+      loaders.push(Promise.all([refreshSiftRuns(), refreshSiftDetectionConfigs()]).catch(() => {}));
+      loadMsg = "Loading Fleet Sift…";
+    }
+    if (view === "anomark") {
+      loaders.push(refreshAnoMark().catch((e) => { toast(e.message || "AnoMark load failed"); }));
+      loadMsg = "Loading AnoMark…";
+    }
+    if (view === "settings" && state._settingsTab === "audit" && state.authUser?.role === "admin") {
+      loaders.push(loadAuditLog().catch(() => {}));
+    }
+
+    const heavySync = view === "hosts" || view === "findings" || view === "scans";
+    const hostCount = (state.hosts || []).length;
+    const findingCount = (state.findings || []).length;
+    const scanCount = (state.scans || []).length;
+    const needsPaintGap = heavySync && (
+      (view === "hosts" && hostCount > 40)
+      || (view === "findings" && findingCount > 200)
+      || (view === "scans" && scanCount > 80)
+    );
+
+    if (loaders.length || needsPaintGap) {
+      showPageLoading(loaders.length ? loadMsg : `Rendering ${t}…`);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      try {
+        if (loaders.length) await Promise.all(loaders);
+        render();
+      } finally {
+        // Keep spinner visible through the paint of a heavy table.
+        requestAnimationFrame(() => hidePageLoading());
+      }
+      return;
     }
     render();
   }
@@ -1325,18 +1516,180 @@
     return counts;
   }
 
+  function scanInventorySummary(meta) {
+    const inv = meta?.inventory;
+    if (inv && typeof inv === "object") {
+      return {
+        processes: Number(inv.processes ?? 0),
+        files: Number(inv.files ?? 0),
+        sockets: Number(inv.sockets ?? 0),
+        processes_in_scan: Number(inv.processes_in_scan ?? inv.processes ?? 0),
+        files_in_scan: Number(inv.files_in_scan ?? inv.files ?? 0),
+        sockets_in_scan: Number(inv.sockets_in_scan ?? inv.sockets ?? 0),
+      };
+    }
+    // Older virtual-import scans only noted caps in delivery.fallback_reason.
+    const reason = String(meta?.delivery?.fallback_reason || "");
+    if (!reason) return null;
+    const out = {
+      processes: 0,
+      files: 0,
+      sockets: 0,
+      processes_in_scan: 0,
+      files_in_scan: 0,
+      sockets_in_scan: 0,
+    };
+    let hit = false;
+    const proc = reason.match(/(\d+)\s*\/\s*(\d+)\s+processes?/i);
+    if (proc) {
+      out.processes_in_scan = Number(proc[1]);
+      out.processes = Number(proc[2]);
+      hit = true;
+    }
+    const file = reason.match(/(\d+)\s*\/\s*(\d+)\s+files?/i)
+      || reason.match(/embeds\s+(\d+)\s*\/\s*(\d+)\s+file\s+rows/i);
+    if (file) {
+      out.files_in_scan = Number(file[1]);
+      out.files = Number(file[2]);
+      hit = true;
+    }
+    return hit ? out : null;
+  }
+
+  function fmtInvShownTotal(shown, total) {
+    const s = shown == null ? "…" : Number(shown).toLocaleString();
+    if (total == null || !Number.isFinite(Number(total))) return s;
+    const t = Number(total);
+    if (shown != null && Number(shown) < t) return `${s} / ${t.toLocaleString()}`;
+    return s;
+  }
+
+  function hostInventoryLabel(shown, total, noun) {
+    return `${fmtInvShownTotal(shown, total)} ${noun}`;
+  }
+
+  function hostInventoryCountsHtml(inv) {
+    const pc = Number(inv.processes ?? 0);
+    const fc = Number(inv.files ?? 0);
+    const cc = Number(inv.connections ?? 0);
+    const capped = (inv.filesTotal != null && fc < Number(inv.filesTotal))
+      || (inv.processesTotal != null && pc < Number(inv.processesTotal));
+    const note = capped
+      ? "Selected scan embeds a capped sample (shown / total). Use Hunt or open the scan for full inventory."
+      : "Counts for the selected scan (change above to compare history)";
+    return `<span class="mono">${esc(hostInventoryLabel(pc, inv.processesTotal, "processes"))}</span>
+      · <span class="mono">${esc(hostInventoryLabel(fc, inv.filesTotal, "files"))}</span>
+      · <span class="mono">${esc(cc.toLocaleString())} connections</span>
+      <div class="muted host-detail-note">${esc(note)}</div>`;
+  }
+
+  /** Merge inventory totals from scan meta onto shown observation counts. */
+  function withScanInventoryTotals(shown, scanMeta) {
+    const summary = scanInventorySummary(scanMeta);
+    return {
+      processes: Number(shown.processes ?? 0),
+      files: Number(shown.files ?? 0),
+      connections: Number(shown.connections ?? 0),
+      processesTotal: summary?.processes ?? null,
+      filesTotal: summary?.files ?? null,
+    };
+  }
+
+  /** Fetch scan meta (triggers server enrich) when virtual-import inventory totals are missing. */
+  async function ensureScanInventoryMeta(scan) {
+    const sid = String(scan?.job?.id || scan?.meta?.scan_id || "");
+    let meta = scan?.meta || null;
+    if (!sid) return meta;
+    if (scanInventorySummary(meta)) return meta;
+    const probe = String(meta?.probe_version || "");
+    const reason = String(meta?.delivery?.fallback_reason || "");
+    const looksVirtual = probe === "virtual-import"
+      || reason.includes("tree-import")
+      || reason.includes("feed-import")
+      || reason.includes("rehydrate");
+    if (!looksVirtual) return meta;
+    try {
+      const status = await api(`/v1/scans/${encodeURIComponent(sid)}`);
+      meta = status?.meta || meta;
+      if (status && Array.isArray(state.scans)) {
+        const idx = state.scans.findIndex((s) => String(s.job?.id || s.meta?.scan_id || "") === sid);
+        if (idx >= 0) {
+          state.scans[idx] = { ...state.scans[idx], ...status, meta };
+        }
+      }
+      if (scan) scan.meta = meta;
+    } catch (_) {}
+    return meta;
+  }
+
+  function rplEscapeHost(name) {
+    return String(name || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  /** Build Hunt RPL for full process/file inventory; optional local filter term. */
+  function huntInventoryQuery(hostId, kind, filterQ) {
+    const hid = rplEscapeHost(hostId);
+    const name = rplEscapeHost(hostName(hostId) || "");
+    // Prefer host_id (stable); OR host_name when display name differs.
+    const hostClause = name && name !== hid
+      ? `(host_id="${hid}" OR host_name="${name}")`
+      : `host_id="${hid}"`;
+    const term = String(filterQ || "").trim();
+    const escTerm = term.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    if (kind === "files" || kind === "file_meta") {
+      const filt = term ? ` path="*${escTerm}*"` : "";
+      return `${hostClause} kind="file_meta"${filt} | fields timestamp, path, file_hash, user, message | sort path | head 500`;
+    }
+    const filt = term
+      ? ` (process_name="*${escTerm}*" OR path="*${escTerm}*" OR cmdline="*${escTerm}*")`
+      : "";
+    return `${hostClause} kind="process"${filt} | fields timestamp, process_name, process_id, user, path, args, cmdline | sort -timestamp | head 500`;
+  }
+
+  async function openInventoryInHunt(hostId, kind, filterQ) {
+    const q = huntInventoryQuery(hostId, kind, filterQ);
+    state._rplQuery = q;
+    state._rplLimit = 500;
+    state._rplTab = "results";
+    state._rplPendingRun = true;
+    // setView already sets #/hunt and bindView runs the pending query — do not
+    // also assign location.hash (that can race with render and drop the run).
+    await setView("hunt");
+    toast("Opened in Hunt");
+  }
+
+  function scanInvCapBannerHtml(kind, shown, total, hostId) {
+    const t = total != null ? Number(total) : null;
+    const s = shown != null ? Number(shown) : null;
+    const capped = t != null && s != null && s < t;
+    if (!capped && t == null) return "";
+    const label = kind === "files" ? "files" : "processes";
+    const text = capped
+      ? `Scan embeds ${s.toLocaleString()} of ${t.toLocaleString()} ${label}. Full inventory is in Hunt / ingest.`
+      : (t != null ? `${t.toLocaleString()} ${label} in inventory.` : "");
+    if (!text) return "";
+    return `<div class="scan-inv-cap-banner">
+      <div class="scan-inv-cap-text">${esc(text)}</div>
+      ${hostId ? `<button type="button" class="btn primary tiny" data-hunt-inventory="${esc(kind)}" data-hunt-host="${esc(hostId)}">Search in Hunt</button>` : ""}
+    </div>`;
+  }
+
   async function refreshScanInvCounts(scanId, hostId) {
     if (!hostId || !scanId) return;
-    const q = `${hostInventoryScanQuery({ scanId })}&count_only=1`;
+    // serde bool query params only accept true/false (not 1/0).
+    const q = `${hostInventoryScanQuery({ scanId })}&count_only=true`;
     const [procPack, filePack, connPack] = await Promise.all([
       api(`/v1/hosts/${hostId}/processes?${q}`).catch(() => null),
       api(`/v1/hosts/${hostId}/files?${q}`).catch(() => null),
       api(`/v1/hosts/${hostId}/connections?${q}`).catch(() => null),
     ]);
+    const summary = scanInventorySummary(state.scanDetail?.status?.meta);
     const invCounts = {
       processes: Number(procPack?.count ?? 0),
       files: Number(filePack?.count ?? 0),
       connections: Number(connPack?.count ?? 0),
+      processesTotal: summary?.processes ?? null,
+      filesTotal: summary?.files ?? null,
     };
     if (!state.scanDetail || String(state.scanDetail.id) !== String(scanId)) return;
     state.scanDetail.invCounts = invCounts;
@@ -1344,12 +1697,22 @@
     // Patch badges in place — avoid a full re-render of the scan page.
     $$("[data-inv-stat]").forEach((el) => {
       const key = el.getAttribute("data-inv-stat");
-      if (key && key in invCounts) el.textContent = String(invCounts[key]);
+      if (key === "processes") {
+        el.textContent = fmtInvShownTotal(invCounts.processes, invCounts.processesTotal);
+      } else if (key === "files") {
+        el.textContent = fmtInvShownTotal(invCounts.files, invCounts.filesTotal);
+      } else if (key && key in invCounts) {
+        el.textContent = String(invCounts[key]);
+      }
     });
     $$("[data-scan-tab]").forEach((btn) => {
       const tab = btn.dataset.scanTab;
-      if (tab === "processes") btn.textContent = `Processes (${invCounts.processes})`;
-      if (tab === "files") btn.textContent = `Files (${invCounts.files})`;
+      if (tab === "processes") {
+        btn.textContent = `Processes (${fmtInvShownTotal(invCounts.processes, invCounts.processesTotal)})`;
+      }
+      if (tab === "files") {
+        btn.textContent = `Files (${fmtInvShownTotal(invCounts.files, invCounts.filesTotal)})`;
+      }
       if (tab === "connections") btn.textContent = `Connections (${invCounts.connections})`;
     });
   }
@@ -1360,6 +1723,7 @@
     if (location.hash !== hash) history.replaceState(null, "", hash);
     state.selectedScanId = id;
     const keepTab = (opts && opts.tab) || state.scanDetail?.tab || "overview";
+    showPageLoading("Loading scan…");
     try {
       // Paint the full page as soon as scan meta is available — do not wait on
       // inventory (processes/files/connections) which can be large.
@@ -1402,8 +1766,9 @@
         render();
       }
       const hostLabel = hostId ? hostName(hostId) : "host";
+      const agentLabel = scanAgentInfo(status).title;
       $("#pageTitle").textContent = `Scan ${shortId(id)}`;
-      $("#pageSub").textContent = `${hostLabel} · ${job.check_set || "scan"} · full page`;
+      $("#pageSub").textContent = `${hostLabel} · ${agentLabel} · ${job.check_set || "scan"} · full page`;
 
       if (hostId) {
         refreshScanInvCounts(id, hostId).catch(() => {});
@@ -1415,6 +1780,8 @@
     } catch (err) {
       toast(err.message || "Scan not found");
       return false;
+    } finally {
+      hidePageLoading();
     }
   }
 
@@ -1450,11 +1817,25 @@
     const abs = scanPermalink(id);
     const hash = `#/scans/${encodeURIComponent(id)}`;
     const hostHref = hostId ? `#host/${encodeURIComponent(hostId)}` : "#/hosts";
+    const invSummary = scanInventorySummary(meta);
     const invCounts = pack.invCounts || { processes: null, files: null, connections: null };
+    if (invSummary) {
+      if (invCounts.processesTotal == null) invCounts.processesTotal = invSummary.processes;
+      if (invCounts.filesTotal == null) invCounts.filesTotal = invSummary.files;
+      if (invCounts.processes == null && invSummary.processes_in_scan != null) {
+        invCounts.processes = invSummary.processes_in_scan;
+      }
+      if (invCounts.files == null && invSummary.files_in_scan != null) {
+        invCounts.files = invSummary.files_in_scan;
+      }
+    }
     const fmtInv = (n) => (n == null ? "…" : String(n));
+    const fmtProc = () => fmtInvShownTotal(invCounts.processes, invCounts.processesTotal);
+    const fmtFile = () => fmtInvShownTotal(invCounts.files, invCounts.filesTotal);
     const activity = pack.activity || [];
     const capOn = Object.entries(caps).filter(([, v]) => !!v).map(([k]) => k);
     const outcomeLabel = formatScanOutcome(meta.outcome);
+    const agent = scanAgentInfo(status);
     const tab = pack.tab || "overview";
     const pane = (name) => (tab === name ? "" : "hidden");
     const tabCls = (name) => (tab === name ? "tab active" : "tab");
@@ -1468,6 +1849,7 @@
             <div class="scan-detail-title">Scan ${esc(shortId(id))}</div>
             <div class="scan-detail-meta">
               <span class="pill neutral">${esc(disp)}</span>
+              <span class="tag scan-agent-tag scan-agent-tag--${esc(agent.id)}" title="${esc(agent.detail)}">${esc(agent.title)}</span>
               <span class="muted">${esc(job.check_set || "—")}</span>
               <span class="sep">·</span>
               <a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(hostId)}">${esc(hostName(hostId))}</a>
@@ -1491,15 +1873,15 @@
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(fired))}${applicable ? `<span class="muted">/${esc(String(applicable))}</span>` : ""}</div><div class="scan-stat-label">Checks fired</div></div>
           <div class="scan-stat"><div class="scan-stat-val">${esc(String(findings.length))}</div><div class="scan-stat-label">Findings</div></div>
           <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="connections">${esc(fmtInv(invCounts.connections))}</div><div class="scan-stat-label">Connections</div></div>
-          <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="processes">${esc(fmtInv(invCounts.processes))}</div><div class="scan-stat-label">Processes</div></div>
-          <div class="scan-stat"><div class="scan-stat-val">${esc(String(collectors.length))}</div><div class="scan-stat-label">Collectors</div></div>
+          <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="processes">${esc(fmtProc())}</div><div class="scan-stat-label">Processes</div></div>
+          <div class="scan-stat"><div class="scan-stat-val" data-inv-stat="files">${esc(fmtFile())}</div><div class="scan-stat-label">Files</div></div>
         </div>
 
         <div class="host-detail-tabs scan-detail-tabs" role="tablist">
           <button type="button" class="${tabCls("overview")}" data-scan-tab="overview">Overview</button>
           <button type="button" class="${tabCls("findings")}" data-scan-tab="findings">Findings (${findings.length})</button>
-          <button type="button" class="${tabCls("processes")}" data-scan-tab="processes">Processes (${esc(fmtInv(invCounts.processes))})</button>
-          <button type="button" class="${tabCls("files")}" data-scan-tab="files">Files (${esc(fmtInv(invCounts.files))})</button>
+          <button type="button" class="${tabCls("processes")}" data-scan-tab="processes">Processes (${esc(fmtProc())})</button>
+          <button type="button" class="${tabCls("files")}" data-scan-tab="files">Files (${esc(fmtFile())})</button>
           <button type="button" class="${tabCls("connections")}" data-scan-tab="connections">Connections (${esc(fmtInv(invCounts.connections))})</button>
           <button type="button" class="${tabCls("collectors")}" data-scan-tab="collectors">Collectors (${collectors.length})</button>
           <button type="button" class="${tabCls("activity")}" data-scan-tab="activity">Activity (${activity.length})</button>
@@ -1513,6 +1895,15 @@
               <dt>Host</dt><dd><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(hostId)}">${esc(hostName(hostId))}</a>
                 <div class="mono muted" style="font-size:0.75rem">${esc(hostId || "—")}</div></dd>
               <dt>Check set</dt><dd>${esc(job.check_set || "—")}</dd>
+              <dt>Agent</dt><dd>
+                <span class="tag scan-agent-tag scan-agent-tag--${esc(agent.id)}">${esc(agent.title)}</span>
+                <span class="muted"> · ${esc(agent.detail)}</span>
+                <div class="mono muted" style="font-size:0.75rem;margin-top:0.2rem">
+                  probe ${esc(agent.probe)}
+                  · delivery ${esc(agent.delivery || delivery.method || "—")}
+                  ${agent.node ? ` · node ${esc(agent.node)}` : ""}
+                </div>
+              </dd>
               <dt>State / outcome</dt><dd><span class="pill neutral">${esc(disp)}</span>
                 <span class="mono muted"> · ${esc(outcomeLabel)}</span></dd>
               <dt>Started</dt><dd class="mono">${esc(fmtWhen(meta.started_at))}</dd>
@@ -1527,6 +1918,15 @@
                 ${delivery.fallback_reason ? `<span class="muted"> · fallback ${esc(delivery.fallback_reason)}</span>` : ""}
                 <div class="muted" style="font-size:0.75rem">cleanup ${delivery.cleanup_ok === false ? "failed" : "ok"}${delivery.cleanup_forced ? " (forced)" : ""}
                   · bytes ${esc(String(delivery.bytes_transferred ?? meta.bytes_from_probe ?? 0))}</div></dd>
+              <dt>Tags</dt><dd>
+                <div id="scanTagsDisplay">${formatScanTags(meta.tags)}</div>
+                <form id="scanTagsForm" class="form" style="margin-top:0.45rem;display:flex;gap:0.45rem;align-items:flex-end;flex-wrap:wrap">
+                  <label style="flex:1;min-width:12rem;margin:0">Edit tags
+                    <input name="scan_tags" id="scanTagsInput" value="${esc((meta.tags || []).join(", "))}" placeholder="import, day-1" autocomplete="off" />
+                  </label>
+                  <button type="submit" class="btn primary tiny">Save tags</button>
+                </form>
+              </dd>
               ${(meta.import_folders || []).length || (meta.import_files || []).length ? `
               <dt>Import folders</dt><dd>${(meta.import_folders || []).length
                 ? `<ul class="scan-import-list">${(meta.import_folders || []).map((f) => `<li class="mono">${esc(f)}</li>`).join("")}</ul>`
@@ -1535,13 +1935,16 @@
                 ? `<ul class="scan-import-list">${(meta.import_files || []).slice(0, 40).map((f) => `<li class="mono">${esc(f)}</li>`).join("")}${(meta.import_files || []).length > 40 ? `<li class="muted">… +${(meta.import_files || []).length - 40} more</li>` : ""}</ul>`
                 : `<span class="muted">—</span>`}</dd>
               ` : ""}
-              <dt>Probe</dt><dd class="mono">${esc(meta.probe_version || "—")}
+              <dt>Probe</dt><dd class="mono">${esc(meta.probe_version || agent.probe || "—")}
                 ${meta.arch ? ` · ${esc(meta.arch)}` : ""}</dd>
               <dt>OS / kernel</dt><dd>${esc(meta.os || "—")}
                 <div class="mono muted" style="font-size:0.78rem">${esc([meta.os_id, meta.os_version].filter(Boolean).join(" ") || "—")}
                   · ${esc(meta.kernel || "—")}</div></dd>
               <dt>Boot ID</dt><dd class="mono">${esc(meta.boot_id || "—")}</dd>
-              <dt>Node</dt><dd class="mono">${esc(meta.node_id || job.leased_by || "—")}</dd>
+              <dt>Node</dt><dd class="mono">${esc(agent.node || meta.node_id || job.leased_by || "—")}
+                ${agent.node && (meta.node_id || job.leased_by) && String(agent.node) !== String(meta.node_id || job.leased_by)
+                  ? `<div class="muted" style="font-size:0.72rem">${esc(meta.node_id || job.leased_by)}</div>`
+                  : ""}</dd>
               <dt>Attempts</dt><dd class="mono">${esc(String(job.attempts ?? "—"))}
                 ${job.priority != null ? ` · priority ${esc(String(job.priority))}` : ""}</dd>
               <dt>Capabilities</dt><dd>${capOn.length
@@ -1565,11 +1968,21 @@
               </div>
               <h3 class="scan-pane-title" style="margin-top:1.25rem">Inventory snapshot</h3>
               <dl class="kv">
-                <dt>Processes</dt><dd class="mono" data-inv-stat="processes">${esc(fmtInv(invCounts.processes))}</dd>
-                <dt>Files</dt><dd class="mono" data-inv-stat="files">${esc(fmtInv(invCounts.files))}</dd>
+                <dt>Processes</dt><dd class="mono" data-inv-stat="processes">${esc(fmtProc())}${
+                  invCounts.processesTotal != null && invCounts.processes != null && invCounts.processes < invCounts.processesTotal
+                    ? ` <span class="muted">(capped)</span>` : ""
+                }</dd>
+                <dt>Files</dt><dd class="mono" data-inv-stat="files">${esc(fmtFile())}${
+                  invCounts.filesTotal != null && invCounts.files != null && invCounts.files < invCounts.filesTotal
+                    ? ` <span class="muted">(capped)</span>` : ""
+                }</dd>
                 <dt>Connections</dt><dd class="mono" data-inv-stat="connections">${esc(fmtInv(invCounts.connections))}</dd>
                 <dt>Observations</dt><dd class="mono">${esc(String(meta.observation_count ?? "—"))}</dd>
               </dl>
+              ${hostId ? `<div class="form-actions" style="justify-content:flex-start;margin-top:0.65rem;gap:0.45rem">
+                <button type="button" class="btn ghost tiny" data-hunt-inventory="processes" data-hunt-host="${esc(hostId)}">Processes in Hunt</button>
+                <button type="button" class="btn ghost tiny" data-hunt-inventory="files" data-hunt-host="${esc(hostId)}">Files in Hunt</button>
+              </div>` : ""}
             </div>
           </div>
         </div>
@@ -1588,11 +2001,17 @@
         </div>
 
         <div data-scan-pane="processes" class="${pane("processes")}">
-          <div class="muted" style="margin-bottom:0.65rem">Process inventory collected during this scan.</div>
+          ${scanInvCapBannerHtml("processes", invCounts.processes, invCounts.processesTotal, hostId)
+            || `<div class="muted" style="margin-bottom:0.65rem">Process inventory collected during this scan.${
+              hostId ? ` <button type="button" class="btn ghost tiny" data-hunt-inventory="processes" data-hunt-host="${esc(hostId)}">Search in Hunt</button>` : ""
+            }</div>`}
           <div id="hostProcessesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-scan-pane="files" class="${pane("files")}">
-          <div class="muted" style="margin-bottom:0.65rem">File inventory collected during this scan.</div>
+          ${scanInvCapBannerHtml("files", invCounts.files, invCounts.filesTotal, hostId)
+            || `<div class="muted" style="margin-bottom:0.65rem">File inventory collected during this scan.${
+              hostId ? ` <button type="button" class="btn ghost tiny" data-hunt-inventory="files" data-hunt-host="${esc(hostId)}">Search in Hunt</button>` : ""
+            }</div>`}
           <div id="hostFilesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-scan-pane="connections" class="${pane("connections")}">
@@ -1818,6 +2237,45 @@
       });
     });
 
+    $$("[data-hunt-inventory]", root).forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        const kind = btn.getAttribute("data-hunt-inventory") || "processes";
+        const hid = btn.getAttribute("data-hunt-host") || hostId;
+        if (!hid) return;
+        openInventoryInHunt(hid, kind, "");
+      });
+    });
+
+    const tagsForm = $("#scanTagsForm");
+    tagsForm?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const raw = String($("#scanTagsInput")?.value || "");
+      const tags = raw.split(",").map((s) => s.trim()).filter(Boolean);
+      const btn = tagsForm.querySelector('button[type="submit"]');
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api(`/v1/scans/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          body: { tags },
+        });
+        const nextTags = res.meta?.tags || tags;
+        if (state.scanDetail?.status?.meta) {
+          state.scanDetail.status.meta.tags = nextTags;
+        }
+        const row = (state.scans || []).find((s) => String(s.job?.id) === String(id));
+        if (row?.meta) row.meta.tags = nextTags;
+        const display = $("#scanTagsDisplay");
+        if (display) display.innerHTML = formatScanTags(nextTags);
+        if ($("#scanTagsInput")) $("#scanTagsInput").value = (nextTags || []).join(", ");
+        toast("Scan tags saved");
+      } catch (err) {
+        toast(err.message || String(err));
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+
     const copyJson = $("#btnCopyScanJson");
     if (copyJson) {
       copyJson.addEventListener("click", async () => {
@@ -1831,7 +2289,10 @@
     }
 
     $$("[data-goto]", root).forEach((b) => {
-      b.addEventListener("click", () => setView(b.dataset.goto));
+      b.addEventListener("click", () => {
+        const tab = b.getAttribute("data-settings-tab");
+        setView(b.dataset.goto, tab ? { settingsTab: tab } : undefined);
+      });
     });
   }
 
@@ -1909,6 +2370,7 @@
       "ssh-tags": sshTags,
     };
     root.innerHTML = (views[state.view] || dashboard)();
+    updateNavFindingsCount();
     bindView();
   }
 
@@ -1932,15 +2394,10 @@
       return `<div class="scan-page-picker muted">No other retained scans for this host.</div>`;
     }
     const opts = hostScans.map((s, i) => {
-      const j = s.job || {};
-      const m = s.meta || {};
-      const sid = String(j.id || m.scan_id || "");
+      const sid = String(s.job?.id || s.meta?.scan_id || "");
       if (!sid) return "";
-      const when = m.finished_at || j.created_at || "";
-      const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
-      const label = `#${i + 1} · ${fmtWhen(when)} · ${setLabel} · ${shortId(sid)}`;
       const sel = String(selectedScanId || "") === sid ? "selected" : "";
-      return `<option value="${esc(sid)}" ${sel}>${esc(label)}</option>`;
+      return `<option value="${esc(sid)}" ${sel} title="${esc(scanPickerLabel(s, i))}">${esc(scanPickerLabel(s, i))}</option>`;
     }).filter(Boolean).join("");
     return `<div class="scan-page-picker">
       <label>Scan for this host
@@ -1972,7 +2429,7 @@
           ${findingsTable(recent)}
         </section>
         <section class="panel">
-          <div class="panel-head"><h3>Live progress feed</h3><button class="btn ghost" data-goto="activity">Activity</button></div>
+          <div class="panel-head"><h3>Live progress feed</h3><button class="btn ghost" data-goto="settings" data-settings-tab="audit">Audit log</button></div>
           ${!recentAct.length ? `<div class="empty">No live events yet</div>` : `
           <table class="data activity-table"><thead><tr><th>When</th><th>Level</th><th>Event</th></tr></thead><tbody>
             ${recentAct.map((e) => `<tr>
@@ -2114,12 +2571,56 @@
     return h ? hostTags(h) : [];
   }
 
+  function findingStatusKey(f) {
+    return String(f?.status || "new").toLowerCase().replace(/-/g, "_");
+  }
+
+  function findingStatusLabel(status) {
+    const s = String(status || "new").toLowerCase().replace(/-/g, "_");
+    return ({
+      new: "Unclassified",
+      acknowledged: "Unclassified",
+      true_positive: "True positive",
+      false_positive: "False positive",
+      suppressed: "False positive",
+      resolved: "Unclassified",
+    })[s] || s;
+  }
+
+  function findingStatusBadge(f) {
+    const s = findingStatusKey(f);
+    const visual = (s === "suppressed") ? "false_positive"
+      : (s === "acknowledged" || s === "resolved") ? "new"
+      : s;
+    const cls = ({
+      new: "finding-status finding-status--new",
+      true_positive: "finding-status finding-status--tp",
+      false_positive: "finding-status finding-status--fp",
+    })[visual] || "finding-status";
+    return `<span class="${cls}" title="${esc(f.suppressed_by ? `by ${f.suppressed_by}` : "")}">${esc(findingStatusLabel(s))}</span>`;
+  }
+
+  function findingIsHiddenByDefault(f) {
+    const s = findingStatusKey(f);
+    return s === "false_positive" || s === "suppressed";
+  }
+
   function findingMatchesFilters(f) {
     const q = (state._findQ || "").trim().toLowerCase();
     const sevF = (state._findSev || "").toLowerCase();
     const hostF = state._findHost || "";
     const tagF = (state._findTag || "").toLowerCase();
     const checkF = state._findCheck || "";
+    // Default "open": hide false positives / suppressed so triage stays clean.
+    const statusF = (state._findStatus || "open").toLowerCase();
+    const st = findingStatusKey(f);
+    if (statusF === "open") {
+      if (findingIsHiddenByDefault(f)) return false;
+    } else if (statusF === "hidden") {
+      if (!findingIsHiddenByDefault(f)) return false;
+    } else if (statusF && statusF !== "all") {
+      if (st !== statusF) return false;
+    }
     if (sevF && String(f.severity).toLowerCase() !== sevF) return false;
     if (hostF && String(f.host_id) !== String(hostF)) return false;
     if (checkF && String(f.check_id) !== String(checkF)) return false;
@@ -2140,6 +2641,65 @@
       if (!hay.includes(q)) return false;
     }
     return true;
+  }
+
+  function findingHostCheckKey(f) {
+    return `${f?.host_id || ""}::${f?.check_id || ""}`;
+  }
+
+  function findingSiblingCount(f) {
+    const key = findingHostCheckKey(f);
+    if (!key || key === "::") return 1;
+    return (state.findings || []).filter((x) => findingHostCheckKey(x) === key).length;
+  }
+
+  async function classifyFinding(id, status) {
+    const updated = await api(`/v1/findings/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { status },
+    });
+    const idx = (state.findings || []).findIndex((x) => String(x.id) === String(id));
+    const base = idx >= 0 ? state.findings[idx] : updated;
+    const hostCheck = findingHostCheckKey(updated || base);
+    const st = String(status || "").toLowerCase();
+    // FP / clear are host×check scoped on the server — mirror that in local state.
+    if ((st === "false_positive" || st === "suppressed") && hostCheck && hostCheck !== "::") {
+      state.findings = (state.findings || []).map((x) => {
+        if (findingHostCheckKey(x) !== hostCheck) return x;
+        return {
+          ...x,
+          status: updated?.status ?? status,
+          suppressed_by: updated?.suppressed_by ?? x.suppressed_by,
+        };
+      });
+    } else if (st === "new" && hostCheck && hostCheck !== "::") {
+      state.findings = (state.findings || []).map((x) => {
+        if (findingHostCheckKey(x) !== hostCheck) return x;
+        const cur = findingStatusKey(x);
+        if (cur === "true_positive" && String(x.id) !== String(id)) return x;
+        return { ...x, status: "new", suppressed_by: null };
+      });
+    } else if (idx >= 0) {
+      state.findings[idx] = { ...state.findings[idx], ...updated };
+    } else if (updated) {
+      state.findings = [updated, ...(state.findings || [])];
+    }
+    if (state.selectedFinding && String(state.selectedFinding.id) === String(id)) {
+      const live = (state.findings || []).find((x) => String(x.id) === String(id));
+      state.selectedFinding = live || { ...state.selectedFinding, ...updated };
+    }
+    updateNavFindingsCount();
+    return updated;
+  }
+
+  async function deleteFindingById(id) {
+    await api(`/v1/findings/${encodeURIComponent(id)}`, { method: "DELETE" });
+    state.findings = (state.findings || []).filter((x) => String(x.id) !== String(id));
+    if (state.selectedFinding && String(state.selectedFinding.id) === String(id)) {
+      state.selectedFinding = null;
+      closeDrawer();
+    }
+    updateNavFindingsCount();
   }
 
   function filteredFindingsList() {
@@ -2270,13 +2830,15 @@
     const hostF = state._findHost || "";
     const tagF = state._findTag || "";
     const checkF = state._findCheck || "";
+    const statusF = state._findStatus || "open";
     const group = state._findGroup || "alert";
     const opts = findingsFilterOptions();
     const allRows = state.findings || [];
     const rows = filteredFindingsList();
-    const sevCounts = findingsSevCounts(allRows);
+    const sevCounts = findingsSevCounts(allRows.filter((f) => !findingIsHiddenByDefault(f)));
     const filteredCounts = findingsSevCounts(rows);
-    const activeFilters = [q, sevF, hostF, tagF, checkF].filter(Boolean).length;
+    const hiddenN = allRows.filter(findingIsHiddenByDefault).length;
+    const activeFilters = [q, sevF, hostF, tagF, checkF, statusF !== "open" ? statusF : ""].filter(Boolean).length;
 
     let pageItems = [];
     let totalUnits = 0;
@@ -2328,10 +2890,18 @@
           <div class="panel-head findings-head">
             <div>
               <h3>Findings <span class="muted">(${totalUnits.toLocaleString()} ${unitLabel})</span></h3>
-              <p class="muted findings-sub">Same check on one host is grouped across scans by default.</p>
+              <p class="muted findings-sub">Same check on one host is grouped across scans by default. Mark FP to hide; use Classification to review hidden ones.</p>
             </div>
             <div class="toolbar findings-toolbar">
               <input id="findQ" placeholder="Search title, host, evidence…" value="${esc(q)}" />
+              <select id="findStatus" title="Classification">
+                <option value="open" ${statusF === "open" ? "selected" : ""}>Open (hide FP)</option>
+                <option value="all" ${statusF === "all" ? "selected" : ""}>All</option>
+                <option value="new" ${statusF === "new" ? "selected" : ""}>Unclassified</option>
+                <option value="true_positive" ${statusF === "true_positive" ? "selected" : ""}>True positive</option>
+                <option value="false_positive" ${statusF === "false_positive" ? "selected" : ""}>False positive</option>
+                <option value="hidden" ${statusF === "hidden" ? "selected" : ""}>Hidden only${hiddenN ? ` (${hiddenN})` : ""}</option>
+              </select>
               <select id="findSev" title="Severity">
                 <option value="">All severities</option>
                 ${["critical", "high", "medium", "low", "info"].map((s) =>
@@ -2398,6 +2968,9 @@
       const getter = getters[sortKey];
       if (getter) data = sortRowsBy(rows, getter, sortDir);
     }
+    // Inside a multi-scan group, don't offer TP/FP on the aggregate rows — open one
+    // occurrence (or use host×check FP from the drawer after reviewing siblings).
+    const allowClassify = !(opts && opts.noClassify);
     return `<table class="data findings-table ${compact ? "findings-table-compact" : ""}"><thead><tr>
       ${th("When", "when")}${th("Severity", "severity")}${th("Title", "title")}${th("Check", "check")}${hideHost ? "" : th("Host", "host")}${compact || hideHost ? "" : th("Tags", "tags")}${hideScan ? "" : th("Scan", "scan")}${th("ATT&CK", "attack")}<th></th>
     </tr></thead><tbody>
@@ -2408,10 +2981,11 @@
         const when = findingWhen(f);
         const tags = findingHostTagList(f);
         const scanHref = f.scan_id ? `#/scans/${encodeURIComponent(f.scan_id)}` : "";
-        return `<tr data-fid="${esc(f.id)}">
+        return `<tr data-fid="${esc(f.id)}" class="${findingIsHiddenByDefault(f) ? "finding-row--hidden" : ""}">
         <td class="mono muted finding-when">${esc(fmtWhen(when.finished || when.seen))}</td>
         <td>${sev(f.severity)}</td>
-        <td><a class="finding-link" href="${esc(href)}" data-fid-link="${esc(f.id)}">${esc(f.title)}</a></td>
+        <td><a class="finding-link" href="${esc(href)}" data-fid-link="${esc(f.id)}">${esc(f.title)}</a>
+          ${findingStatusKey(f) !== "new" ? ` ${findingStatusBadge(f)}` : ""}</td>
         <td><span class="pill">${esc(f.check_id)}</span></td>
         ${hideHost ? "" : `<td><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(f.host_id)}">${esc(hostName(f.host_id))}</a></td>`}
         ${compact || hideHost ? "" : `<td class="findings-tags">${tags.length ? tags.slice(0, 4).map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "—"}</td>`}
@@ -2424,6 +2998,9 @@
         <td class="row-actions">
           <a class="btn ghost tiny" href="${esc(href)}" data-fid-link="${esc(f.id)}" title="Open finding">Open</a>
           <button type="button" class="btn ghost tiny" data-copy-finding="${esc(abs)}" title="Copy direct link">Link</button>
+          ${allowClassify ? `
+          <button type="button" class="btn ghost tiny" data-classify-finding="${esc(f.id)}" data-status="true_positive" title="True positive (this occurrence)">TP</button>
+          <button type="button" class="btn ghost tiny" data-classify-finding="${esc(f.id)}" data-status="false_positive" title="False positive — this host + check (all scans)">FP</button>` : ""}
         </td>
       </tr>`;
       }).join("")}
@@ -2472,13 +3049,18 @@
       const tags = findingHostTagList(latest);
       const href = `#finding/${encodeURIComponent(latest.id)}`;
       const hostHref = `#host/${encodeURIComponent(g.host_id)}`;
+      const multi = g.count > 1;
+      const titleInner = multi
+        ? `<button type="button" class="finding-link finding-group-title-btn" data-toggle-find-group="${esc(g.key)}">${esc(g.title || g.check_id)}</button>`
+        : `<a class="finding-link" href="${esc(href)}" data-fid-link="${esc(latest.id)}">${esc(g.title || g.check_id)}</a>`;
       return `<article class="finding-group ${open ? "open" : ""}" data-find-group-key="${esc(g.key)}">
         <div class="finding-group-main">
           <div class="finding-group-sev">${sev(g.severity)}</div>
           <div class="finding-group-body">
             <div class="finding-group-title">
-              <a class="finding-link" href="${esc(href)}" data-fid-link="${esc(latest.id)}">${esc(g.title || g.check_id)}</a>
-              ${g.count > 1 ? `<span class="finding-count" title="Seen across ${g.scanCount} scan(s)">${g.count}×</span>` : ""}
+              ${titleInner}
+              ${multi ? `<span class="finding-count" title="Seen across ${g.scanCount} scan(s) — expand to review before classifying">${g.count}×</span>` : ""}
+              ${!multi && findingStatusKey(latest) !== "new" ? findingStatusBadge(latest) : ""}
             </div>
             <div class="finding-group-meta">
               <a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(g.host_id)}">${esc(hostName(g.host_id))}</a>
@@ -2490,17 +3072,18 @@
             </div>
             <div class="finding-group-times muted mono">
               last ${esc(fmtWhen(whenLatest.finished || whenLatest.seen))}
-              ${g.count > 1 ? ` · first ${esc(fmtWhen(whenFirst.finished || whenFirst.seen))}` : ""}
+              ${multi ? ` · first ${esc(fmtWhen(whenFirst.finished || whenFirst.seen))}` : ""}
             </div>
+            ${multi ? `<p class="muted finding-group-hint">Expand to review each scan before classifying. False positive applies to this host + check (all scans + future).</p>` : ""}
           </div>
           <div class="finding-group-actions">
-            <a class="btn primary tiny" href="${esc(href)}" data-fid-link="${esc(latest.id)}">Open latest</a>
-            ${g.count > 1
-              ? `<button type="button" class="btn ghost tiny" data-toggle-find-group="${esc(g.key)}">${open ? "Hide" : "Show"} ${g.count}</button>`
-              : `<button type="button" class="btn ghost tiny" data-copy-finding="${esc(findingPermalink(latest.id))}">Link</button>`}
+            ${multi
+              ? `<button type="button" class="btn primary tiny" data-toggle-find-group="${esc(g.key)}">${open ? "Hide" : "Review"} ${g.count}</button>`
+              : `<a class="btn primary tiny" href="${esc(href)}" data-fid-link="${esc(latest.id)}">Open</a>
+                 <button type="button" class="btn ghost tiny" data-copy-finding="${esc(findingPermalink(latest.id))}">Link</button>`}
           </div>
         </div>
-        ${open && g.count > 1 ? `<div class="finding-group-detail">${findingsTable(g.findings, { compact: true })}</div>` : ""}
+        ${open && multi ? `<div class="finding-group-detail">${findingsTable(g.findings, { compact: true, noClassify: true })}</div>` : ""}
       </article>`;
     }).join("")}</div>`;
   }
@@ -2674,7 +3257,7 @@
       return { key: "active", label: "Active", auth: detail || (auth === "ok" ? "SSH reachable" : "login not tested") };
     }
     if (auth === "virtual" || String(h.agent_kind || "").toLowerCase() === "virtual") {
-      return { key: "active", label: "Virtual", auth: detail || "log ingest only" };
+      return { key: "virtual", label: "Virtual", auth: detail || "log ingest only" };
     }
     if (auth === "unreachable" || auth === "no_sshd") {
       return { key: "offline", label: "Offline", auth: detail || auth.replace(/_/g, " ") };
@@ -2728,6 +3311,136 @@
     return [...new Set(tags)];
   }
 
+  /** Freeform tags only (for the Tags column — env/profile live in filters). */
+  function hostFreeformTags(h) {
+    const raw = h?.labels?.tags || h?.labels?.tag || "";
+    return [...new Set(String(raw).split(/[,;]+/).map((t) => t.trim()).filter(Boolean))];
+  }
+
+  function hostMetaChips(h) {
+    const labels = h?.labels || {};
+    const chips = [];
+    ["env", "profile", "region"].forEach((k) => {
+      if (labels[k]) chips.push({ key: k, value: String(labels[k]) });
+    });
+    return chips;
+  }
+
+  function hostTargetText(h) {
+    if (isVirtualHost(h)) {
+      return h.labels?.source || "ingest";
+    }
+    const addr = h.primary_addr || "—";
+    if (addr === "—") return "—";
+    return `${addr}:${h.ssh_port || 22}`;
+  }
+
+  function hostTargetHtml(h) {
+    if (isVirtualHost(h)) {
+      const src = h.labels?.source || "";
+      return `<span class="muted">ingest</span>${src ? `<div class="mono muted host-cell-sub" title="${esc(src)}">${esc(src)}</div>` : ""}`;
+    }
+    const addr = h.primary_addr || "—";
+    const port = h.ssh_port || 22;
+    return `<span class="mono">${esc(addr)}${addr !== "—" ? `:${port}` : ""}</span>`;
+  }
+
+  function hostTagsCellHtml(h) {
+    const tags = hostFreeformTags(h);
+    const meta = hostMetaChips(h);
+    if (!tags.length && !meta.length) return `<span class="muted">—</span>`;
+    return `<div class="host-tags-cell">
+      ${tags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+      ${meta.map((m) => `<span class="host-meta-chip" title="${esc(m.key)}">${esc(m.value)}</span>`).join("")}
+    </div>`;
+  }
+
+  /** Compact SVG icons for host-row action buttons. */
+  function hostActionIcon(name) {
+    const common = 'xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+    const paths = {
+      link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+      upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>',
+      plug: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a6 6 0 0 1-12 0V8Z"/>',
+      scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/>',
+      edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+      trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+      more: '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
+    };
+    return `<svg ${common}>${paths[name] || ""}</svg>`;
+  }
+
+  /** Single ⋯ menu so every host action stays available without crowding the row. */
+  function hostRowActionsHtml(h, abs) {
+    const virt = isVirtualHost(h);
+    const items = [
+      virt
+        ? `<button type="button" class="host-action-item" role="menuitem" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name)}">${hostActionIcon("upload")}<span>Update ingest</span></button>`
+        : `<button type="button" class="host-action-item" role="menuitem" data-scan-host="${esc(h.id)}">${hostActionIcon("scan")}<span>Scan now</span></button>`,
+      `<button type="button" class="host-action-item" role="menuitem" data-copy-host-link="${esc(abs)}">${hostActionIcon("link")}<span>Copy link</span></button>`,
+      virt ? "" : `<button type="button" class="host-action-item" role="menuitem" data-test-host="${esc(h.id)}">${hostActionIcon("plug")}<span>Test connectivity</span></button>`,
+      `<button type="button" class="host-action-item" role="menuitem" data-edit-host="${esc(h.id)}">${hostActionIcon("edit")}<span>Edit</span></button>`,
+      `<button type="button" class="host-action-item danger-text" role="menuitem" data-delete-host="${esc(h.id)}">${hostActionIcon("trash")}<span>Delete</span></button>`,
+    ].filter(Boolean).join("");
+    return `<div class="host-action-menu">
+        <button type="button" class="btn ghost tiny icon-action" data-host-menu-toggle aria-haspopup="menu" aria-expanded="false" title="Host actions" aria-label="Host actions">${hostActionIcon("more")}</button>
+        <div class="host-action-pop hidden" role="menu">${items}</div>
+      </div>`;
+  }
+
+  function closeAllHostActionMenus() {
+    $$(".host-action-pop").forEach((pop) => {
+      pop.classList.add("hidden");
+      pop.style.top = "";
+      pop.style.right = "";
+      pop.style.left = "";
+      pop.style.bottom = "";
+    });
+    $$("[data-host-menu-toggle]").forEach((btn) => btn.setAttribute("aria-expanded", "false"));
+  }
+
+  function positionHostActionPop(btn, pop) {
+    const r = btn.getBoundingClientRect();
+    const pad = 8;
+    pop.style.position = "fixed";
+    pop.style.left = "auto";
+    pop.style.right = `${Math.max(pad, window.innerWidth - r.right)}px`;
+    pop.classList.remove("hidden");
+    const ph = pop.getBoundingClientRect().height || 160;
+    const spaceBelow = window.innerHeight - r.bottom - pad;
+    if (spaceBelow < ph && r.top > ph + pad) {
+      pop.style.top = "auto";
+      pop.style.bottom = `${Math.max(pad, window.innerHeight - r.top + 4)}px`;
+    } else {
+      pop.style.bottom = "auto";
+      pop.style.top = `${Math.min(r.bottom + 4, window.innerHeight - ph - pad)}px`;
+    }
+  }
+
+  function wireHostActionMenus(root) {
+    const scope = root || document;
+    $$("[data-host-menu-toggle]", scope).forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const menu = btn.closest(".host-action-menu");
+        const pop = menu?.querySelector(".host-action-pop");
+        if (!pop) return;
+        const wasOpen = !pop.classList.contains("hidden");
+        closeAllHostActionMenus();
+        if (wasOpen) return;
+        positionHostActionPop(btn, pop);
+        btn.setAttribute("aria-expanded", "true");
+      });
+    });
+    $$(".host-action-pop .host-action-item", scope).forEach((item) => {
+      item.addEventListener("click", () => {
+        // Let the specific data-* handler run; close after.
+        window.setTimeout(closeAllHostActionMenus, 0);
+      });
+    });
+  }
+
   function selectedHostIds() {
     return new Set(state._selectedHosts || []);
   }
@@ -2751,6 +3464,7 @@
         if (preset === "active" && st.key !== "active") return false;
         if (preset === "inactive" && st.key !== "inactive") return false;
         if (preset === "offline" && st.key !== "offline") return false;
+        if (preset === "virtual" && st.key !== "virtual") return false;
       }
       if (agent) {
         const a = hostAgentInfo(h).id;
@@ -2846,112 +3560,140 @@
     const selected = selectedHostIds();
     const pageIds = pageRows.map((h) => h.id);
     const allPageSelected = pageIds.length > 0 && pageIds.every((id) => selected.has(id));
-    const statusCounts = { active: 0, inactive: 0, offline: 0 };
-    state.hosts.forEach((h) => { statusCounts[hostStatus(h).key] += 1; });
+    const statusCounts = { active: 0, inactive: 0, offline: 0, virtual: 0 };
+    state.hosts.forEach((h) => {
+      const k = hostStatus(h).key;
+      if (statusCounts[k] != null) statusCounts[k] += 1;
+    });
     const selCount = selected.size;
+    const selVirtual = [...selected].filter((id) => {
+      const h = state.hosts.find((x) => x.id === id);
+      return h && isVirtualHost(h);
+    }).length;
+    const selScannable = Math.max(0, selCount - selVirtual);
+    const moreFiltersOpen = !!state._hostMoreFilters;
     return `
-      <div class="stack">
-        <div class="stats">
+      <div class="stack hosts-page">
+        <div class="stats hosts-stats">
           <div class="stat"><div class="label">Total</div><div class="value">${state.hosts.length.toLocaleString()}</div></div>
           <div class="stat"><div class="label">Active</div><div class="value">${statusCounts.active.toLocaleString()}</div></div>
+          <div class="stat"><div class="label">Virtual</div><div class="value">${statusCounts.virtual.toLocaleString()}</div></div>
           <div class="stat warn"><div class="label">Inactive</div><div class="value">${statusCounts.inactive.toLocaleString()}</div></div>
-          <div class="stat"><div class="label">Offline (&gt;24h)</div><div class="value">${statusCounts.offline.toLocaleString()}</div></div>
+          <div class="stat"><div class="label">Offline</div><div class="value">${statusCounts.offline.toLocaleString()}</div><div class="hint hosts-stat-hint">&gt;24h</div></div>
         </div>
         <section class="panel">
-          <div class="panel-head">
-            <h3>Hosts Management <span class="muted">(${rows.length.toLocaleString()} shown)</span></h3>
-            <div class="toolbar">
-              <input id="hostQ" type="search" placeholder="Search name, IP, OS, kernel…" value="${esc(state._hostQ || "")}" autocomplete="off" />
-              <select id="hostPreset">
-                <option value="">All statuses</option>
-                <option value="active" ${state._hostPreset === "active" ? "selected" : ""}>Active only</option>
-                <option value="inactive" ${state._hostPreset === "inactive" ? "selected" : ""}>Inactive only</option>
-                <option value="offline" ${state._hostPreset === "offline" ? "selected" : ""}>Offline only</option>
-              </select>
-              <select id="hostAgent">
-                <option value="">All agents</option>
-                <option value="ssh" ${state._hostAgent === "ssh" ? "selected" : ""}>SSH probe</option>
-                <option value="agentlite" ${state._hostAgent === "agentlite" ? "selected" : ""}>AgentLite</option>
-                <option value="virtual" ${state._hostAgent === "virtual" ? "selected" : ""}>Virtual</option>
-              </select>
-              <select id="hostOs">
-                <option value="">All OS</option>
-                ${osIds.map((e) => `<option value="${esc(e)}" ${state._hostOs === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
-              </select>
-              <select id="hostArch">
-                <option value="">All arch</option>
-                ${archs.map((e) => `<option value="${esc(e)}" ${state._hostArch === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
-              </select>
-              <select id="hostEnv">
-                <option value="">All envs</option>
-                ${envs.map((e) => `<option value="${esc(e)}" ${state._hostEnv === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
-              </select>
-              <select id="hostProfile">
-                <option value="">All profiles</option>
-                ${profiles.map((e) => `<option value="${esc(e)}" ${state._hostProfile === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
-              </select>
-              <button class="btn primary" id="btnAddHost">Add hosts</button>
+          <div class="panel-head hosts-panel-head">
+            <h3>Hosts <span class="muted hosts-shown-count">(${rows.length.toLocaleString()})</span></h3>
+            <div class="hosts-toolbar">
+              <div class="hosts-toolbar-primary">
+                <input id="hostQ" type="search" placeholder="Search hosts…" value="${esc(state._hostQ || "")}" autocomplete="off" title="Search name, IP, OS, tags" />
+                <select id="hostPreset" title="Status">
+                  <option value="">Status</option>
+                  <option value="active" ${state._hostPreset === "active" ? "selected" : ""}>Active</option>
+                  <option value="virtual" ${state._hostPreset === "virtual" ? "selected" : ""}>Virtual</option>
+                  <option value="inactive" ${state._hostPreset === "inactive" ? "selected" : ""}>Inactive</option>
+                  <option value="offline" ${state._hostPreset === "offline" ? "selected" : ""}>Offline</option>
+                </select>
+                <select id="hostAgent" title="Agent">
+                  <option value="">Agent</option>
+                  <option value="ssh" ${state._hostAgent === "ssh" ? "selected" : ""}>SSH probe</option>
+                  <option value="agentlite" ${state._hostAgent === "agentlite" ? "selected" : ""}>AgentLite</option>
+                  <option value="virtual" ${state._hostAgent === "virtual" ? "selected" : ""}>Virtual</option>
+                </select>
+                <button type="button" class="btn ghost" id="btnHostMoreFilters" aria-expanded="${moreFiltersOpen}"><span class="label-full">${moreFiltersOpen ? "Fewer filters" : "More filters"}</span><span class="label-short">${moreFiltersOpen ? "Less" : "More"}</span></button>
+                <button class="btn primary" id="btnAddHost"><span class="label-full">Add hosts</span><span class="label-short">Add</span></button>
+              </div>
+              <div class="hosts-toolbar-more ${moreFiltersOpen ? "" : "hidden"}">
+                <select id="hostOs" title="OS">
+                  <option value="">OS</option>
+                  ${osIds.map((e) => `<option value="${esc(e)}" ${state._hostOs === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
+                </select>
+                <select id="hostArch" title="Arch">
+                  <option value="">Arch</option>
+                  ${archs.map((e) => `<option value="${esc(e)}" ${state._hostArch === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
+                </select>
+                <select id="hostEnv" title="Env">
+                  <option value="">Env</option>
+                  ${envs.map((e) => `<option value="${esc(e)}" ${state._hostEnv === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
+                </select>
+                <select id="hostProfile" title="Profile">
+                  <option value="">Profile</option>
+                  ${profiles.map((e) => `<option value="${esc(e)}" ${state._hostProfile === e ? "selected" : ""}>${esc(e)}</option>`).join("")}
+                </select>
+              </div>
             </div>
           </div>
           <div class="hosts-bulkbar ${selCount ? "" : "dim"}">
-            <span class="muted">${selCount ? `${selCount} selected` : "Select hosts for bulk actions"}</span>
-            <div class="toolbar">
-              <button class="btn ghost" id="btnHostSelectPage" ${pageRows.length ? "" : "disabled"}>${allPageSelected ? "Clear page" : "Select page"}</button>
-              <button class="btn ghost" id="btnScanSelected" ${selCount ? "" : "disabled"}>Scan selected</button>
-              <button class="btn ghost" id="btnTagSelected" ${selCount ? "" : "disabled"}>Tag selected</button>
-              <button class="btn ghost" id="btnExportHosts">Export CSV</button>
-              <button class="btn danger" id="btnDeleteSelected" ${selCount ? "" : "disabled"}>Delete</button>
+            <span class="muted hosts-bulk-summary">${selCount
+              ? `${selCount} selected${selVirtual ? ` · ${selVirtual} virtual` : ""}`
+              : "Select hosts for bulk actions"}</span>
+            <div class="toolbar hosts-bulk-actions">
+              <button class="btn ghost" id="btnHostSelectPage" ${pageRows.length ? "" : "disabled"}><span class="label-full">${allPageSelected ? "Clear page" : "Select page"}</span><span class="label-short">${allPageSelected ? "Clear" : "Page"}</span></button>
+              <button class="btn ghost" id="btnScanSelected" ${selScannable ? "" : "disabled"} title="${selVirtual && selCount ? "Virtual hosts are skipped for SSH scan" : "Scan selected"}"><span class="label-full">Scan selected${selScannable && selVirtual ? ` (${selScannable})` : ""}</span><span class="label-short">Scan${selScannable && selVirtual ? ` ${selScannable}` : ""}</span></button>
+              <button class="btn ghost" id="btnTagSelected" ${selCount ? "" : "disabled"}><span class="label-full">Tag selected</span><span class="label-short">Tag</span></button>
+              <button class="btn ghost" id="btnExportHosts"><span class="label-full">Export CSV</span><span class="label-short">CSV</span></button>
+              <button class="btn danger" id="btnDeleteSelected" ${selCount ? "" : "disabled"}><span class="label-full">Delete</span><span class="label-short">Del</span></button>
             </div>
           </div>
           ${!rows.length ? `<div class="empty">No hosts match filters. Use <strong>Add hosts</strong> to register endpoints.</div>` : `
+          <div class="hosts-table-wrap">
           <table class="data hosts-table"><thead><tr>
             <th class="col-check"><input type="checkbox" id="hostCheckAll" ${allPageSelected ? "checked" : ""} /></th>
-            <th>Status</th><th>Host</th><th>Agent</th><th>Target</th><th>OS</th><th>Arch / kernel</th><th>Tags</th><th>Auth / last outcome</th><th>Scans</th><th>Last scan</th><th></th>
+            <th class="col-host-status">Status</th>
+            <th class="col-host-name">Host</th>
+            <th class="col-host-agent">Agent</th>
+            <th class="col-host-target">Target</th>
+            <th class="col-host-os">OS</th>
+            <th class="col-host-arch">Arch</th>
+            <th class="col-host-tags">Tags</th>
+            <th class="col-host-auth">Auth</th>
+            <th class="col-host-scans">Scans</th>
+            <th class="col-host-last">Last</th>
+            <th class="col-actions"></th>
           </tr></thead><tbody>
             ${pageRows.map((h) => {
               const st = hostStatus(h);
               const agent = hostAgentInfo(h);
-              const tags = hostTags(h);
               const scanCount = siftHostFinishedScans(h.id).length;
               const checked = selected.has(h.id) ? "checked" : "";
               const href = `#host/${encodeURIComponent(h.id)}`;
               const abs = hostPermalink(h.id);
               const osLabel = h.os || h.os_id || "—";
               const osSub = [h.os_id, h.os_version].filter(Boolean).join(" ");
-              return `<tr data-host-row="${esc(h.id)}" class="${checked ? "is-selected" : ""}">
+              const archBits = [h.arch, h.kernel].filter(Boolean).join(" · ") || "—";
+              return `<tr data-host-row="${esc(h.id)}" class="${checked ? "is-selected" : ""}${agent.id === "virtual" ? " is-virtual" : ""}">
                 <td class="col-check" data-stop><input type="checkbox" data-host-check="${esc(h.id)}" ${checked} /></td>
-                <td><span class="host-status ${st.key}">${esc(st.label)}</span></td>
-                <td>
+                <td class="col-host-status"><span class="host-status ${st.key}" title="${esc(st.auth || st.label)}">${esc(st.label)}</span></td>
+                <td class="col-host-name">
                   <a class="finding-link host-name-link" href="${esc(href)}" data-host-detail="${esc(h.id)}"><strong>${esc(h.display_name)}</strong></a>
                   <div class="mono muted host-id-line">${esc(shortId(h.id))}</div>
+                  <div class="host-inline-meta muted">
+                    <span class="tag host-agent-tag host-agent-tag--${esc(agent.id)}">${esc(agent.title)}</span>
+                    <span class="mono host-inline-target" title="${esc(hostTargetText(h))}">${esc(hostTargetText(h))}</span>
+                  </div>
                 </td>
-                <td>
-                  <div><span class="tag">${esc(agent.title)}</span></div>
-                  <div class="muted" style="font-size:0.72rem;margin-top:0.15rem">${esc(agent.detail)}</div>
+                <td class="col-host-agent" title="${esc(agent.detail)}">
+                  <div><span class="tag host-agent-tag host-agent-tag--${esc(agent.id)}">${esc(agent.title)}</span></div>
+                  <div class="muted host-cell-sub host-agent-detail">${esc(agent.detail)}</div>
                 </td>
-                <td class="mono">${esc(h.primary_addr || "—")}:${h.ssh_port || 22}</td>
-                <td>
+                <td class="col-host-target">${hostTargetHtml(h)}</td>
+                <td class="col-host-os" title="${esc(osSub || osLabel)}">
                   <div>${esc(osLabel)}</div>
-                  ${osSub && h.os ? `<div class="mono muted" style="font-size:0.72rem">${esc(osSub)}</div>` : ""}
+                  ${osSub && h.os ? `<div class="mono muted host-cell-sub">${esc(osSub)}</div>` : ""}
+                  <div class="mono muted host-cell-sub host-os-arch">${esc(archBits)}</div>
                 </td>
-                <td class="mono muted">${esc(h.arch || "—")} · ${esc(h.kernel || "—")}</td>
-                <td>${tags.length ? tags.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ") : `<span class="muted">—</span>`}</td>
-                <td>${esc(st.auth || "—")}</td>
-                <td class="mono">${scanCount ? esc(String(scanCount)) : `<span class="muted">0</span>`}</td>
-                <td class="mono muted">${esc(fmtWhen(h.last_scan_at))}</td>
-                <td class="hosts-actions" data-stop>
-                  <button type="button" class="btn ghost tiny" data-copy-host-link="${esc(abs)}" title="Copy host link">Link</button>
-                  ${agent.id === "virtual"
-                    ? `<button class="btn ghost tiny" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name)}" title="Update ingest from file">Update</button>
-                       <button class="btn ghost tiny" data-copy-ingest="${esc(h.ingest_token || "")}" title="Copy ingest token">Token</button>`
-                    : `<button class="btn ghost tiny" data-test-host="${esc(h.id)}">Test</button>
-                  <button class="btn ghost tiny" data-scan-host="${esc(h.id)}">Scan</button>`}
-                  <button class="btn ghost tiny" data-edit-host="${esc(h.id)}">Edit</button>
-                  <button class="btn ghost tiny danger-text" data-delete-host="${esc(h.id)}">Delete</button>
+                <td class="col-host-arch mono muted" title="${esc(archBits)}">${esc(h.arch || "—")}${h.kernel ? ` · ${esc(h.kernel)}` : ""}</td>
+                <td class="col-host-tags">${hostTagsCellHtml(h)}</td>
+                <td class="col-host-auth host-auth-cell" title="${esc(st.auth || "")}">${esc(st.auth || "—")}</td>
+                <td class="col-host-scans mono">${scanCount ? esc(String(scanCount)) : `<span class="muted">0</span>`}</td>
+                <td class="col-host-last mono muted" title="${esc(fmtWhen(h.last_scan_at))}">${esc(fmtWhen(h.last_scan_at))}</td>
+                <td class="hosts-actions col-actions" data-stop>
+                  ${hostRowActionsHtml(h, abs)}
                 </td>
               </tr>`;
             }).join("")}
           </tbody></table>
+          </div>
           ${pager("host", state.hostPage, rows.length, state.pageSize)}`}
         </section>
       </div>`;
@@ -2982,7 +3724,7 @@
       <span class="muted" style="font-size:0.8rem">Click a row to open the full scan page (inventory, findings, collectors).</span>
     </div>
       <table class="data"><thead><tr>
-        <th>When</th><th>Scan</th><th>Host</th><th>Set</th><th>State</th><th>Coverage</th><th>Findings</th>
+        <th>When</th><th>Scan</th><th>Host</th><th>Set</th><th>Tags</th><th>State</th><th>Coverage</th><th>Findings</th>
       </tr></thead><tbody>
         ${pageRows.map((s) => {
           const j = s.job || {};
@@ -2998,6 +3740,7 @@
             <td class="mono"><a class="finding-link" href="${esc(scanHref)}" data-open-scan="${esc(j.id)}">${esc(shortId(j.id))}</a></td>
             <td><a class="finding-link" href="${esc(hostHref)}" data-goto-host="${esc(j.host_id || "")}">${esc(hostName(j.host_id))}</a></td>
             <td>${esc(j.check_set || "—")}</td>
+            <td>${formatScanTags(m.tags)}</td>
             <td><span class="pill neutral">${esc(disp)}</span></td>
             <td class="mono">${esc(String(fired))}/${esc(String(applicable))}</td>
             <td>${(s.findings || []).length}</td>
@@ -3018,7 +3761,7 @@
       examples: [
         {
           label: "Processes",
-          q: 'host_name="example-host" kind="process" | fields timestamp, process_name, process_id, user, path, exe_memfd | sort -timestamp | head 200',
+          q: 'host_name="example-host" kind="process" | fields timestamp, process_name, process_id, user, path, args, cmdline, exe_memfd | sort -timestamp | head 200',
         },
         {
           label: "Files",
@@ -3101,6 +3844,10 @@
           q: 'kind="process" process_name=* | stats count by process_name | sort -count | head 20',
         },
         {
+          label: "Process args",
+          q: 'kind="process" args=* | fields timestamp, host_name, process_name, path, args, cmdline | sort -timestamp | head 100',
+        },
+        {
           label: "Events by host",
           q: 'host_name=* | stats count by host_name | sort -count | head 25',
         },
@@ -3173,6 +3920,44 @@
   }
 
   const RPL_HISTORY_KEY = "rustmite-rpl-history";
+  const RPL_RESULTS_HEIGHT_KEY = "rustmite-rpl-results-height";
+
+  function huntToolIcon(name) {
+    const common = 'xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+    const paths = {
+      regex: '<circle cx="17" cy="17" r="3"/><path d="M3 7h3l2 10 3-7 2 7 2-4h4"/><path d="M14.5 14.5 21 21"/>',
+      copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+      json: '<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1"/><path d="M16 3h1a2 2 0 0 1 2 2v5a2 2 0 0 0 2 2 2 2 0 0 0-2 2v5a2 2 0 0 1-2 2h-1"/>',
+      csv: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h8"/><path d="M8 9h2"/>',
+      download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+      expand: '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
+      close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+      row: '<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/><rect x="14" y="15" width="6" height="6" rx="1"/>',
+    };
+    return `<svg ${common}>${paths[name] || ""}</svg>`;
+  }
+
+  function ensureRplResultsPrefs() {
+    if (state._rplResultsHeight === undefined) {
+      try {
+        const h = Number(localStorage.getItem(RPL_RESULTS_HEIGHT_KEY));
+        state._rplResultsHeight = Number.isFinite(h) && h >= 180 ? Math.round(h) : null;
+      } catch (_) {
+        state._rplResultsHeight = null;
+      }
+    }
+  }
+
+  function persistRplResultsPrefs() {
+    try {
+      localStorage.removeItem("rustmite-rpl-results-size");
+      if (state._rplResultsHeight) {
+        localStorage.setItem(RPL_RESULTS_HEIGHT_KEY, String(state._rplResultsHeight));
+      } else {
+        localStorage.removeItem(RPL_RESULTS_HEIGHT_KEY);
+      }
+    } catch (_) {}
+  }
 
   function loadRplHistory() {
     if (state._rplHistory) return state._rplHistory;
@@ -3232,6 +4017,198 @@
       _filterTotal: rows.length,
       count: filtered.length,
     };
+  }
+
+  function rplResultColumns(res) {
+    const rows = res?.rows || [];
+    const rawCols = res?.columns?.length
+      ? res.columns
+      : rows[0]
+        ? Object.keys(rows[0])
+        : [];
+    return rplOrderedColumns(rawCols);
+  }
+
+  function rplRowsToCsv(res) {
+    const rows = res?.rows || [];
+    const cols = rplResultColumns(res);
+    const escCsv = (v) => {
+      const s = cellText(v);
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+    return [cols.map(escCsv).join(","), ...rows.map((r) => cols.map((c) => escCsv(r[c])).join(","))].join("\n");
+  }
+
+  function rplRowsToJson(res) {
+    return JSON.stringify(res?.rows || [], null, 2);
+  }
+
+  async function copyTextToClipboard(text, okMsg) {
+    try {
+      await navigator.clipboard.writeText(String(text ?? ""));
+      toast(okMsg || "Copied");
+      return true;
+    } catch (_) {
+      toast("Copy failed");
+      return false;
+    }
+  }
+
+  function downloadTextFile(filename, text, mime) {
+    const blob = new Blob([text], { type: mime || "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function downloadAuthedFile(url, filename) {
+    const t = token();
+    const res = await fetch(url, {
+      headers: {
+        Accept: "application/octet-stream",
+        ...(t ? { Authorization: `Bearer ${t}` } : {}),
+      },
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        if (j?.error) msg = j.error;
+      } catch (_) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    const obj = URL.createObjectURL(blob);
+    a.href = obj;
+    a.download = filename || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(obj), 1000);
+  }
+
+  async function loadHostVirtualBlobs(hostId) {
+    const body = $("#hostVirtualBlobsBody");
+    if (!body) return;
+    try {
+      const pack = await api(`/v1/hosts/${hostId}/virtual/blobs`);
+      const blobs = pack.blobs || [];
+      if (!pack.clickhouse) {
+        body.innerHTML = `<div class="muted" style="font-size:0.85rem">ClickHouse not configured — ingest stays on local disk until CH is enabled.</div>`;
+        return;
+      }
+      if (!blobs.length) {
+        body.innerHTML = `<div class="muted" style="font-size:0.85rem">No ingest blobs yet — run Update / import to sync processes.jsonl and files.jsonl into ClickHouse.</div>`;
+        return;
+      }
+      body.innerHTML = `
+        <div class="data-clear-list" style="padding:0;gap:0.4rem">
+          ${blobs.map((b) => `
+            <div class="data-clear-row" style="padding:0.55rem 0.65rem">
+              <div class="data-clear-main">
+                <strong class="mono">${esc(b.filename || b.slug || b.kind)}</strong>
+                <span class="muted">${b.lines != null ? `${Number(b.lines).toLocaleString()} lines` : "blob"} · ${esc(b.slug || "")}</span>
+              </div>
+              <div class="data-clear-metrics">
+                ${sizeHtml(b.bytes)}
+              </div>
+              <button type="button" class="btn ghost tiny" data-dl-virtual-blob="${esc(b.slug)}" data-dl-name="${esc(b.filename || b.slug)}">Download</button>
+            </div>`).join("")}
+        </div>
+        <div class="form-actions" style="margin:0.65rem 0 0;justify-content:flex-start;gap:0.5rem">
+          <button type="button" class="btn ghost" id="btnReingestVirtual" title="Rebuild Hunt events and import scan from ClickHouse blobs">Reingest from blobs</button>
+          <button type="button" class="btn ghost tiny" id="btnReloadVirtualBlobs">Refresh</button>
+        </div>`;
+      $$("[data-dl-virtual-blob]", body).forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const slug = btn.getAttribute("data-dl-virtual-blob");
+          const name = btn.getAttribute("data-dl-name") || `${slug}.jsonl`;
+          try {
+            await downloadAuthedFile(`/v1/hosts/${hostId}/virtual/blobs/${encodeURIComponent(slug)}`, name);
+            toast(`Downloaded ${name}`);
+          } catch (err) {
+            toast(err.message);
+          }
+        });
+      });
+      $("#btnReloadVirtualBlobs")?.addEventListener("click", () => {
+        loadHostVirtualBlobs(hostId).catch((err) => toast(err.message));
+      });
+      $("#btnReingestVirtual")?.addEventListener("click", async () => {
+        if (!confirm("Reingest Hunt events (and rebuild import scan if needed) from ClickHouse blobs?")) return;
+        try {
+          const res = await api(`/v1/hosts/${hostId}/virtual/reingest`, { method: "POST", body: {} });
+          toast(res.scan_rebuilt
+            ? `Reingested ${res.blobs?.length || 0} blob(s) · scan rebuilt`
+            : `Reingested ${res.blobs?.length || 0} blob(s)`);
+          await loadLive().catch(() => null);
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    } catch (err) {
+      body.innerHTML = `<div class="empty">${esc(err.message || "Failed to load blobs")}</div>`;
+    }
+  }
+
+  function rplExportStamp() {
+    return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  }
+
+  function exportRplJson(res) {
+    const text = rplRowsToJson(res);
+    downloadTextFile(`rustmite-hunt-${rplExportStamp()}.json`, text, "application/json");
+    toast("Downloaded JSON");
+  }
+
+  function exportRplCsv(res) {
+    const text = rplRowsToCsv(res);
+    downloadTextFile(`rustmite-hunt-${rplExportStamp()}.csv`, text, "text/csv;charset=utf-8");
+    toast("Downloaded CSV");
+  }
+
+  function renderRplFullscreen(res, selected, filterVal, filterRegex) {
+    const rows = res?.rows || [];
+    const filterMatch = res?._filterMatch;
+    const filterTotal = res?._filterTotal;
+    const hitLabel = filterVal && filterMatch != null && filterTotal != null
+      ? `${filterMatch.toLocaleString()} / ${filterTotal.toLocaleString()} rows`
+      : `${rows.length.toLocaleString()} row${rows.length === 1 ? "" : "s"}`;
+    return `
+      <div class="rpl-fs" id="rplFullscreen" role="dialog" aria-modal="true" aria-label="Hunt results fullscreen">
+        <header class="rpl-fs-head">
+          <div class="rpl-fs-title">
+            <h2>Hunt results</h2>
+            <span class="muted">${esc(hitLabel)}${res?._filterError ? ` · <span class="results-filter-error">${esc(res._filterError)}</span>` : ""}</span>
+          </div>
+          <div class="rpl-fs-toolbar">
+            <div class="results-filter-input-wrap rpl-fs-search">
+              <input id="rplFsFilter" type="search" placeholder="Search in results…" value="${esc(filterVal)}" spellcheck="false" autofocus />
+              ${filterVal ? `<button type="button" class="results-filter-clear" id="rplFsFilterClear" aria-label="Clear">×</button>` : ""}
+            </div>
+            <button type="button" class="btn ${filterRegex ? "primary" : "ghost"} tiny icon-action" id="rplFsFilterRegex" aria-pressed="${filterRegex}" title="Toggle regex filter" aria-label="Toggle regex filter">${huntToolIcon("regex")}</button>
+            <div class="rpl-fs-actions" role="group" aria-label="Copy and export">
+              <button type="button" class="btn ghost tiny icon-action" id="rplFsCopyJson" title="Copy filtered rows as JSON" aria-label="Copy JSON">${huntToolIcon("copy")}</button>
+              <button type="button" class="btn ghost tiny icon-action" id="rplFsCopyCsv" title="Copy filtered rows as CSV" aria-label="Copy CSV">${huntToolIcon("csv")}</button>
+              <button type="button" class="btn ghost tiny icon-action" id="rplFsCopyRow" title="Copy selected row as JSON" aria-label="Copy selected row" ${rows[selected] ? "" : "disabled"}>${huntToolIcon("row")}</button>
+              <button type="button" class="btn ghost tiny icon-action" id="rplFsDlJson" title="Download JSON" aria-label="Download JSON">${huntToolIcon("json")}</button>
+              <button type="button" class="btn ghost tiny icon-action" id="rplFsDlCsv" title="Download CSV" aria-label="Download CSV">${huntToolIcon("download")}</button>
+            </div>
+            <button type="button" class="btn ghost tiny icon-action" id="rplFsClose" title="Close (Esc)" aria-label="Close fullscreen">${huntToolIcon("close")}</button>
+          </div>
+        </header>
+        <div class="rpl-fs-body">
+          <div class="rpl-fs-table" id="rplFsTable">${renderRplTable(res, selected, { expand: true })}</div>
+          <div class="rpl-fs-inspector" id="rplFsInspector">${renderRplInspector(res, selected)}</div>
+        </div>
+      </div>`;
   }
 
   async function ensureRplFields() {
@@ -3425,34 +4402,142 @@
     return renderRplTable(res, selected);
   }
 
-  function renderRplTable(res, selected) {
-    const rows = res?.rows || [];
-    const cols = res?.columns?.length
-      ? res.columns
-      : rows[0]
-        ? Object.keys(rows[0])
-        : [];
-    if (!rows.length) {
-      return `<div class="empty">No rows — start ClickHouse (docker/clickhouse) or refine the query</div>`;
+  const RPL_COL_PRIORITY = [
+    "timestamp", "ts", "time", "host_name", "host_id", "kind", "event_type",
+    "process_name", "comm", "process_id", "pid", "ppid", "user", "username",
+    "uid", "path", "exe", "cmdline", "command", "parent", "severity",
+  ];
+
+  function rplOrderedColumns(cols) {
+    const list = (cols || []).map(String);
+    const rank = (c) => {
+      const i = RPL_COL_PRIORITY.indexOf(c.toLowerCase());
+      return i >= 0 ? i : 1000 + list.indexOf(c);
+    };
+    return list.slice().sort((a, b) => rank(a) - rank(b));
+  }
+
+  function rplColKind(col) {
+    const c = String(col || "").toLowerCase();
+    if (/(timestamp|^ts$|time$|_at$)/.test(c)) return "time";
+    if (/(host_name|host_id)/.test(c)) return "host";
+    if (/(^kind$|event_type)/.test(c)) return "kind";
+    if (/(path|exe|cmdline|command)/.test(c)) return "path";
+    if (/(pid|ppid|process_id|uid|gid|count|port)/.test(c)) return "num";
+    return "text";
+  }
+
+  function rplFormatCell(col, value, opts) {
+    if (value == null || value === "") return { text: "—", full: "", empty: true };
+    const kind = rplColKind(col);
+    if (kind === "time") {
+      const pretty = fmtWhen(value);
+      return { text: pretty, full: String(value), empty: false, kind };
     }
-    return `<div class="rpl-table-wrap"><table class="data rpl-table"><thead><tr>
-      ${cols.map((c) => `<th>${esc(c)}</th>`).join("")}
-    </tr></thead><tbody>
-      ${rows.map((r, i) => `<tr data-rpl-row="${i}" class="${selected === i ? "selected" : ""}">
-        ${cols.map((c) => `<td class="mono">${esc(cellText(r[c]).slice(0, 200))}</td>`).join("")}
-      </tr>`).join("")}
-    </tbody></table></div>`;
+    const raw = cellText(value);
+    if (opts?.expand) {
+      return { text: raw, full: raw, empty: false, kind };
+    }
+    const limit = kind === "path" ? 96 : kind === "host" ? 40 : 64;
+    const text = raw.length > limit ? `${raw.slice(0, limit)}…` : raw;
+    return { text, full: raw, empty: false, kind };
+  }
+
+  function renderRplCellHtml(col, value, opts) {
+    const cell = rplFormatCell(col, value, opts);
+    if (cell.empty) return `<span class="rpl-cell-empty">—</span>`;
+    if (cell.kind === "kind") return `<span class="rpl-kind-pill" title="${esc(cell.full)}">${esc(cell.text)}</span>`;
+    if (cell.kind === "host") return `<span class="rpl-host-chip" title="${esc(cell.full)}">${esc(cell.text)}</span>`;
+    if (cell.kind === "time") return `<time class="rpl-time" title="${esc(cell.full)}">${esc(cell.text)}</time>`;
+    if (cell.kind === "path") return `<code class="rpl-path" title="${esc(cell.full)}">${esc(cell.text)}</code>`;
+    if (cell.kind === "num") return `<span class="rpl-num" title="${esc(cell.full)}">${esc(cell.text)}</span>`;
+    return `<span title="${esc(cell.full)}">${esc(cell.text)}</span>`;
+  }
+
+  function renderRplTable(res, selected, opts) {
+    const expand = !!opts?.expand;
+    const rows = res?.rows || [];
+    const cols = rplResultColumns(res);
+    if (!rows.length) {
+      return `<div class="rpl-no-rows">
+        <div class="rpl-no-rows-mark" aria-hidden="true"></div>
+        <h4>No matching rows</h4>
+        <p class="muted">Widen the time range, clear the filter, or refine the query.</p>
+      </div>`;
+    }
+    return `<div class="rpl-table-wrap${expand ? " rpl-table-wrap--expand" : ""}">
+      <div class="rpl-table-meta">
+        <span class="rpl-table-meta-count"><strong>${rows.length.toLocaleString()}</strong> row${rows.length === 1 ? "" : "s"}</span>
+        <span class="rpl-table-meta-sep" aria-hidden="true">·</span>
+        <span>${cols.length} columns</span>
+        <span class="rpl-table-meta-hint">Select a row to inspect</span>
+      </div>
+      <table class="data rpl-table${expand ? " rpl-table--expand" : ""}"><thead><tr>
+        <th class="rpl-col-idx">#</th>
+        ${cols.map((c) => `<th class="rpl-col-${esc(rplColKind(c))}" title="${esc(c)}"><span>${esc(c)}</span></th>`).join("")}
+      </tr></thead><tbody>
+        ${rows.map((r, i) => `<tr data-rpl-row="${i}" class="${selected === i ? "selected" : ""}">
+          <td class="rpl-col-idx"><span class="rpl-row-num">${i + 1}</span></td>
+          ${cols.map((c) => {
+            const kind = rplColKind(c);
+            const empty = r[c] == null || r[c] === "";
+            return `<td class="rpl-col-${esc(kind)}${empty ? " is-empty" : ""}">${renderRplCellHtml(c, r[c], { expand })}</td>`;
+          }).join("")}
+        </tr>`).join("")}
+      </tbody></table>
+    </div>`;
   }
 
   function renderRplInspector(res, selected) {
     const row = res?.rows?.[selected];
-    if (!row) return `<div class="empty">Select a row</div>`;
-    const entries = Object.entries(row);
+    const total = (res?.rows || []).length;
+    if (!row) {
+      return `<div class="rpl-inspector rpl-inspector--empty">
+        <div class="rpl-inspector-empty-mark" aria-hidden="true"></div>
+        <div class="rpl-inspector-head">Event detail</div>
+        <div class="rpl-inspector-empty muted">Select a row to inspect every field.</div>
+      </div>`;
+    }
+    const orderedKeys = rplOrderedColumns(Object.keys(row));
+    const primary = new Set(RPL_COL_PRIORITY);
+    const primaryEntries = orderedKeys.filter((k) => primary.has(k.toLowerCase()) && row[k] != null && row[k] !== "");
+    const otherEntries = orderedKeys.filter((k) => !primaryEntries.includes(k));
+    const host = row.host_name || row.host_id || "";
+    const kind = row.kind || row.event_type || "";
+    const when = row.timestamp || row.ts || row.time || "";
+    const process = row.process_name || row.comm || "";
+    const renderKv = (keys) => `<div class="rpl-inspector-grid">
+      ${keys.map((k) => {
+        const cell = rplFormatCell(k, row[k], { expand: true });
+        const val = cell.empty ? "" : (cell.full || cell.text);
+        return `<div class="rpl-inspector-row" data-rpl-copy-field="${esc(val)}">
+          <span class="rpl-inspector-key">${esc(k)}</span>
+          <span class="rpl-inspector-val mono" title="${esc(val)}">${esc(cell.empty ? "—" : val)}</span>
+          ${val ? `<button type="button" class="rpl-inspector-copy" data-rpl-copy-val="${esc(val)}" title="Copy value" aria-label="Copy ${esc(k)}">${huntToolIcon("copy")}</button>` : ""}
+        </div>`;
+      }).join("")}
+    </div>`;
     return `<div class="rpl-inspector">
-      <div class="rpl-inspector-head">Event ${selected + 1}</div>
-      <dl class="kv">
-        ${entries.map(([k, v]) => `<dt>${esc(k)}</dt><dd class="mono">${esc(cellText(v))}</dd>`).join("")}
-      </dl>
+      <div class="rpl-inspector-head">
+        <div class="rpl-inspector-kicker">
+          <span class="rpl-inspector-badge">Event</span>
+          <span class="rpl-inspector-title">${selected + 1}<span class="muted"> / ${total}</span></span>
+        </div>
+        ${process ? `<div class="rpl-inspector-process mono" title="${esc(String(process))}">${esc(String(process))}</div>` : ""}
+        <div class="rpl-inspector-sub">
+          ${when ? `<span class="rpl-inspector-when mono">${esc(fmtWhen(when) || String(when))}</span>` : ""}
+          ${host ? `<span class="rpl-host-chip">${esc(String(host))}</span>` : ""}
+          ${kind ? `<span class="rpl-kind-pill">${esc(String(kind))}</span>` : ""}
+        </div>
+      </div>
+      ${primaryEntries.length ? `
+        <div class="rpl-inspector-section-label">Key fields</div>
+        ${renderKv(primaryEntries)}` : renderKv(orderedKeys)}
+      ${primaryEntries.length && otherEntries.length ? `
+        <details class="rpl-inspector-more">
+          <summary>More fields <span class="muted">${otherEntries.length}</span></summary>
+          ${renderKv(otherEntries)}
+        </details>` : ""}
     </div>`;
   }
 
@@ -3523,9 +4608,113 @@
     return out;
   }
 
+  /** Tags from retained finished scans for a host (newest-first index via siftScansByHost). */
+  function fleetSiftScanTags(hostId) {
+    const out = [];
+    const seen = new Set();
+    for (const s of siftHostFinishedScans(hostId)) {
+      for (const t of s.tags || []) {
+        const v = String(t || "").trim();
+        if (!v) continue;
+        const key = v.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(v);
+      }
+    }
+    return out;
+  }
+
+  /** Lowercased set of every scan tag currently in retained history. */
+  function siftAllScanTagSet() {
+    const tags = new Set();
+    for (const list of siftScansByHost().values()) {
+      for (const s of list) {
+        for (const t of s.tags || []) {
+          const v = String(t || "").trim().toLowerCase();
+          if (v) tags.add(v);
+        }
+      }
+    }
+    return tags;
+  }
+
+  /** Unique scan tags (original casing) across retained history. */
+  function siftKnownScanTags() {
+    const out = [];
+    const seen = new Set();
+    for (const list of siftScansByHost().values()) {
+      for (const s of list) {
+        for (const t of s.tags || []) {
+          const v = String(t || "").trim();
+          if (!v) continue;
+          const key = v.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(v);
+        }
+      }
+    }
+    out.sort((a, b) => a.localeCompare(b));
+    return out;
+  }
+
+  function siftSelectedScanTags() {
+    if (!Array.isArray(state._siftScanTagFilter)) state._siftScanTagFilter = [];
+    return state._siftScanTagFilter;
+  }
+
+  function siftToggleScanTag(tag) {
+    const t = String(tag || "").trim();
+    if (!t) return;
+    const key = t.toLowerCase();
+    const cur = siftSelectedScanTags();
+    const idx = cur.findIndex((x) => String(x).toLowerCase() === key);
+    if (idx >= 0) cur.splice(idx, 1);
+    else cur.push(t);
+    state._siftScanTagFilter = cur;
+  }
+
+  /**
+   * Selected scan tags lock inventory to the newest finished scan per host
+   * that carries every listed tag.
+   */
+  function siftQueryScanTagTokens() {
+    return siftSelectedScanTags()
+      .map((t) => String(t || "").trim())
+      .filter(Boolean);
+  }
+
+  function siftScanHasTagTokens(scan, tagTokens) {
+    if (!tagTokens || !tagTokens.length) return true;
+    const st = (scan?.tags || []).map((t) => String(t || "").trim().toLowerCase()).filter(Boolean);
+    if (!st.length) return false;
+    return tagTokens.every((tok) => {
+      const w = String(tok || "").trim().toLowerCase();
+      return st.some((t) => t === w || t.includes(w));
+    });
+  }
+
+  /** Newest finished scan for host that carries all given scan-tag tokens. */
+  function siftHostScanMatchingTags(hostId, tagTokens = siftQueryScanTagTokens()) {
+    if (!tagTokens.length) return null;
+    for (const s of siftHostFinishedScans(hostId)) {
+      if (siftScanHasTagTokens(s, tagTokens)) return s;
+    }
+    return null;
+  }
+
+  /** Inventory scan for UI/run: tag-matched scan wins over Nth-newest index. */
+  function siftResolvedInventoryScan(hostId) {
+    return siftHostScanMatchingTags(hostId) || siftHostInventoryScan(hostId);
+  }
+
   function siftKnownTags() {
     const tags = new Set();
-    (state.hosts || []).forEach((h) => fleetSiftHostTags(h).forEach((t) => tags.add(t)));
+    (state.hosts || []).forEach((h) => {
+      fleetSiftHostTags(h).forEach((t) => tags.add(t));
+      fleetSiftScanTags(h.id).forEach((t) => tags.add(t));
+    });
     return [...tags].sort((a, b) => a.localeCompare(b));
   }
 
@@ -3563,12 +4752,13 @@
       const when = m.finished_at || j.updated_at || j.created_at || "";
       if (!when) continue;
       const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
+      const tags = Array.isArray(m.tags) ? m.tags.map((t) => String(t || "").trim()).filter(Boolean) : [];
       let list = map.get(hid);
       if (!list) {
         list = [];
         map.set(hid, list);
       }
-      list.push({ sid, when, setLabel, outcome: m.outcome || j.state || "" });
+      list.push({ sid, when, setLabel, outcome: m.outcome || j.state || "", tags });
     }
     for (const list of map.values()) {
       list.sort((a, b) => String(b.when).localeCompare(String(a.when)));
@@ -3590,27 +4780,29 @@
   }
 
   function siftHostSearchHay(h) {
-    const tags = fleetSiftHostTags(h);
+    const hostTags = fleetSiftHostTags(h);
+    const scanTags = fleetSiftScanTags(h.id);
     return [
       h.display_name || "",
       h.primary_addr || "",
       h.id || "",
       h.agent_kind || "",
-      tags.join(" "),
+      hostTags.join(" "),
+      scanTags.join(" "),
     ].join(" ").toLowerCase();
   }
 
   function siftFilteredHosts() {
     const q = String(state._siftHostQ || "").trim().toLowerCase();
     const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+    const scanTagTokens = siftQueryScanTagTokens();
     const env = String(state._siftEnv || "").trim();
     const kind = String(state._siftKind || "").trim().toLowerCase();
     const after = String(state._siftScanAfter || "").trim();
     const before = String(state._siftScanBefore || "").trim();
     const afterDigits = after.replace(/\D/g, "").slice(0, 14);
     const beforeDigits = before.replace(/\D/g, "").slice(0, 14);
-    const needInv = !!(afterDigits || beforeDigits);
-    const invN = siftInventoryIndex();
+    const needInv = !!(afterDigits || beforeDigits || scanTagTokens.length);
     if (needInv) siftScansByHost();
 
     const out = [];
@@ -3621,12 +4813,25 @@
         if (isAgentLiteHost(h) || isVirtualHost(h)) continue;
       } else if (kind && String(h.agent_kind || "ssh").toLowerCase() !== kind) continue;
       if (env && (h.labels?.env || "") !== env) continue;
+      // Scan-tag filter selects a concrete scan — host must have one that matches.
+      let tagScan = null;
+      if (scanTagTokens.length) {
+        tagScan = siftHostScanMatchingTags(h.id, scanTagTokens);
+        if (!tagScan) continue;
+      }
       if (tokens.length) {
-        const hay = siftHostSearchHay(h);
+        // Host search: name / IP / host tags (scan tags are a separate control).
+        const hay = [
+          h.display_name || "",
+          h.primary_addr || "",
+          h.id || "",
+          h.agent_kind || "",
+          fleetSiftHostTags(h).join(" "),
+        ].join(" ").toLowerCase();
         if (!tokens.every((t) => hay.includes(t))) continue;
       }
-      if (needInv) {
-        const invScan = siftHostInventoryScan(h.id, invN);
+      if (afterDigits || beforeDigits) {
+        const invScan = tagScan || siftHostInventoryScan(h.id);
         const invWhen = invScan?.when || h.last_scan_at || "";
         const last = String(invWhen).replace(/\D/g, "").slice(0, 14);
         if (!last) continue;
@@ -3877,14 +5082,39 @@
     </div>`;
   }
 
+  function siftReasonLabel(code) {
+    const c = String(code || "").trim().toLowerCase();
+    const map = {
+      root_no_whitelist: "Root process outside whitelist",
+      suspicious_path: "Path matches a suspicious pattern",
+      high_entropy_args: "Arguments look high-entropy / encoded",
+      rare_process: "Rare across the fleet",
+      rare_file: "Rare file across the fleet",
+      minority_cluster: "Host sits in a small / odd cluster",
+    };
+    return map[c] || code.replace(/_/g, " ");
+  }
+
   function siftRiskTags(factors) {
-    const list = (factors || []).filter(Boolean);
-    if (!list.length) return `<span class="muted">—</span>`;
-    const shown = list.slice(0, 8);
-    const more = list.length - shown.length;
+    const parsed = (factors || []).filter(Boolean).map(siftParseRiskFactor);
+    if (!parsed.length) return `<span class="muted">No specific warnings listed</span>`;
+    const chips = [];
+    for (const f of parsed) {
+      if (f.kind === "risk") {
+        const why = (f.reasons || []).map(siftReasonLabel).join(" · ") || "flagged";
+        chips.push({
+          label: `${f.name || "item"} — ${why}`,
+          title: f.raw,
+        });
+      } else {
+        chips.push({ label: f.text || f.raw, title: f.raw });
+      }
+      if (chips.length >= 6) break;
+    }
+    const more = parsed.length - chips.length;
     return `<div class="sift-risk-tags">
-      ${shown.map((f) => `<span class="sift-risk-tag" title="${esc(f)}">${esc(f)}</span>`).join("")}
-      ${more > 0 ? `<span class="sift-risk-tag sift-risk-tag--more">+${more}</span>` : ""}
+      ${chips.map((c) => `<span class="sift-risk-tag" title="${esc(c.title)}">${esc(c.label)}</span>`).join("")}
+      ${more > 0 ? `<span class="sift-risk-tag sift-risk-tag--more">+${more} more</span>` : ""}
     </div>`;
   }
 
@@ -3919,54 +5149,83 @@
     if (!a) return;
     const mid = a.machine_id || "—";
     const kind = a._kind || "process";
+    const kindLabel = kind === "file" ? "file inventory" : "process inventory";
     const factors = (a.risk_factors || []).map(siftParseRiskFactor);
     const risks = factors.filter((f) => f.kind === "risk");
-    const notes = factors.filter((f) => f.kind !== "risk");
+    const rares = factors.filter((f) => f.kind === "rare");
+    const notes = factors.filter((f) => f.kind === "note");
     const src = (sources || []).find((s) => s.host_id === mid || s.display_name === mid);
     const hostRec = state.hostById?.[mid] || state.hosts?.find((h) => h.id === mid || h.display_name === mid);
     const hostId = hostRec?.id || src?.host_id || "";
-    const cluster = a.cluster_assignment == null ? "outlier" : `cluster ${a.cluster_assignment}`;
-    openDrawer(`${hostLabel || mid}`, `
+    const isOutlier = a.cluster_assignment == null;
+    const cluster = isOutlier ? "outlier (no matching peer group)" : `cluster ${a.cluster_assignment}`;
+    const scoreN = Number(a.anomaly_score);
+    const scoreHint = !Number.isFinite(scoreN) ? ""
+      : scoreN >= 0.8 ? "Strong outlier vs the fleet baseline."
+        : scoreN >= 0.5 ? "Noticeably different from most peers."
+          : "Mild deviation — review before escalating.";
+    openDrawer(`Warning · ${hostLabel || mid}`, `
       <div class="sift-detail-head">
         <div class="sift-detail-title-row">
           ${sev(String(a.severity || "medium").toLowerCase())}
-          <span class="pill neutral">${esc(kind)}</span>
-          <span class="muted mono">${esc(cluster)}</span>
+          <span class="pill neutral">${esc(kind)} inventory</span>
+          <span class="muted">${esc(cluster)}</span>
         </div>
+        <p class="sift-detail-lead">
+          This host’s <strong>${esc(kindLabel)}</strong> looks unusual compared with the rest of the selected fleet.
+          ${isOutlier
+            ? "It did not land in a peer cluster — treat as a singleton outlier."
+            : "It sits in a small or atypical cluster relative to the fleet."}
+        </p>
         <div class="muted" style="font-size:0.82rem;margin-top:0.35rem">
           Host <strong title="${esc(mid)}">${esc(hostLabel || mid)}</strong>
           ${src?.last_scan_at ? ` · last scan ${esc(fmtWhen(src.last_scan_at))}` : ""}
         </div>
       </div>
       <dl class="kv">
-        <dt>Anomaly score</dt><dd>${siftScoreBar(a.anomaly_score)}</dd>
+        <dt>Anomaly score</dt><dd>${siftScoreBar(a.anomaly_score)}${scoreHint ? `<div class="muted" style="font-size:0.75rem;margin-top:0.25rem">${esc(scoreHint)}</div>` : ""}</dd>
         <dt>Inventory</dt><dd class="mono">${esc(String(a.process_count ?? "—"))} ${kind === "file" ? "files" : "processes"}
           · ${esc(String(a.suspicious_process_count ?? 0))} flagged</dd>
         <dt>Source rows</dt><dd class="mono">${esc(String(src?.process_rows ?? "—"))} proc · ${esc(String(src?.file_rows ?? "—"))} file</dd>
       </dl>
       ${risks.length ? `
-        <h4 class="sift-detail-h">Suspicious ${kind === "file" ? "files" : "processes"} (${risks.length})</h4>
+        <h4 class="sift-detail-h">1. Flagged ${kind === "file" ? "files" : "processes"} (${risks.length})</h4>
+        <p class="muted sift-detail-hint">Each row is a concrete item that triggered a risk check. Read the <em>Why flagged</em> column first.</p>
         <div class="ml-table-scroll">
           <table class="data"><thead><tr>
-            <th>Name</th><th>Path</th><th>Parent</th><th>UID</th><th>Count</th><th>Reasons</th>
+            <th>Name</th><th>Path</th><th>Parent</th><th>UID</th><th>Seen</th><th>Why flagged</th>
           </tr></thead><tbody>
             ${risks.map((r) => `<tr>
-              <td class="mono">${esc(r.name)}</td>
+              <td class="mono"><strong>${esc(r.name)}</strong></td>
               <td class="mono" title="${esc(r.path)}">${esc(String(r.path).length > 48 ? String(r.path).slice(0, 48) + "…" : r.path)}</td>
               <td class="mono">${esc(r.parent)}</td>
               <td class="mono">${esc(r.uid)}</td>
               <td class="mono">${esc(r.count)}</td>
-              <td>${(r.reasons || []).map((x) => `<span class="tag">${esc(x)}</span>`).join(" ") || "—"}</td>
+              <td>${(r.reasons || []).length
+                ? (r.reasons || []).map((x) => `<span class="tag" title="${esc(x)}">${esc(siftReasonLabel(x))}</span>`).join(" ")
+                : "—"}</td>
             </tr>`).join("")}
           </tbody></table>
         </div>` : ""}
+      ${rares.length ? `
+        <h4 class="sift-detail-h">${risks.length ? "2" : "1"}. Rare across the fleet (${rares.length})</h4>
+        <p class="muted sift-detail-hint">These items are uncommon among peers — not always malicious, but worth checking.</p>
+        <ul class="sift-detail-notes">
+          ${rares.map((n) => `<li>${esc(n.text || n.raw)}</li>`).join("")}
+        </ul>` : ""}
       ${notes.length ? `
-        <h4 class="sift-detail-h">Other signals (${notes.length})</h4>
+        <h4 class="sift-detail-h">${(risks.length ? 1 : 0) + (rares.length ? 1 : 0) + 1}. Other signals (${notes.length})</h4>
         <ul class="sift-detail-notes">
           ${notes.map((n) => `<li>${esc(n.text || n.raw)}</li>`).join("")}
-        </ul>` : (!risks.length ? `<div class="empty">No risk factor details for this anomaly.</div>` : "")}
+        </ul>` : (!risks.length && !rares.length ? `<div class="empty">No risk factor details for this anomaly — open the host and compare inventory manually.</div>` : "")}
+      <h4 class="sift-detail-h">Next steps</h4>
+      <ol class="sift-detail-steps">
+        <li>Open the host and review Processes / Files for the items above.</li>
+        <li>Compare with a peer host in a larger cluster if this one is an outlier.</li>
+        <li>If expected (admin tooling, one-off job), whitelist the path in Sift config.</li>
+      </ol>
       <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
-        ${hostId ? `<button type="button" class="btn primary" data-sift-open-host="${esc(hostId)}">Open host</button>` : ""}
+        ${hostId ? `<button type="button" class="btn primary" data-sift-open-host="${esc(hostId)}">Inspect host</button>` : ""}
         <button type="button" class="btn ghost" data-close-drawer>Close</button>
       </div>
       <details class="ml-details">
@@ -4095,7 +5354,7 @@
         </div>
       </div>
       <div class="muted" style="font-size:0.78rem;margin:0.35rem 0 0.55rem">
-        Showing ${filtered.length} of ${shown.length}
+        Showing ${filtered.length} of ${shown.length} warnings — click a card to see why it was flagged and what to check next.
       </div>
       ${!filtered.length
         ? `<div class="empty">No anomalies match these filters</div>`
@@ -4121,7 +5380,7 @@
               const procs = a.process_count != null
                 ? `${a.suspicious_process_count ?? 0}/${a.process_count} suspicious procs`
                 : "";
-              return `<article class="sift-anom-card sift-anom-card--${esc(String(a.severity || "medium").toLowerCase())}" data-sift-anom="${esc(String(idx))}" role="button" tabindex="0" title="View anomaly details">
+              return `<article class="sift-anom-card sift-anom-card--${esc(String(a.severity || "medium").toLowerCase())}" data-sift-anom="${esc(String(idx))}" role="button" tabindex="0" title="Inspect this warning">
                 <div class="sift-anom-head">
                   <div class="sift-anom-title">
                     ${sev(String(a.severity || "medium").toLowerCase())}
@@ -4134,9 +5393,9 @@
                   <span>${esc(cluster)}</span>
                   ${procs ? `<span>· ${esc(procs)}</span>` : ""}
                   <span class="mono">#${idx + 1}</span>
-                  <span class="sift-anom-open">Details →</span>
+                  <span class="sift-anom-open">Inspect warning →</span>
                 </div>
-                ${siftRiskTags(a.risk_factors)}
+                <div class="sift-anom-warnings">${siftRiskTags(a.risk_factors)}</div>
               </article>`;
             }).join("")}
           </div>`;
@@ -4190,8 +5449,10 @@
     ensureSiftConfigState();
     if (state._siftTag) {
       const t = String(state._siftTag).trim();
-      if (t && !String(state._siftHostQ || "").includes(t)) {
-        state._siftHostQ = `${String(state._siftHostQ || "").trim()} ${t}`.trim();
+      if (t) {
+        const cur = siftSelectedScanTags();
+        if (!cur.some((x) => String(x).toLowerCase() === t.toLowerCase())) cur.push(t);
+        state._siftScanTagFilter = cur;
       }
       state._siftTag = "";
     }
@@ -4206,7 +5467,10 @@
     const selectedCfgId = state._siftSelectedConfigId || "";
     const cfg = state._siftConfig || siftConfigDefaults();
     const envs = [...new Set((state.hosts || []).map((h) => h.labels?.env).filter(Boolean))].sort();
-    const tags = siftKnownTags();
+    const knownScanTags = siftKnownScanTags();
+    const scanTagTokens = siftQueryScanTagTokens();
+    const selectedScanTagLc = new Set(scanTagTokens.map((t) => t.toLowerCase()));
+    const tagSelectMode = scanTagTokens.length > 0;
     const selectedVisible = filtered.filter((h) => selected.has(h.id)).length;
     const allVisibleSelected = filtered.length > 0 && filtered.every((h) => selected.has(h.id));
     const running = !!state._siftProgress;
@@ -4280,10 +5544,27 @@
                 </div>
               </div>
               <div class="sift-scope-filters ml-panel-body">
-                <label class="sift-filter-search">Search
-                  <input id="siftHostQ" type="search" list="siftTagList" placeholder="Name, IP, or tag…" value="${esc(state._siftHostQ || "")}" autocomplete="off" />
-                  <datalist id="siftTagList">${tags.map((t) => `<option value="${esc(t)}"></option>`).join("")}</datalist>
+                <label class="sift-filter-search">Host search
+                  <input id="siftHostQ" type="search" placeholder="Name, IP, or host label…" value="${esc(state._siftHostQ || "")}" autocomplete="off" title="Filters hosts by name, address, or host labels" />
                 </label>
+                <div class="sift-scan-tags" style="grid-column:1/-1">
+                  <div class="sift-scan-tags-head">
+                    <span>Scan tags</span>
+                    <span class="muted" style="font-weight:400">Locks inventory to newest matching scan per host</span>
+                    ${tagSelectMode ? `<button type="button" class="btn ghost tiny" id="siftClearScanTags">Clear</button>` : ""}
+                  </div>
+                  ${!knownScanTags.length
+                    ? `<p class="muted" style="margin:0;font-size:0.78rem">No scan tags in retained history yet. Tag a scan from its detail page.</p>`
+                    : `<div class="sift-scan-tag-chips" role="group" aria-label="Scan tags">
+                        ${knownScanTags.map((t) => {
+                          const on = selectedScanTagLc.has(t.toLowerCase());
+                          return `<button type="button" class="sift-scan-tag-chip${on ? " is-on" : ""}" data-sift-scan-tag="${esc(t)}" aria-pressed="${on}">${esc(t)}</button>`;
+                        }).join("")}
+                      </div>`}
+                  ${tagSelectMode
+                    ? `<p class="muted sift-tag-scan-hint" style="margin:0.35rem 0 0;font-size:0.78rem">Active: <strong>${esc(scanTagTokens.join(", "))}</strong></p>`
+                    : ""}
+                </div>
                 <label>Env
                   <select id="siftEnv">
                     <option value="">All envs</option>
@@ -4299,7 +5580,9 @@
                   </select>
                 </label>
                 <label>Inventory scan #
-                  <select id="siftInventory" class="ml-select" title="Nth newest finished scan per host (1 = latest; capped by scan history keep)">
+                  <select id="siftInventory" class="ml-select" ${tagSelectMode ? "disabled" : ""} title="${tagSelectMode
+                    ? `Locked to scan tag(s): ${scanTagTokens.join(", ")}`
+                    : "Nth newest finished scan per host (1 = latest; capped by scan history keep)"}">
                     ${(() => {
                       const keep = siftInventoryKeep();
                       const curN = siftInventoryIndex();
@@ -4327,19 +5610,42 @@
               <div class="sift-host-list ml-table-scroll">
                 ${!filtered.length ? `<div class="empty">No hosts match these filters</div>` : `
                 <table class="data"><thead><tr>
-                  <th style="width:2rem"></th><th>Host</th><th>Kind</th><th>Tags</th><th>Scan #${esc(String(siftInventoryIndex()))}</th>
+                  <th style="width:2rem"></th><th>Host</th><th>Kind</th><th>Tags</th><th>${tagSelectMode ? "Scan (by tag)" : `Scan #${esc(String(siftInventoryIndex()))}`}</th>
                 </tr></thead><tbody>
                   ${filtered.map((h) => {
                     const checked = selected.has(h.id) ? "checked" : "";
-                    const tagStr = fleetSiftHostTags(h).slice(0, 4).join(", ");
                     const finished = siftHostFinishedScans(h.id);
                     const invN = siftInventoryIndex();
-                    const inv = finished[invN - 1] || null;
+                    const inv = tagSelectMode
+                      ? siftHostScanMatchingTags(h.id, scanTagTokens)
+                      : (finished[invN - 1] || null);
                     const avail = finished.length;
+                    const hostTagList = fleetSiftHostTags(h);
+                    const scanTagList = fleetSiftScanTags(h.id);
+                    const invTags = Array.isArray(inv?.tags) ? inv.tags : [];
+                    const scanBits = (invTags.length ? invTags : scanTagList).slice(0, 4);
+                    const tagTitle = [
+                      hostTagList.length ? `host: ${hostTagList.join(", ")}` : "",
+                      scanTagList.length ? `scan: ${scanTagList.join(", ")}` : "",
+                    ].filter(Boolean).join(" · ");
+                    const tagCellHtml = [
+                      ...hostTagList.slice(0, 2).map((t) => `<span class="tag muted-tag" title="Host label">${esc(t)}</span>`),
+                      ...scanBits.map((t) => {
+                        const on = selectedScanTagLc.has(String(t).toLowerCase());
+                        return `<button type="button" class="sift-scan-tag-chip tiny${on ? " is-on" : ""}" data-sift-scan-tag="${esc(t)}" title="Filter by scan tag">${esc(t)}</button>`;
+                      }),
+                    ].join(" ") || `<span class="muted">—</span>`;
                     let cell;
                     if (inv) {
                       const setHint = inv.setLabel || "";
-                      cell = `<span title="${esc(setHint)}${avail ? ` · ${avail} retained` : ""}">${esc(fmtWhen(inv.when))}</span>${setHint ? `<div class="muted" style="font-size:0.72rem">${esc(setHint)}</div>` : ""}`;
+                      const tagHint = invTags.length ? invTags.join(", ") : "";
+                      const idx = finished.findIndex((s) => s.sid === inv.sid);
+                      const idxBit = idx >= 0 ? `#${idx + 1}` : "";
+                      cell = `<span title="${esc([idxBit, setHint, tagHint, shortId(inv.sid), avail ? `${avail} retained` : ""].filter(Boolean).join(" · "))}">${esc(fmtWhen(inv.when))}</span>${
+                        setHint || tagHint || idxBit
+                          ? `<div class="muted" style="font-size:0.72rem">${esc([idxBit, setHint, tagHint].filter(Boolean).join(" · "))}</div>`
+                          : ""
+                      }`;
                     } else if (avail > 0) {
                       cell = `<span class="muted" title="Only ${avail} finished scan(s) retained">no #${esc(String(invN))} · ${avail} kept</span>`;
                     } else {
@@ -4350,7 +5656,7 @@
                       <td><strong>${esc(h.display_name || h.id)}</strong>
                         <div class="muted mono" style="font-size:0.75rem">${esc(h.primary_addr || "")}</div></td>
                       <td class="mono">${esc((h.agent_kind || "ssh").toLowerCase())}</td>
-                      <td class="muted" style="font-size:0.8rem">${esc(tagStr || "—")}</td>
+                      <td class="sift-host-tags" title="${esc(tagTitle || "")}">${tagCellHtml}</td>
                       <td class="mono muted">${cell}</td>
                     </tr>`;
                   }).join("")}
@@ -4554,12 +5860,26 @@
     const filtered = siftFilteredHosts();
     const body = { mode, config };
     // Prefer explicit selection; otherwise scope to the filtered host list.
+    const runHosts = selected.length
+      ? (state.hosts || []).filter((h) => selected.includes(h.id))
+      : filtered;
     if (selected.length) body.host_ids = selected;
     else if (filtered.length && filtered.length < (state.hosts || []).length) {
       body.host_ids = filtered.map((h) => h.id);
     }
     const env = String(state._siftEnv || "").trim();
     if (env) body.labels = { ...(body.labels || {}), env };
+    // Scan-tag tokens select the matching scan per host (inventory override).
+    const scanTagTokens = siftQueryScanTagTokens();
+    if (scanTagTokens.length) {
+      body.tags = scanTagTokens;
+      const scanIds = {};
+      for (const h of runHosts) {
+        const hit = siftHostScanMatchingTags(h.id, scanTagTokens);
+        if (hit?.sid) scanIds[String(h.id)] = hit.sid;
+      }
+      if (Object.keys(scanIds).length) body.scan_ids = scanIds;
+    }
     const after = String(state._siftScanAfter || "").trim();
     const before = String(state._siftScanBefore || "").trim();
     if (after) body.scan_after = new Date(after).toISOString();
@@ -4607,11 +5927,12 @@
       const applySiftQ = () => {
         const live = $("#siftHostQ");
         if (live) state._siftHostQ = live.value || "";
-        // Drop legacy separate tag filter into the unified search.
         if (state._siftTag) {
           const t = String(state._siftTag).trim();
-          if (t && !String(state._siftHostQ || "").includes(t)) {
-            state._siftHostQ = `${String(state._siftHostQ || "").trim()} ${t}`.trim();
+          if (t) {
+            const cur = siftSelectedScanTags();
+            if (!cur.some((x) => String(x).toLowerCase() === t.toLowerCase())) cur.push(t);
+            state._siftScanTagFilter = cur;
           }
           state._siftTag = "";
         }
@@ -4639,6 +5960,19 @@
         }
       });
     }
+
+    $$("[data-sift-scan-tag]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        siftToggleScanTag(btn.getAttribute("data-sift-scan-tag"));
+        render();
+      });
+    });
+    $("#siftClearScanTags")?.addEventListener("click", () => {
+      state._siftScanTagFilter = [];
+      render();
+    });
 
     const resultQ = $("#siftResultQ");
     if (resultQ) {
@@ -5180,9 +6514,13 @@
                         <textarea name="lines" id="anomarkTrainLines" rows="8" class="mono"
                           placeholder="sshd: /usr/sbin/sshd -D&#10;/usr/bin/python3 /opt/agent.py">${esc(trainLines)}</textarea>
                       </label>
-                      <label>Server path
-                        <input name="path" id="anomarkTrainPath" placeholder=".dev/train-cmds.jsonl" value="${esc(trainPath)}" />
-                      </label>
+                      ${serverPathFieldHtml({
+                        label: "Server path",
+                        id: "anomarkTrainPath",
+                        value: trainPath,
+                        placeholder: ".dev/train-cmds.jsonl",
+                        hint: "Optional — browse a training file/folder on the server.",
+                      })}
                     </div>
                   </div>
                   <div class="anomark-train-actions">
@@ -6044,28 +7382,46 @@
     }
   }
 
+  function looksLikeIsoDayFolder(name) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(String(name || "").trim());
+  }
+
   function showImportTree() {
     openDrawer("Import host tree", `
       <form class="form" id="importTreeForm">
         <p class="muted" style="font-size:0.82rem;margin:0 0 0.75rem">
-          Point at a <strong>server-local</strong> day folder. Each subdirectory becomes one virtual host
-          (IronSift-style). Matching display names are updated; each import <strong>adds a new scan</strong>
-          (previous scans stay in history). Name hosts from the <strong>directory name</strong>, a delimited segment
-          (e.g. field 4 of <span class="mono">…-standalone-HOST-20260511-0012</span> → <span class="mono">HOST</span>),
-          or the PulseSecure heuristic. Mixed JSONL is split by <span class="mono">event_type</span>.
+          Point at a <strong>server-local</strong> day folder
+          (<span class="mono">…/2026-05-10/</span> → one host per subdirectory),
+          or a <strong>campaign parent</strong> that contains several day folders
+          (<span class="mono">…/vpn/2026-05-03</span>, <span class="mono">2026-05-10</span>, …).
+          Then use the same naming / virtual-agent options (IronSift, PulseSecure, …).
+          Matching display names are updated; each import <strong>adds a new scan</strong>.
         </p>
-        <label>Root directory
-          <input name="path" class="mono" required
-            placeholder="/data/snapshots/2026-05-10"
-            value="" autocomplete="off" />
-        </label>
+        ${serverPathFieldHtml({
+          label: "Root directory",
+          required: true,
+          mode: "dir",
+          placeholder: "/data/vpn  or  /data/vpn/2026-05-10",
+          hint: "Browse a day folder or the parent that contains YYYY-MM-DD day folders.",
+        })}
+        <div id="importTreeDaysPanel" class="hidden import-tree-days">
+          <div class="import-tree-days-head">
+            <strong>Day folders</strong>
+            <span class="muted" id="importTreeDaysHint"></span>
+            <div class="toolbar">
+              <button type="button" class="btn ghost tiny" id="importTreeDaysAll">Select all</button>
+              <button type="button" class="btn ghost tiny" id="importTreeDaysNone">Select none</button>
+            </div>
+          </div>
+          <div id="importTreeDaysList" class="import-tree-days-list"></div>
+        </div>
         <fieldset class="ml-device-rule" style="border:1px solid color-mix(in srgb, var(--border,#fff) 55%, transparent);border-radius:8px;padding:0.65rem 0.75rem;margin:0.5rem 0 0.75rem">
           <legend style="font-size:0.8rem;padding:0 0.35rem">Host name from directory</legend>
           <label>Source
             <select name="host_from" id="importTreeHostFrom">
-              <option value="dirname" selected>Full directory name</option>
+              <option value="dirname">Full directory name</option>
               <option value="segment">Directory segment (IronSift)</option>
-              <option value="pulsesecure">PulseSecure heuristic</option>
+              <option value="pulsesecure" selected>PulseSecure heuristic</option>
             </select>
           </label>
           <div id="importTreeSegmentFields" class="ml-form-grid" style="margin-top:0.55rem;display:none">
@@ -6090,6 +7446,12 @@
         <p class="muted" style="font-size:0.78rem;margin:0 0 0.65rem">
           Applied to every host created/updated by this tree import (field mapping).
         </p>
+        ${hostPlatformFieldsHtml({
+          hint: "Optional — applied to every host in this tree import (leave unset to keep existing values).",
+        })}
+        ${scanTagsFieldHtml({
+          hint: "Optional extra tags. The parent day/folder name (e.g. 2026-05-10) is always added so multiple scans per host stay identifiable.",
+        })}
         <div class="form-actions">
           <button type="submit" class="btn primary">Import tree</button>
           <button type="button" class="btn ghost" data-close-drawer>Cancel</button>
@@ -6102,7 +7464,12 @@
     const hostFromSel = $("#importTreeHostFrom");
     const segFields = $("#importTreeSegmentFields");
     const exEl = $("#importTreeHostExample");
+    const daysPanel = $("#importTreeDaysPanel");
+    const daysList = $("#importTreeDaysList");
+    const daysHint = $("#importTreeDaysHint");
+    const pathInput = form?.querySelector('input[name="path"]');
     const sample = "PulseSecure-Periodicsnapshot-standalone-HOSTEXAMPLE01-20260504-0011";
+    let detectedDays = [];
     const syncHostFromUi = () => {
       const mode = hostFromSel?.value || "dirname";
       if (segFields) segFields.style.display = mode === "segment" ? "grid" : "none";
@@ -6119,6 +7486,44 @@
         exEl.textContent = `Example: ${sample} → HOSTEXAMPLE01`;
       }
     };
+    const renderDaysPanel = (days) => {
+      detectedDays = days || [];
+      if (!daysPanel || !daysList) return;
+      if (!detectedDays.length) {
+        daysPanel.classList.add("hidden");
+        daysList.innerHTML = "";
+        if (daysHint) daysHint.textContent = "";
+        return;
+      }
+      daysPanel.classList.remove("hidden");
+      if (daysHint) {
+        daysHint.textContent = `${detectedDays.length} day folder${detectedDays.length === 1 ? "" : "s"} found — pick which to import`;
+      }
+      daysList.innerHTML = detectedDays.map((d) => `
+        <label class="import-tree-day">
+          <input type="checkbox" name="import_day" value="${esc(d)}" checked />
+          <span class="mono">${esc(d)}</span>
+        </label>`).join("");
+    };
+    const refreshDaysFromPath = async () => {
+      const path = String(pathInput?.value || "").trim();
+      if (!path) {
+        renderDaysPanel([]);
+        return;
+      }
+      try {
+        const data = await api(`/v1/fs/list?dirs_only=true&path=${encodeURIComponent(path)}`);
+        const dirs = (data.entries || [])
+          .filter((e) => e.kind === "dir")
+          .map((e) => e.name);
+        const days = dirs.filter(looksLikeIsoDayFolder).sort();
+        // Only treat as campaign when every child dir is a day folder (or at least one day and no host-like mix).
+        const allDays = days.length > 0 && days.length === dirs.length;
+        renderDaysPanel(allDays ? days : []);
+      } catch (_) {
+        renderDaysPanel([]);
+      }
+    };
     hostFromSel?.addEventListener("change", syncHostFromUi);
     $("#importTreeField")?.addEventListener("input", syncHostFromUi);
     $("#importTreeDelim")?.addEventListener("input", syncHostFromUi);
@@ -6130,13 +7535,29 @@
       if (d) d.value = "-";
       syncHostFromUi();
     });
+    $("#importTreeDaysAll")?.addEventListener("click", () => {
+      $$('#importTreeDaysList input[name="import_day"]').forEach((cb) => { cb.checked = true; });
+    });
+    $("#importTreeDaysNone")?.addEventListener("click", () => {
+      $$('#importTreeDaysList input[name="import_day"]').forEach((cb) => { cb.checked = false; });
+    });
+    pathInput?.addEventListener("change", () => { refreshDaysFromPath(); });
+    pathInput?.addEventListener("blur", () => { refreshDaysFromPath(); });
     syncHostFromUi();
+    refreshDaysFromPath();
     form?.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
       const path = String(fd.get("path") || "").trim();
       if (!path) {
         toast("Root directory required");
+        return;
+      }
+      const selectedDays = $$('#importTreeDaysList input[name="import_day"]:checked')
+        .map((cb) => cb.value)
+        .filter(Boolean);
+      if (detectedDays.length && !selectedDays.length) {
+        toast("Select at least one day folder");
         return;
       }
       const btn = form.querySelector('button[type="submit"]');
@@ -6147,73 +7568,241 @@
         progWrap.innerHTML = importProgressHtml("importTreeProgBar");
       }
       const ticker = startImportProgressTicker("importTreeProgBar");
-      setImportProgress("importTreeProgBar", {
-        title: "Importing host tree",
-        detail: `Scanning ${path} — each subdirectory is one host (large JSONL can take a while)…`,
-        pct: null,
-      });
+      // Host-by-host client import drives the progress UI directly (activity poll
+      // was racing a single long request and often only showed "Done").
       const host_from = String(fd.get("host_from") || "dirname");
-      const body = {
-        path,
+      const baseBody = {
         host_from,
         replace: true,
         create_scan: true,
         virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+        ...readHostPlatformFromForm(fd),
+        ...readScanTagsFromForm(fd),
       };
       if (host_from === "segment") {
-        body.parent_dir_field = Number(fd.get("parent_dir_field") || 4) || 4;
+        baseBody.parent_dir_field = Number(fd.get("parent_dir_field") || 4) || 4;
         const delim = String(fd.get("delimiter") || "-").trim();
-        if (delim) body.delimiter = delim.charAt(0);
+        if (delim) baseBody.delimiter = delim.charAt(0);
       } else if (host_from === "pulsesecure") {
         const field = Number(fd.get("parent_dir_field") || 0);
-        if (field > 0) body.parent_dir_field = field;
+        if (field > 0) baseBody.parent_dir_field = field;
         const delim = String(fd.get("delimiter") || "-").trim();
-        if (delim) body.delimiter = delim.charAt(0);
+        if (delim) baseBody.delimiter = delim.charAt(0);
       }
+
+      const listHostDirNames = async (dirPath) => {
+        try {
+          const data = await api(`/v1/fs/list?dirs_only=true&path=${encodeURIComponent(dirPath)}`);
+          return (data.entries || [])
+            .filter((e) => e.kind === "dir")
+            .map((e) => e.name)
+            .filter(Boolean);
+        } catch (_) {
+          return [];
+        }
+      };
+
+      const renderImportResults = (s) => {
+        const box = $("#importTreeResult");
+        if (!box) return;
+        box.classList.remove("hidden");
+        const showDay = (s.results || []).some((r) => r.day);
+        const rows = (s.results || []).map((r) => {
+          if (r.error) {
+            const soft = String(r.error).startsWith("no .jsonl under ");
+            return `<tr>${showDay ? `<td class="mono muted">${esc(r.day || "—")}</td>` : ""}<td class="mono">${esc(r.dir)}</td><td colspan="4" class="muted">${soft ? "skipped — " : ""}${esc(r.error)}</td></tr>`;
+          }
+          const dirShort = (r.dir || "").length > 36 ? `${r.dir.slice(0, 36)}…` : (r.dir || "");
+          return `<tr>
+            ${showDay ? `<td class="mono muted">${esc(r.day || "—")}</td>` : ""}
+            <td class="mono"><strong>${esc(r.display_name)}</strong></td>
+            <td class="mono muted" title="${esc(r.dir || "")}">${esc(dirShort)}</td>
+            <td>${r.created ? "new" : "existing"}</td>
+            <td>${esc(String(r.processes ?? 0))}p / ${esc(String(r.files ?? 0))}f / ${esc(String(r.sockets ?? 0))}s</td>
+            <td class="mono">${esc(r.scan_id ? String(r.scan_id).slice(0, 8) + "…" : "—")}</td>
+          </tr>`;
+        }).join("");
+        box.innerHTML = `
+          <div class="panel" style="padding:0.75rem">
+            <div><strong>${esc(String(s.hosts_ok ?? 0))}</strong> ok ·
+              <strong>${esc(String(s.hosts_failed ?? 0))}</strong> failed${
+                (s.days || []).length ? ` · days <span class="mono">${esc((s.days || []).join(", "))}</span>` : ""
+              }</div>
+            <table class="data" style="margin-top:0.65rem"><thead><tr>
+              ${showDay ? "<th>Day</th>" : ""}
+              <th>Host</th><th>Folder</th><th></th><th>Rows</th><th>Scan</th>
+            </tr></thead><tbody>${rows}</tbody></table>
+          </div>`;
+      };
+
       try {
-        const res = await api("/v1/hosts/virtual/import-tree", {
-          method: "POST",
-          body,
-        });
-        ticker.stop();
-        const s = res.summary || {};
-        const totalProc = (s.results || []).reduce((n, r) => n + (r.processes || 0), 0);
-        const totalFile = (s.results || []).reduce((n, r) => n + (r.files || 0), 0);
+        const aggregate = {
+          hosts_ok: 0,
+          hosts_failed: 0,
+          hosts_skipped: 0,
+          days: [],
+          campaign: !!selectedDays.length,
+          results: [],
+          root: path,
+        };
+
+        // One job per day (or the root). Hosts are imported one-by-one for live UI progress.
+        const dayJobs = selectedDays.length
+          ? selectedDays.map((day) => ({ path: `${path.replace(/\/$/, "")}/${day}`, day }))
+          : [{ path, day: null }];
+
+        appendImportDebugLog(
+          "importTreeProgBar",
+          selectedDays.length
+            ? `Campaign import · ${selectedDays.length} day(s) under ${path}`
+            : `Tree import · ${path}`,
+          "progress"
+        );
         setImportProgress("importTreeProgBar", {
-          title: (s.hosts_failed || 0) ? "Finished with errors" : "Done",
-          detail: `${s.hosts_ok ?? 0} host(s) ok · ${s.hosts_failed ?? 0} failed${s.hosts_skipped ? ` · ${s.hosts_skipped} skipped (empty)` : ""} · ${totalProc} processes · ${totalFile} files`,
+          title: "Listing host folders…",
+          detail: path,
+          pct: 1,
+        });
+        progWrap?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+
+        const work = [];
+        for (let ji = 0; ji < dayJobs.length; ji++) {
+          const job = dayJobs[ji];
+          const hosts = await listHostDirNames(job.path);
+          const dayLabel = job.day || path.split("/").filter(Boolean).pop() || "(root)";
+          appendImportDebugLog(
+            "importTreeProgBar",
+            `Day ${ji + 1}/${dayJobs.length} · ${dayLabel} · ${hosts.length} host folder(s)`,
+            "progress"
+          );
+          if (job.day) aggregate.days.push(job.day);
+          for (const hostDir of hosts) {
+            work.push({
+              root: job.path,
+              day: job.day,
+              parentTag: job.day || dayLabel,
+              hostDir,
+            });
+          }
+        }
+
+        if (!work.length) {
+          throw new Error("No host subdirectories found under the selected path(s)");
+        }
+
+        appendImportDebugLog(
+          "importTreeProgBar",
+          `Importing ${work.length} host(s) one-by-one (parent folder tagged on each scan)`,
+          "progress"
+        );
+
+        for (let wi = 0; wi < work.length; wi++) {
+          const w = work[wi];
+          const dayBit = w.day ? `${w.day} · ` : "";
+          const counts = `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`;
+          setImportProgress("importTreeProgBar", {
+            title: `Host ${wi + 1} / ${work.length}`,
+            detail: `${dayBit}${w.hostDir}`,
+            pct: Math.max(1, Math.round((wi / work.length) * 100)),
+            counts,
+          });
+          appendImportDebugLog(
+            "importTreeProgBar",
+            `[${wi + 1}/${work.length}] ${dayBit}importing ${w.hostDir}`,
+            "progress"
+          );
+
+          const body = {
+            ...baseBody,
+            path: w.root,
+            host_dirs: [w.hostDir],
+          };
+          // Ensure parent day/folder is in tags (server also adds it; this keeps the request explicit).
+          const tags = Array.isArray(baseBody.scan_tags) ? [...baseBody.scan_tags] : [];
+          if (w.parentTag && !tags.some((t) => String(t).toLowerCase() === String(w.parentTag).toLowerCase())) {
+            tags.push(w.parentTag);
+          }
+          if (tags.length) body.scan_tags = tags;
+
+          let tagged = [];
+          try {
+            const res = await api("/v1/hosts/virtual/import-tree", {
+              method: "POST",
+              body,
+            });
+            const s = res.summary || {};
+            tagged = (s.results || []).map((r) => ({
+              ...r,
+              day: r.day || w.day || null,
+            }));
+            if (!tagged.length) {
+              // Unexpected empty summary — synthesize from counts.
+              aggregate.hosts_ok += s.hosts_ok ?? 0;
+              aggregate.hosts_failed += s.hosts_failed ?? 0;
+              aggregate.hosts_skipped += s.hosts_skipped ?? 0;
+            }
+          } catch (hostErr) {
+            tagged = [{
+              dir: w.hostDir,
+              display_name: w.hostDir,
+              day: w.day,
+              error: hostErr.message || String(hostErr),
+            }];
+          }
+
+          for (const r of tagged) {
+            aggregate.results.push(r);
+            if (r.error) {
+              const soft = String(r.error).startsWith("no .jsonl under ")
+                || String(r.error).startsWith("no ingest files");
+              if (soft) aggregate.hosts_skipped += 1;
+              else aggregate.hosts_failed += 1;
+              appendImportDebugLog(
+                "importTreeProgBar",
+                `  ${soft ? "skip" : "fail"} ${r.display_name || r.dir}: ${r.error}`,
+                soft ? "muted" : "error"
+              );
+            } else {
+              aggregate.hosts_ok += 1;
+              appendImportDebugLog(
+                "importTreeProgBar",
+                `  ok ${r.display_name} · ${r.processes || 0}p / ${r.files || 0}f / ${r.sockets || 0}s${r.created ? " · new" : ""}${w.parentTag ? ` · tag ${w.parentTag}` : ""}`,
+                "info"
+              );
+            }
+          }
+
+          setImportProgress("importTreeProgBar", {
+            title: `Host ${wi + 1} / ${work.length}`,
+            detail: `${dayBit}${w.hostDir} · ${aggregate.hosts_ok} ok so far`,
+            pct: Math.round(((wi + 1) / work.length) * 100),
+            counts: `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`,
+          });
+        }
+
+        ticker.stop();
+        const totalProc = aggregate.results.reduce((n, r) => n + (r.processes || 0), 0);
+        const totalFile = aggregate.results.reduce((n, r) => n + (r.files || 0), 0);
+        const dayNote = aggregate.days.length
+          ? ` · ${aggregate.days.length} day${aggregate.days.length === 1 ? "" : "s"}`
+          : "";
+        setImportProgress("importTreeProgBar", {
+          title: aggregate.hosts_failed ? "Finished with errors" : "Done",
+          detail: `${aggregate.hosts_ok} host(s) ok · ${aggregate.hosts_failed} failed${aggregate.hosts_skipped ? ` · ${aggregate.hosts_skipped} skipped (empty)` : ""}${dayNote} · ${totalProc} processes · ${totalFile} files`,
+          counts: `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`,
           done: true,
         });
-        const box = $("#importTreeResult");
-        if (box) {
-          box.classList.remove("hidden");
-          const rows = (s.results || []).map((r) => {
-            if (r.error) {
-              const soft = String(r.error).startsWith("no .jsonl under ");
-              return `<tr><td class="mono">${esc(r.dir)}</td><td colspan="4" class="muted">${soft ? "skipped — " : ""}${esc(r.error)}</td></tr>`;
-            }
-            const dirShort = (r.dir || "").length > 36 ? `${r.dir.slice(0, 36)}…` : (r.dir || "");
-            return `<tr>
-              <td class="mono"><strong>${esc(r.display_name)}</strong></td>
-              <td class="mono muted" title="${esc(r.dir || "")}">${esc(dirShort)}</td>
-              <td>${r.created ? "new" : "existing"}</td>
-              <td>${esc(String(r.processes ?? 0))}p / ${esc(String(r.files ?? 0))}f / ${esc(String(r.sockets ?? 0))}s</td>
-              <td class="mono">${esc(r.scan_id ? String(r.scan_id).slice(0, 8) + "…" : "—")}</td>
-            </tr>`;
-          }).join("");
-          box.innerHTML = `
-            <div class="panel" style="padding:0.75rem">
-              <div><strong>${esc(String(s.hosts_ok ?? 0))}</strong> ok ·
-                <strong>${esc(String(s.hosts_failed ?? 0))}</strong> failed</div>
-              <table class="data" style="margin-top:0.65rem"><thead><tr>
-                <th>Host</th><th>Folder</th><th></th><th>Rows</th><th>Scan</th>
-              </tr></thead><tbody>${rows}</tbody></table>
-            </div>`;
-        }
+        appendImportDebugLog(
+          "importTreeProgBar",
+          `Finished · ${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} failed · ${aggregate.hosts_skipped} skipped · ${totalProc}p / ${totalFile}f`,
+          aggregate.hosts_failed ? "warn" : "info"
+        );
+        renderImportResults(aggregate);
         await loadAll();
-        toast(`Tree import: ${s.hosts_ok ?? 0} hosts`);
+        toast(`Tree import: ${aggregate.hosts_ok} hosts`);
       } catch (err) {
         ticker.stop();
+        appendImportDebugLog("importTreeProgBar", `Failed: ${err.message || err}`, "error");
         setImportProgress("importTreeProgBar", {
           title: "Failed",
           detail: err.message || String(err),
@@ -6254,9 +7843,10 @@
             <option value="files">Files</option>
           </select>
         </label>
-        <label>Server path (file or directory on the RustMite server)
-          <input name="path" class="mono" placeholder="/var/log/fleet or ./samples/procs.jsonl" autocomplete="off" />
-        </label>
+        ${serverPathFieldHtml({
+          label: "Server path (file or directory on the RustMite server)",
+          hint: "Browse the server, or type a path. Prefer folder upload below for local day trees.",
+        })}
         <label class="rules-enable" style="display:flex;gap:0.5rem;align-items:center;margin:0.35rem 0">
           <input type="checkbox" name="recursive" checked />
           Recurse directories (*.jsonl)
@@ -6275,7 +7865,12 @@
           </label>
           <p class="muted" style="font-size:0.75rem;margin:0.25rem 0 0">Only needed for a single host (tree import off, or flat file upload).</p>
         </div>
-        <p class="muted" style="font-size:0.75rem;margin:0.25rem 0 0">Server path is only for paths the RustMite server can read. Prefer folder upload for local day trees (PulseSecure-style).</p>
+        ${hostPlatformFieldsHtml({
+          hint: "Optional — set arch/kernel/OS at ingest (tree import applies to every host).",
+        })}
+        ${scanTagsFieldHtml({
+          hint: "Optional — tags the scan created by this import (first import or update).",
+        })}
         <div class="form-actions">
           <button type="submit" class="btn primary">Create / update</button>
           <button type="button" class="btn ghost" data-close-drawer>Cancel</button>
@@ -6312,7 +7907,7 @@
       try {
         setImportProgress("virtualHostProgBar", {
           title: "Preparing import",
-          detail: "Scanning selected files…",
+          detail: "Checking path / files…",
           pct: 0,
         });
         const feed = await readVirtualFeedFields(
@@ -6320,14 +7915,15 @@
           "#createVirtualFiles",
           "#createVirtualDir",
           (p) => setImportProgress("virtualHostProgBar", {
-            title: p.phase === "scan" || p.phase === "scan_done" ? "Scanning folder" : "Reading files",
+            title: virtualProgressTitle(p.phase),
             detail: p.detail,
             pct: p.pct,
           })
         );
         const treeChecked = fd.get("tree_import") != null;
-        const wantTree = treeChecked && isVirtualTreeFolderUpload(feed.files || []);
-        if (treeChecked && (feed.files || []).length && !wantTree) {
+        const wantTreeUpload = treeChecked && isVirtualTreeFolderUpload(feed.files || []);
+        const wantTreeServer = treeChecked && !!(feed.path || "").trim() && !(feed.files || []).length;
+        if (treeChecked && (feed.files || []).length && !wantTreeUpload) {
           $("#createVirtDisplayNameWrap")?.classList.remove("hidden");
           const displayName = String(fd.get("display_name") || "").trim();
           if (!displayName) {
@@ -6336,37 +7932,55 @@
             return;
           }
         }
-        if (wantTree) {
+        if (wantTreeServer || wantTreeUpload) {
           const treeOpts = readTreeHostFromForm(fd, "createVirt");
-          setImportProgress("virtualHostProgBar", {
-            title: "Importing host tree",
-            detail: "Create or update one virtual host per subdirectory…",
-            pct: 0,
-          });
-          const res = await importVirtualTreeUpload(
-            feed.files,
-            {
-              host_from: treeOpts.host_from,
-              parent_dir_field: treeOpts.parent_dir_field,
-              delimiter: treeOpts.delimiter,
-              create_scan: treeOpts.create_scan,
-              replace: treeOpts.replace,
-              kind: feed.kind || "auto",
-              virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
-            },
-            (p) => setImportProgress("virtualHostProgBar", {
+          const treeCommon = {
+            host_from: treeOpts.host_from,
+            parent_dir_field: treeOpts.parent_dir_field,
+            delimiter: treeOpts.delimiter,
+            create_scan: treeOpts.create_scan,
+            replace: treeOpts.replace,
+            kind: feed.kind || "auto",
+            virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+            labels,
+            ...readHostPlatformFromForm(fd),
+            ...readScanTagsFromForm(fd),
+          };
+          const onTreeProg = bindImportTreeProgress("virtualHostProgBar");
+          if (wantTreeServer) {
+            onTreeProg({
               title: "Importing host tree",
-              detail: p.detail,
-              pct: p.pct,
-            })
-          );
+              detail: `Server path ${feed.path}`,
+              pct: 1,
+              log: `Server path tree · ${feed.path}`,
+              logLevel: "progress",
+            });
+          } else {
+            setImportProgress("virtualHostProgBar", {
+              title: "Importing host tree",
+              detail: "Create or update one virtual host per subdirectory…",
+              pct: null,
+            });
+          }
+          const res = wantTreeServer
+            ? await importVirtualTreeFromServerPath(feed.path, treeCommon, onTreeProg)
+            : await importVirtualTreeUpload(
+              feed.files,
+              treeCommon,
+              (p) => setImportProgress("virtualHostProgBar", {
+                title: "Importing host tree",
+                detail: p.detail,
+                pct: p.pct,
+              })
+            );
           ticker.stop();
           const s = res.summary || {};
           const updated = (s.results || []).filter((r) => !r.error && r.created === false).length;
           const created = (s.results || []).filter((r) => !r.error && r.created === true).length;
           setImportProgress("virtualHostProgBar", {
-            title: "Done",
+            title: s.hosts_failed ? "Finished with errors" : "Done",
             detail: `${s.hosts_ok ?? 0} hosts ok (${created} new · ${updated} updated) · ${s.hosts_failed ?? 0} failed · ${s.hosts_skipped ?? 0} skipped`,
+            counts: `${s.hosts_ok ?? 0} ok · ${s.hosts_failed ?? 0} fail · ${s.hosts_skipped ?? 0} skip`,
             done: true,
           });
           const box = $("#virtualHostResult");
@@ -6443,6 +8057,8 @@
           create_scan: singleOpts.create_scan,
           replace: singleOpts.replace,
           virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+          ...readHostPlatformFromForm(fd),
+          ...readScanTagsFromForm(fd),
         }, (p) => setImportProgress("virtualHostProgBar", {
           title: p.phase === "pack" ? "Packaging upload" : "Uploading to server",
           detail: p.detail,
@@ -6529,10 +8145,12 @@
 
   function importProgressHtml(id) {
     return `<div class="import-progress" id="${esc(id)}" role="status" aria-live="polite">
+      <div class="ip-heading">Import progress</div>
       <div class="ip-title">Working…</div>
       <div class="ip-detail">Starting</div>
       <div class="bar indeterminate"><span style="width:35%"></span></div>
-      <div class="ip-meta"><span class="ip-pct">—</span><span class="ip-elapsed">0.0s</span></div>
+      <div class="ip-meta"><span class="ip-pct">—</span><span class="ip-counts"></span><span class="ip-elapsed">0.0s</span></div>
+      <div class="ip-log" id="${esc(id)}Log" aria-label="Import debug log"></div>
     </div>`;
   }
 
@@ -6572,6 +8190,23 @@
       if (fill) fill.style.width = "100%";
       if (pctEl) pctEl.textContent = "100%";
     }
+    if (opts.counts != null) {
+      const el = root.querySelector(".ip-counts");
+      if (el) el.textContent = opts.counts;
+    }
+  }
+
+  function appendImportDebugLog(rootOrId, line, level = "info") {
+    const root = typeof rootOrId === "string" ? document.getElementById(rootOrId) : rootOrId;
+    if (!root) return;
+    const log = root.querySelector(".ip-log") || document.getElementById(`${root.id || ""}Log`);
+    if (!log) return;
+    const ts = new Date().toLocaleTimeString();
+    const row = document.createElement("div");
+    row.className = `ip-log-line ip-log-${level}`;
+    row.textContent = `${ts}  ${line}`;
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
   }
 
   function startImportProgressTicker(rootOrId) {
@@ -6584,6 +8219,56 @@
       stop() {
         clearInterval(id);
         setImportProgress(rootOrId, { elapsedMs: performance.now() - t0 });
+      },
+    };
+  }
+
+  /** Poll activity feed for import.tree lines while a long tree import runs. */
+  function startImportTreeActivityPoll(rootOrId, sinceTs) {
+    const seen = new Set();
+    let lastDetail = null;
+    const tick = async () => {
+      try {
+        const rows = await api("/v1/activity?limit=120");
+        const list = (Array.isArray(rows) ? rows : (rows?.events || rows?.activity || []))
+          .filter((e) => String(e.kind || "") === "import.tree")
+          .filter((e) => !(sinceTs && e.ts && String(e.ts) < sinceTs))
+          .sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
+        for (const e of list) {
+          const key = `${e.id || e.ts}|${e.message}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const level = String(e.level || "info");
+          const msg = String(e.message || "");
+          appendImportDebugLog(rootOrId, msg, level === "progress" ? "progress" : level);
+          const d = e.detail || {};
+          if (d.phase === "host_start" || d.phase === "host_ok" || d.phase === "host_skip" || d.phase === "host_fail") {
+            const idx = Number(d.index) || 0;
+            const total = Number(d.total) || 0;
+            if (total > 0) {
+              const pct = Math.max(1, Math.min(99, Math.round((idx / total) * 100)));
+              const dayBit = d.day ? `${d.day} · ` : "";
+              const title = d.phase === "host_start"
+                ? `Importing ${dayBit}${d.display_name || d.dir || "host"}`
+                : `Progress ${idx}/${total}`;
+              if (title !== lastDetail) {
+                lastDetail = title;
+                setImportProgress(rootOrId, {
+                  title: d.phase === "host_start" ? "Importing hosts" : "Importing hosts",
+                  detail: `${idx}/${total}${d.day ? ` · ${d.day}` : ""} · ${d.display_name || d.dir || ""}`,
+                  pct,
+                });
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    };
+    const id = window.setInterval(tick, 900);
+    tick();
+    return {
+      stop() {
+        window.clearInterval(id);
       },
     };
   }
@@ -6614,18 +8299,25 @@
   async function collectVirtualUploadCandidates(fileInputSel, dirInputSel, onProgress) {
     const pending = [];
     let scanned = 0;
+    const yieldEvery = 16;
     const fileInput = $(fileInputSel);
     const fileList = fileInput?.files;
     if (fileList?.length) {
       const total = fileList.length;
+      onProgress?.({
+        phase: "scan",
+        pct: 1,
+        detail: `Listing ${total.toLocaleString()} file(s)…`,
+      });
+      await yieldToUi();
       for (let i = 0; i < total; i++) {
         pending.push(fileList[i]);
         scanned++;
-        if (i % 48 === 0 || i === total - 1) {
+        if (i % yieldEvery === 0 || i === total - 1) {
           onProgress?.({
             phase: "scan",
             pct: Math.min(8, ((i + 1) / total) * 8),
-            detail: `Scanning files… ${i + 1}/${total}`,
+            detail: `Scanning files… ${(i + 1).toLocaleString()}/${total.toLocaleString()}`,
           });
           await yieldToUi();
         }
@@ -6636,15 +8328,21 @@
       const list = dirInput?.files;
       if (list?.length) {
         const total = list.length;
+        onProgress?.({
+          phase: "scan",
+          pct: 8,
+          detail: `Listing folder (${total.toLocaleString()} entries)…`,
+        });
+        await yieldToUi();
         for (let i = 0; i < total; i++) {
           const f = list[i];
           scanned++;
           if (isVirtualUploadName(f.name)) pending.push(f);
-          if (i % 48 === 0 || i === total - 1) {
+          if (i % yieldEvery === 0 || i === total - 1) {
             onProgress?.({
               phase: "scan",
               pct: Math.min(18, 8 + ((i + 1) / total) * 10),
-              detail: `Scanning folder… ${i + 1}/${total} · ${pending.length} matching (.jsonl/.json/.csv)`,
+              detail: `Scanning folder… ${(i + 1).toLocaleString()}/${total.toLocaleString()} · ${pending.length.toLocaleString()} matching (.jsonl/.json/.csv)`,
             });
             await yieldToUi();
           }
@@ -6666,6 +8364,206 @@
       text += " — Finish when ready (large folders may take a while to read).";
     }
     return text;
+  }
+
+  function formatBytesShort(n) {
+    const v = Number(n) || 0;
+    if (v < 1024) return `${v} B`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(v / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  /** Server path input + Browse… (fills from `/v1/fs/list`). */
+  function serverPathFieldHtml(opts = {}) {
+    const label = opts.label || "Server path (file or directory on the server)";
+    const name = opts.name || "path";
+    const id = opts.id ? ` id="${esc(opts.id)}"` : "";
+    const required = opts.required ? " required" : "";
+    const mode = opts.mode === "dir" ? "dir" : "any";
+    const placeholder = opts.placeholder
+      || (mode === "dir" ? "/data/snapshots/2026-05-10" : "/var/log/fleet or ./samples/procs.jsonl");
+    const value = opts.value || "";
+    const hint = opts.hint
+      || (mode === "dir"
+        ? "Browse the RustMite server filesystem, or type an absolute path."
+        : "Browse the server, or type a path. Browser upload still works below.");
+    return `
+      <label>${esc(label)}
+        <div class="server-path-row">
+          <input name="${esc(name)}"${id} class="mono"${required}
+            placeholder="${esc(placeholder)}" value="${esc(value)}" autocomplete="off" />
+          <button type="button" class="btn ghost" data-browse-server-path data-browse-mode="${esc(mode)}" title="Browse server filesystem">Browse…</button>
+        </div>
+      </label>
+      <p class="muted server-path-hint">${esc(hint)}</p>`;
+  }
+
+  function closeFsBrowse() {
+    const overlay = $("#fsBrowse");
+    if (!overlay) return;
+    overlay.classList.add("hidden");
+    overlay.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("fs-browse-open");
+  }
+
+  function openServerPathBrowser(inputEl, mode) {
+    if (!inputEl) return;
+    const overlay = $("#fsBrowse");
+    const body = $("#fsBrowseBody");
+    const title = $("#fsBrowseTitle");
+    if (!overlay || !body) {
+      toast("Server browser unavailable");
+      return;
+    }
+    const dirsOnly = mode === "dir";
+    let currentPath = String(inputEl.value || "").trim();
+    let selectedPath = currentPath;
+    if (title) title.textContent = dirsOnly ? "Browse server folder" : "Browse server path";
+
+    const renderBody = (data, errMsg) => {
+      if (errMsg) {
+        return `<div class="fs-browser">
+          <div class="fs-browser-error">${esc(errMsg)}</div>
+          <div class="form-actions">
+            <button type="button" class="btn ghost" data-close-fs-browse>Cancel</button>
+          </div>
+        </div>`;
+      }
+      const roots = data.roots || [];
+      const entries = data.entries || [];
+      const parent = data.parent || "";
+      selectedPath = data.path || selectedPath;
+      const cur = data.path || "";
+      let activeRoot = roots[0]?.path || "";
+      for (const r of roots) {
+        if (cur === r.path || cur.startsWith(`${r.path}/`)) {
+          if (!activeRoot || String(r.path).length >= String(activeRoot).length) {
+            activeRoot = r.path;
+          }
+        }
+      }
+      return `
+        <div class="fs-browser" data-fs-dirs-only="${dirsOnly ? "1" : "0"}">
+          <p class="muted" style="font-size:0.8rem;margin:0 0 0.65rem">
+            Paths are on the <strong>RustMite server</strong> (not your laptop).
+            Roots can be set with <span class="mono">RUSTMITE_FS_ROOTS</span>.
+          </p>
+          <div class="fs-browser-toolbar">
+            <label class="fs-browser-root">Root
+              <select id="fsBrowserRoot">
+                ${roots.map((r) => `<option value="${esc(r.path)}" ${r.path === activeRoot ? "selected" : ""}>${esc(r.label || r.path)}</option>`).join("")}
+              </select>
+            </label>
+            <div class="fs-browser-path mono" title="${esc(data.path || "")}">${esc(data.path || "")}</div>
+          </div>
+          <div class="fs-browser-nav">
+            <button type="button" class="btn ghost tiny" id="fsBrowserUp" ${parent ? "" : "disabled"} data-fs-goto="${esc(parent)}">↑ Up</button>
+            <button type="button" class="btn ghost tiny" id="fsBrowserRefresh" data-fs-goto="${esc(data.path || "")}">Refresh</button>
+          </div>
+          <div class="fs-browser-list" role="listbox" aria-label="Server directory">
+            ${entries.length ? entries.map((e) => `
+              <button type="button" class="fs-browser-item fs-browser-item--${esc(e.kind)}"
+                data-fs-kind="${esc(e.kind)}" data-fs-path="${esc(e.path)}"
+                title="${esc(e.path)}">
+                <span class="fs-browser-item-icon fs-browser-item-icon--${esc(e.kind)}" aria-hidden="true"></span>
+                <span class="fs-browser-item-name">${esc(e.name)}</span>
+                <span class="fs-browser-item-meta muted">${e.kind === "dir" ? "folder" : formatBytesShort(e.size)}</span>
+              </button>`).join("") : `<div class="fs-browser-empty muted">Empty directory</div>`}
+          </div>
+          <div class="fs-browser-selected muted mono">${esc(selectedPath || "(nothing selected)")}</div>
+          <div class="form-actions">
+            <button type="button" class="btn primary" id="fsBrowserSelect">${dirsOnly ? "Select folder" : "Select"}</button>
+            <button type="button" class="btn ghost" data-close-fs-browse>Cancel</button>
+          </div>
+        </div>`;
+    };
+
+    const applySelection = (path) => {
+      if (!path) return toast("Nothing selected");
+      inputEl.value = path;
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+      inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+      // Clear leftover browser folder picks so submit uses the server path
+      // instead of re-scanning a huge FileList.
+      const form = inputEl.closest("form");
+      if (form) {
+        form.querySelectorAll('input[type="file"]').forEach((el) => {
+          try { el.value = ""; } catch (_) {}
+        });
+        form.querySelectorAll("[id$='PickStatus'], .form-hint-status").forEach((el) => {
+          if (el.id && /PickStatus$/i.test(el.id)) el.textContent = "";
+        });
+      }
+      closeFsBrowse();
+      toast("Server path selected");
+    };
+
+    const load = async (path) => {
+      const qs = new URLSearchParams();
+      if (path) qs.set("path", path);
+      if (dirsOnly) qs.set("dirs_only", "true");
+      body.innerHTML = `<div class="fs-browser"><div class="muted">Loading…</div></div>`;
+      try {
+        const data = await api(`/v1/fs/list?${qs.toString()}`);
+        currentPath = data.path || path || "";
+        selectedPath = currentPath;
+        body.innerHTML = renderBody(data);
+        bindBrowser();
+      } catch (err) {
+        body.innerHTML = renderBody(null, err.message || String(err));
+      }
+    };
+
+    const bindBrowser = () => {
+      $("#fsBrowserRoot")?.addEventListener("change", (e) => {
+        e.stopPropagation();
+        load(e.target.value);
+      });
+      $$("[data-fs-goto]", body).forEach((b) => {
+        b.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const p = b.getAttribute("data-fs-goto");
+          if (p) load(p);
+        });
+      });
+      $$(".fs-browser-item", body).forEach((b) => {
+        b.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const kind = b.getAttribute("data-fs-kind");
+          const path = b.getAttribute("data-fs-path") || "";
+          if (kind === "dir") {
+            // Enter folder — keep the browse overlay open.
+            load(path);
+            return;
+          }
+          selectedPath = path;
+          $$(".fs-browser-item", body).forEach((x) => x.classList.toggle("selected", x === b));
+          const sel = $(".fs-browser-selected", body);
+          if (sel) sel.textContent = path;
+        });
+        b.addEventListener("dblclick", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const kind = b.getAttribute("data-fs-kind");
+          const path = b.getAttribute("data-fs-path") || "";
+          if (kind === "dir") load(path);
+          else if (!dirsOnly && path) applySelection(path);
+        });
+      });
+      $("#fsBrowserSelect")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        applySelection(selectedPath || currentPath);
+      });
+    };
+
+    overlay.classList.remove("hidden");
+    overlay.setAttribute("aria-hidden", "false");
+    document.body.classList.add("fs-browse-open");
+    load(currentPath);
   }
 
   /**
@@ -6754,16 +8652,310 @@
     document.addEventListener("rustmite:virt-tree-opts", onOpts);
   }
 
+  function virtualBrowserFileCounts(fileInputSel, dirInputSel) {
+    const fileN = $(fileInputSel)?.files?.length || 0;
+    const dirN = dirInputSel ? ($(dirInputSel)?.files?.length || 0) : 0;
+    return { fileN, dirN, total: fileN + dirN };
+  }
+
+  function virtualProgressTitle(phase) {
+    if (phase === "server_path") return "Server path";
+    if (phase === "scan" || phase === "scan_done") return "Scanning folder";
+    if (phase === "read" || phase === "read_done") return "Reading files";
+    if (phase === "pack") return "Packaging upload";
+    if (phase === "upload") return "Uploading to server";
+    return "Working";
+  }
+
+  async function listFsDirNames(dirPath) {
+    try {
+      const data = await api(`/v1/fs/list?dirs_only=true&path=${encodeURIComponent(dirPath)}`);
+      return (data.entries || [])
+        .filter((e) => e.kind === "dir")
+        .map((e) => e.name)
+        .filter(Boolean);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function importTreeBaseBody(opts = {}) {
+    const body = {
+      host_from: opts.host_from || "dirname",
+      replace: opts.replace !== false,
+      create_scan: opts.create_scan !== false,
+      kind: opts.kind || "auto",
+      virtual_agent_id: opts.virtual_agent_id || null,
+      source_label: opts.source_label || null,
+      arch: opts.arch || null,
+      kernel: opts.kernel || null,
+      os: opts.os || null,
+      labels: opts.labels && Object.keys(opts.labels).length ? opts.labels : null,
+      scan_tags: opts.scan_tags || null,
+    };
+    if (opts.parent_dir_field != null) body.parent_dir_field = opts.parent_dir_field;
+    if (opts.delimiter) body.delimiter = opts.delimiter;
+    return body;
+  }
+
+  /**
+   * Import a server-local day/campaign folder via `/v1/hosts/virtual/import-tree`,
+   * one host at a time so the UI can show live progress (not a single opaque wait).
+   *
+   * onProgress({ phase, title, detail, pct, counts, log, logLevel })
+   */
+  async function importVirtualTreeFromServerPath(path, opts = {}, onProgress) {
+    const root = String(path || "").trim();
+    if (!root) throw new Error("Server path required");
+    const baseBody = importTreeBaseBody(opts);
+
+    onProgress?.({
+      phase: "list",
+      title: "Listing host folders…",
+      detail: root,
+      pct: 1,
+      log: `Listing under ${root}`,
+      logLevel: "progress",
+    });
+
+    let dayJobs = [];
+    if (opts.days && opts.days.length) {
+      dayJobs = opts.days.map((day) => ({
+        path: `${root.replace(/\/$/, "")}/${day}`,
+        day,
+      }));
+    } else {
+      const children = await listFsDirNames(root);
+      const days = children.filter(looksLikeIsoDayFolder).sort();
+      const campaign = opts.campaign === true
+        || (days.length > 0 && days.length === children.length);
+      if (campaign) {
+        if (!days.length) {
+          throw new Error(`No YYYY-MM-DD day folders under ${root}`);
+        }
+        dayJobs = days.map((day) => ({
+          path: `${root.replace(/\/$/, "")}/${day}`,
+          day,
+        }));
+        onProgress?.({
+          phase: "list",
+          title: "Campaign folder",
+          detail: `${days.length} day folder(s) under ${root}`,
+          pct: 2,
+          log: `Campaign · ${days.length} day(s): ${days.join(", ")}`,
+          logLevel: "progress",
+        });
+      } else {
+        dayJobs = [{ path: root, day: null }];
+      }
+    }
+
+    const work = [];
+    const daysSeen = [];
+    for (let ji = 0; ji < dayJobs.length; ji++) {
+      const job = dayJobs[ji];
+      const hosts = await listFsDirNames(job.path);
+      const parentTag = job.day || job.path.split("/").filter(Boolean).pop() || "";
+      onProgress?.({
+        phase: "list",
+        title: "Listing host folders…",
+        detail: `${job.day || parentTag || job.path} · ${hosts.length} host folder(s)`,
+        pct: Math.min(8, 2 + Math.round(((ji + 1) / Math.max(dayJobs.length, 1)) * 6)),
+        log: `${job.day || parentTag || "(root)"} · ${hosts.length} host folder(s)`,
+        logLevel: "progress",
+      });
+      if (job.day) daysSeen.push(job.day);
+      for (const hostDir of hosts) {
+        work.push({
+          root: job.path,
+          day: job.day,
+          parentTag,
+          hostDir,
+        });
+      }
+    }
+
+    if (!work.length) {
+      throw new Error(`No host subdirectories found under ${root}`);
+    }
+
+    onProgress?.({
+      phase: "list_done",
+      title: "Starting import",
+      detail: `${work.length} host(s) · one-by-one for live progress`,
+      pct: 8,
+      log: `Importing ${work.length} host(s) (parent folder tagged on each scan)`,
+      logLevel: "progress",
+    });
+
+    const aggregate = {
+      hosts_ok: 0,
+      hosts_failed: 0,
+      hosts_skipped: 0,
+      days: daysSeen,
+      campaign: daysSeen.length > 0,
+      results: [],
+      root,
+    };
+
+    for (let wi = 0; wi < work.length; wi++) {
+      const w = work[wi];
+      const dayBit = w.day ? `${w.day} · ` : "";
+      const counts = `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`;
+      onProgress?.({
+        phase: "host_start",
+        title: `Host ${wi + 1} / ${work.length}`,
+        detail: `${dayBit}${w.hostDir}`,
+        pct: Math.max(8, Math.round((wi / work.length) * 100)),
+        counts,
+        log: `[${wi + 1}/${work.length}] ${dayBit}importing ${w.hostDir}`,
+        logLevel: "progress",
+      });
+
+      const body = {
+        ...baseBody,
+        path: w.root,
+        host_dirs: [w.hostDir],
+      };
+      const tags = Array.isArray(baseBody.scan_tags) ? [...baseBody.scan_tags] : [];
+      if (w.parentTag && !tags.some((t) => String(t).toLowerCase() === String(w.parentTag).toLowerCase())) {
+        tags.push(w.parentTag);
+      }
+      if (tags.length) body.scan_tags = tags;
+
+      let tagged = [];
+      try {
+        const res = await api("/v1/hosts/virtual/import-tree", {
+          method: "POST",
+          body,
+        });
+        const s = res.summary || {};
+        tagged = (s.results || []).map((r) => ({
+          ...r,
+          day: r.day || w.day || null,
+        }));
+        if (!tagged.length) {
+          aggregate.hosts_ok += s.hosts_ok ?? 0;
+          aggregate.hosts_failed += s.hosts_failed ?? 0;
+          aggregate.hosts_skipped += s.hosts_skipped ?? 0;
+        }
+      } catch (hostErr) {
+        tagged = [{
+          dir: w.hostDir,
+          display_name: w.hostDir,
+          day: w.day,
+          error: hostErr.message || String(hostErr),
+        }];
+      }
+
+      for (const r of tagged) {
+        aggregate.results.push(r);
+        if (r.error) {
+          const soft = String(r.error).startsWith("no .jsonl under ")
+            || String(r.error).startsWith("no ingest files");
+          if (soft) aggregate.hosts_skipped += 1;
+          else aggregate.hosts_failed += 1;
+          onProgress?.({
+            phase: soft ? "host_skip" : "host_fail",
+            title: `Host ${wi + 1} / ${work.length}`,
+            detail: `${dayBit}${w.hostDir} · ${soft ? "skipped" : "failed"}`,
+            pct: Math.round(((wi + 1) / work.length) * 100),
+            counts: `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`,
+            log: `  ${soft ? "skip" : "fail"} ${r.display_name || r.dir}: ${r.error}`,
+            logLevel: soft ? "muted" : "error",
+          });
+        } else {
+          aggregate.hosts_ok += 1;
+          onProgress?.({
+            phase: "host_ok",
+            title: `Host ${wi + 1} / ${work.length}`,
+            detail: `${dayBit}${r.display_name || w.hostDir} · ${r.processes || 0}p / ${r.files || 0}f`,
+            pct: Math.round(((wi + 1) / work.length) * 100),
+            counts: `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`,
+            log: `  ok ${r.display_name} · ${r.processes || 0}p / ${r.files || 0}f / ${r.sockets || 0}s${r.created ? " · new" : ""}${w.parentTag ? ` · tag ${w.parentTag}` : ""}`,
+            logLevel: "info",
+          });
+        }
+      }
+    }
+
+    const totalProc = aggregate.results.reduce((n, r) => n + (r.processes || 0), 0);
+    const totalFile = aggregate.results.reduce((n, r) => n + (r.files || 0), 0);
+    onProgress?.({
+      phase: "done",
+      title: aggregate.hosts_failed ? "Finished with errors" : "Done",
+      detail: `${aggregate.hosts_ok} host(s) ok · ${aggregate.hosts_failed} failed${aggregate.hosts_skipped ? ` · ${aggregate.hosts_skipped} skipped` : ""} · ${totalProc}p / ${totalFile}f`,
+      pct: 100,
+      counts: `${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} fail · ${aggregate.hosts_skipped} skip`,
+      log: `Finished · ${aggregate.hosts_ok} ok · ${aggregate.hosts_failed} failed · ${aggregate.hosts_skipped} skipped · ${totalProc}p / ${totalFile}f`,
+      logLevel: aggregate.hosts_failed ? "warn" : "info",
+      done: true,
+    });
+
+    return {
+      ok: aggregate.hosts_failed === 0,
+      summary: aggregate,
+    };
+  }
+
+  function bindImportTreeProgress(progId) {
+    return (p) => {
+      setImportProgress(progId, {
+        title: p.title || "Importing host tree",
+        detail: p.detail,
+        pct: p.pct,
+        counts: p.counts,
+        done: !!p.done,
+      });
+      if (p.log) appendImportDebugLog(progId, p.log, p.logLevel || "progress");
+    };
+  }
+
   async function readVirtualFeedFields(fd, fileInputSel, dirInputSel, onProgress) {
     const path = String(fd.get("path") || "").trim();
     const kind = String(fd.get("kind") || "auto");
     const recursive = fd.get("recursive") != null;
     const replace = true;
     const files = [];
+    const browser = virtualBrowserFileCounts(fileInputSel, dirInputSel);
+
+    // Server path wins: never walk a huge browser FileList when a path is set.
+    // (Browsing a day folder on the server used to still "scan selected files" forever
+    // if a leftover folder pick was present, and never used import-tree.)
+    if (path) {
+      if (browser.total) {
+        onProgress?.({
+          phase: "server_path",
+          pct: 100,
+          detail: `Using server path — ignoring ${browser.total.toLocaleString()} browser file(s)`,
+        });
+        toast("Using server path (browser upload ignored while path is set)");
+      } else {
+        onProgress?.({
+          phase: "server_path",
+          pct: 100,
+          detail: `Using server path ${path}`,
+        });
+      }
+      await yieldToUi();
+      return {
+        path,
+        kind,
+        recursive,
+        replace,
+        files: [],
+        readBytes: 0,
+        fileCount: 0,
+        serverPathOnly: true,
+      };
+    }
+
     onProgress?.({
       phase: "scan",
       pct: 0,
-      detail: "Scanning selected files…",
+      detail: browser.total
+        ? `Opening ${browser.total.toLocaleString()} selected file(s)…`
+        : "Scanning selected files…",
     });
     await yieldToUi();
     const { pending, scanned } = await collectVirtualUploadCandidates(
@@ -6929,6 +9121,7 @@
             replace: false,
             create_scan: isLast && createScan,
             virtual_agent_id: bodyBase.virtual_agent_id || null,
+            scan_tags: isLast ? (bodyBase.scan_tags || null) : null,
           },
           (p) => onProgress?.({
             ...p,
@@ -7047,6 +9240,82 @@
     const { byDir, root } = groupVirtualFilesByTopDir(files);
     // Prefer tree when we found ≥1 host subdirectory (ignore stray root files).
     return byDir.size >= 1;
+  }
+
+  const HOST_ARCH_OPTIONS = [
+    ["", "— unset —"],
+    ["x86_64", "x86_64"],
+    ["aarch64", "aarch64 (arm64)"],
+    ["armv7", "armv7"],
+    ["i686", "i686"],
+    ["ppc64le", "ppc64le"],
+    ["s390x", "s390x"],
+    ["riscv64", "riscv64"],
+  ];
+
+  function hostPlatformFieldsHtml({
+    arch = "",
+    kernel = "",
+    os = "",
+    hint = "Optional — used on Hosts → Arch / kernel and virtual scan metadata.",
+  } = {}) {
+    const cur = String(arch || "").trim();
+    const known = HOST_ARCH_OPTIONS.some(([v]) => v && v === cur);
+    return `
+      <div class="form-row form-row-3">
+        <label>Architecture
+          <select name="arch">
+            ${HOST_ARCH_OPTIONS.map(([v, label]) =>
+              `<option value="${esc(v)}" ${cur === v ? "selected" : ""}>${esc(label)}</option>`
+            ).join("")}
+            ${cur && !known ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : ""}
+          </select>
+        </label>
+        <label>Kernel
+          <input name="kernel" class="mono" placeholder="6.8.0-generic" value="${esc(kernel || "")}" autocomplete="off" />
+        </label>
+        <label>OS
+          <input name="os" placeholder="Ubuntu 22.04" value="${esc(os || "")}" autocomplete="off" />
+        </label>
+      </div>
+      ${hint ? `<p class="form-hint muted">${hint}</p>` : ""}`;
+  }
+
+  function readHostPlatformFromForm(fd) {
+    const trim = (k) => String(fd.get(k) || "").trim();
+    const arch = trim("arch");
+    const kernel = trim("kernel");
+    const os = trim("os");
+    const out = {};
+    if (arch) out.arch = arch;
+    if (kernel) out.kernel = kernel;
+    if (os) out.os = os;
+    return out;
+  }
+
+  function scanTagsFieldHtml({
+    value = "",
+    hint = "Optional — tags this scan (first import or update). Shown on Scans / scan detail.",
+  } = {}) {
+    return `
+      <label>Scan tags <span class="field-optional">(optional, comma-separated)</span>
+        <input name="scan_tags" placeholder="day-2026-05-10, pulsesecure" value="${esc(value || "")}" autocomplete="off" />
+      </label>
+      ${hint ? `<p class="form-hint muted">${hint}</p>` : ""}`;
+  }
+
+  function readScanTagsFromForm(fd) {
+    const tags = String(fd.get("scan_tags") || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return tags.length ? { scan_tags: tags } : {};
+  }
+
+  function formatScanTags(tags) {
+    const list = Array.isArray(tags) ? tags : [];
+    if (!list.length) return `<span class="muted">—</span>`;
+    return list.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ");
   }
 
   function treeHostFromFieldsHtml(idPrefix = "virtTree") {
@@ -7256,6 +9525,11 @@
             kind: opts.kind || "auto",
             virtual_agent_id: opts.virtual_agent_id || null,
             source_label: opts.source_label || null,
+            arch: opts.arch || null,
+            kernel: opts.kernel || null,
+            os: opts.os || null,
+            labels: opts.labels && Object.keys(opts.labels).length ? opts.labels : null,
+            scan_tags: opts.scan_tags || null,
             files: chunks[0],
           },
           (p) => onProgress?.({
@@ -7286,6 +9560,7 @@
                 replace: false,
                 create_scan: isLast && opts.create_scan !== false,
                 virtual_agent_id: opts.virtual_agent_id || null,
+                scan_tags: isLast ? (opts.scan_tags || null) : null,
               },
               (p) => onProgress?.({
                 ...p,
@@ -7373,9 +9648,9 @@
             <option value="files">Files</option>
           </select>
         </label>
-        <label>Server path (file or directory)
-          <input name="path" class="mono" placeholder="/var/log/fleet or ./samples/procs.jsonl" autocomplete="off" />
-        </label>
+        ${serverPathFieldHtml({
+          label: "Server path (file or directory)",
+        })}
         <label class="rules-enable" style="display:flex;gap:0.5rem;align-items:center;margin:0.35rem 0">
           <input type="checkbox" name="recursive" checked />
           Recurse directories
@@ -7390,6 +9665,15 @@
           <input type="file" id="feedVirtualDir" webkitdirectory directory multiple />
         </label>
         <p id="feedVirtualPickStatus" class="muted" style="font-size:0.78rem;margin:0.4rem 0 0;min-height:1.2em"></p>
+        ${hostPlatformFieldsHtml({
+          arch: host?.arch || "",
+          kernel: host?.kernel || "",
+          os: host?.os || "",
+          hint: "Optional — update arch/kernel/OS on this host with the import.",
+        })}
+        ${scanTagsFieldHtml({
+          hint: "Optional — tags the scan created by this update import.",
+        })}
         <div class="form-actions">
           <button type="submit" class="btn primary">Import</button>
           <button type="button" class="btn ghost" data-close-drawer>Cancel</button>
@@ -7414,8 +9698,8 @@
       const ticker = startImportProgressTicker("feedVirtualProgBar");
       try {
         setImportProgress("feedVirtualProgBar", {
-          title: "Reading files",
-          detail: "Scanning selected files…",
+          title: "Preparing import",
+          detail: "Checking path / files…",
           pct: 0,
         });
         const feed = await readVirtualFeedFields(
@@ -7423,7 +9707,7 @@
           "#feedVirtualFiles",
           "#feedVirtualDir",
           (p) => setImportProgress("feedVirtualProgBar", {
-            title: p.phase === "scan" || p.phase === "scan_done" ? "Scanning folder" : "Reading files",
+            title: virtualProgressTitle(p.phase),
             detail: p.detail,
             pct: p.pct,
           })
@@ -7435,7 +9719,9 @@
         }
         setImportProgress("feedVirtualProgBar", {
           title: "Importing on server",
-          detail: "Parsing JSONL (large mixed snapshots can take a minute)…",
+          detail: feed.path && !feed.files.length
+            ? `Server is reading ${feed.path} (large mixed snapshots can take a minute)…`
+            : "Parsing JSONL (large mixed snapshots can take a minute)…",
           pct: null,
         });
         const res = await importVirtualFeedChunked(
@@ -7448,6 +9734,8 @@
             replace: true,
             create_scan: true,
             virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+            ...readHostPlatformFromForm(fd),
+            ...readScanTagsFromForm(fd),
           },
           (p) => setImportProgress("feedVirtualProgBar", {
             title: p.phase === "pack" ? "Packaging upload" : "Uploading to server",
@@ -7525,25 +9813,42 @@
     const hitCount = resRaw ? (resRaw.count ?? (resRaw.rows || []).length) : null;
     const filterMatch = res?._filterMatch;
     const filterTotal = res?._filterTotal;
+    const vizLabels = {
+      table: "Table",
+      timechart: "Timeline",
+      bar: "Bars",
+      single_value: "Single",
+    };
 
-    const statusText = searching
-      ? `Executing…`
+    const fieldsOpen = !!state._rplFieldsOpen;
+    ensureRplResultsPrefs();
+    const statusHtml = searching
+      ? `<span class="hunt-status-pill hunt-status-pill--run">Running…</span>`
       : hasSearched
-        ? `${Number(hitCount || 0).toLocaleString()} hit${hitCount === 1 ? "" : "s"}${elapsed != null ? ` · ${elapsed} ms` : ""}${resRaw?.engine ? ` · ${resRaw.engine}` : ""}`
-        : `Press Ctrl+Enter to run`;
+        ? `<span class="hunt-status-pill hunt-status-pill--hits">${Number(hitCount || 0).toLocaleString()} hit${hitCount === 1 ? "" : "s"}</span>
+           ${elapsed != null ? `<span class="hunt-status-pill">${elapsed} ms</span>` : ""}
+           ${resRaw?.engine ? `<span class="hunt-status-pill muted">${esc(resRaw.engine)}</span>` : ""}`
+        : `<span class="hunt-status-pill hunt-status-pill--idle">Ready · Ctrl+Enter to run</span>`;
 
     return `
-      <div class="search-workspace">
-        <aside class="fields-panel panel">
-          <div class="panel-head"><h3>Fields</h3></div>
+      <div class="search-workspace ${fieldsOpen ? "" : "search-workspace--fields-collapsed"}">
+        <aside class="fields-panel panel ${fieldsOpen ? "" : "is-collapsed"}" ${fieldsOpen ? "" : "hidden"}>
+          <div class="panel-head">
+            <h3>Browse fields</h3>
+            <div class="fields-panel-head-actions">
+              <span class="muted" style="font-size:0.72rem">${fields.length ? `${fields.length}` : "—"}</span>
+              <button type="button" class="btn ghost tiny" id="rplFieldsCollapse" title="Hide fields panel">Hide</button>
+            </div>
+          </div>
           <div class="fields-panel-body">
+            <p class="hunt-side-hint muted">Click a field to append it to the query.</p>
             <input id="rplFieldFilter" type="search" placeholder="Filter fields…" value="${esc(state._rplFieldFilter || "")}" />
             <div class="rpl-field-list" id="rplFieldList">
               ${renderRplFieldListHtml(fields, state._rplFieldFilter || "")}
             </div>
             <div class="rpl-saved">
               <div class="rpl-saved-head">
-                <span class="rpl-side-label">Saved</span>
+                <span class="rpl-side-label">Saved queries</span>
                 <button type="button" class="btn ghost tiny" id="rplSaveQuery" title="Save current query">Save</button>
               </div>
               ${saved.length
@@ -7552,24 +9857,39 @@
                     <button type="button" class="rpl-saved-load" data-rpl-load="${i}" title="${esc(s.query || "")}">${esc(s.name || s.query.slice(0, 40))}</button>
                     <button type="button" class="icon-btn" data-rpl-del="${i}" aria-label="Delete">×</button>
                   </div>`).join("")
-                : `<p class="rpl-side-empty muted">Save pins the current query here</p>`}
+                : `<p class="rpl-side-empty muted">Pin useful hunts with Save</p>`}
             </div>
           </div>
         </aside>
 
         <div class="search-workspace-main">
-          <nav class="rpl-tabs" role="tablist" aria-label="Hunt views">
-            <button type="button" class="rpl-tab ${tab === "results" ? "active" : ""}" data-rpl-tab="results">Hunt</button>
-            <button type="button" class="rpl-tab ${tab === "guide" ? "active" : ""}" data-rpl-tab="guide">Guide</button>
-            <button type="button" class="rpl-tab ${tab === "expr" ? "active" : ""}" data-rpl-tab="expr">Expr</button>
-          </nav>
+          <div class="hunt-topbar">
+            <nav class="rpl-tabs" role="tablist" aria-label="Hunt views">
+              <button type="button" class="rpl-tab ${tab === "results" ? "active" : ""}" data-rpl-tab="results">Results</button>
+              <button type="button" class="rpl-tab ${tab === "guide" ? "active" : ""}" data-rpl-tab="guide">Guide</button>
+              <button type="button" class="rpl-tab ${tab === "expr" ? "active" : ""}" data-rpl-tab="expr">Legacy expr</button>
+            </nav>
+            <div class="hunt-topbar-actions">
+              <button type="button" class="btn ghost tiny" id="rplFieldsToggle" aria-pressed="${fieldsOpen}" title="Show or hide Browse fields">
+                ${fieldsOpen ? "Hide fields" : "Browse fields"}
+              </button>
+              <p class="hunt-topbar-hint muted">RPL · filter → pipe → fields</p>
+            </div>
+          </div>
 
           ${tab === "guide" ? `<section class="panel rpl-guide-panel">${renderRplGuideHtml()}</section>` : ""}
 
           ${tab === "expr" ? `
           <section class="panel">
-            <div class="panel-head"><h3>Legacy expr hunt</h3><span class="muted">POST /v1/hunt</span></div>
+            <div class="panel-head">
+              <h3>Legacy expression hunt</h3>
+              <span class="muted">Store observations · POST /v1/hunt</span>
+            </div>
             <div class="rpl-expr-body">
+              <p class="muted" style="margin:0 0 0.75rem;font-size:0.82rem">
+                Prefer the <strong>Results</strong> tab for fleet event search. This path dry-runs a rule-style
+                <span class="mono">where</span> against stored observations.
+              </p>
               <form class="form" id="huntForm">
                 <label>Match stream
                   <select name="match_on">
@@ -7592,7 +9912,7 @@
           <section class="panel rpl-results-panel">
             <form class="search-command-card" id="rplHuntForm">
               <div class="search-query-shell">
-                <label class="search-query-label" for="rplQuery">Query</label>
+                <div class="hunt-step-label"><span class="hunt-step-num">1</span> Query <span class="muted">RPL</span></div>
                 <textarea name="query" id="rplQuery" spellcheck="false" placeholder='host_name="web-01" kind="process" | fields timestamp, process_name, process_id, user, path | head 200'>${esc(q)}</textarea>
                 <div class="search-history-drop" id="rplHistoryDrop" ${histOpen ? "" : "hidden"}>
                   ${history.length
@@ -7604,6 +9924,7 @@
               </div>
               <div class="search-toolbar">
                 <div class="search-toolbar-range">
+                  <div class="hunt-step-label hunt-step-label--inline"><span class="hunt-step-num">2</span> Time scope</div>
                   <div class="search-time-presets" role="group" aria-label="Time range">
                     ${[
                       ["1h", "1h"],
@@ -7625,38 +9946,47 @@
                   </label>
                 </div>
                 <div class="search-query-actions">
+                  <span class="hunt-step-label hunt-step-label--inline"><span class="hunt-step-num">3</span></span>
                   <button type="button" class="btn ghost search-history-toggle" id="rplHistoryToggle" title="Search history" aria-expanded="${histOpen}">
                     History${history.length ? `<span class="search-history-badge">${history.length}</span>` : ""}
                   </button>
-                  <button class="btn ghost" type="button" id="rplCompile">Compile</button>
-                  <button class="btn primary" type="submit" ${searching ? "disabled" : ""}>${searching ? "Running…" : "Run"}</button>
+                  <button class="btn ghost" type="button" id="rplCompile" title="Show compiled SQL without running">Compile</button>
+                  <button class="btn primary" type="submit" ${searching ? "disabled" : ""}>${searching ? "Running…" : "Run hunt"}</button>
                 </div>
               </div>
             </form>
 
-            <details class="rpl-examples-fold" ${hasSearched ? "" : "open"}>
-              <summary>Example hunts</summary>
+            <details class="rpl-examples-fold">
+              <summary>
+                <span>Starter queries</span>
+                <span class="muted">Collapsed · click to expand, then Run</span>
+              </summary>
               <div class="rpl-examples">${renderRplExampleChips()}</div>
             </details>
 
             <div class="search-results-toolbar ${searching ? "is-running" : hasSearched ? "is-ready" : "is-idle"}">
               <div class="search-status" role="status">
-                <span class="search-status-text">${esc(statusText)}</span>
+                <span class="hunt-step-label hunt-step-label--inline"><span class="hunt-step-num">4</span> Results</span>
+                ${statusHtml}
                 ${resRaw?.hint ? `<span class="rpl-hint">${esc(resRaw.hint)}</span>` : ""}
               </div>
               <div class="results-filter-bar">
                 <div class="results-filter-input-wrap">
-                  <input id="rplResultFilter" type="search" placeholder="Filter results…" value="${esc(filterVal)}" spellcheck="false" ${hasSearched ? "" : "disabled"} />
+                  <input id="rplResultFilter" type="search" placeholder="Filter these hits…" value="${esc(filterVal)}" spellcheck="false" ${hasSearched ? "" : "disabled"} />
                   ${filterVal ? `<button type="button" class="results-filter-clear" id="rplResultFilterClear" aria-label="Clear">×</button>` : ""}
                 </div>
-                <button type="button" class="btn ${filterRegex ? "primary" : "ghost"} tiny" id="rplResultFilterRegex" aria-pressed="${filterRegex}" ${hasSearched ? "" : "disabled"}>Regex</button>
+                <button type="button" class="btn ${filterRegex ? "primary" : "ghost"} tiny icon-action" id="rplResultFilterRegex" aria-pressed="${filterRegex}" title="Toggle regex filter" aria-label="Toggle regex filter" ${hasSearched ? "" : "disabled"}>${huntToolIcon("regex")}</button>
                 ${filterVal && filterMatch != null && filterTotal != null
                   ? `<span class="results-filter-count">${filterMatch.toLocaleString()} / ${filterTotal.toLocaleString()}</span>`
                   : ""}
                 ${res?._filterError ? `<span class="results-filter-error">${esc(res._filterError)}</span>` : ""}
                 ${hasSearched ? `
-                  <button type="button" class="btn ghost tiny" id="rplExportJson" title="Export filtered rows as JSON">JSON</button>
-                  <button type="button" class="btn ghost tiny" id="rplExportCsv" title="Export filtered rows as CSV">CSV</button>
+                  <div class="rpl-tool-actions" role="group" aria-label="Results actions">
+                    <button type="button" class="btn ghost tiny icon-action" id="rplCopyJson" title="Copy filtered rows as JSON" aria-label="Copy JSON">${huntToolIcon("copy")}</button>
+                    <button type="button" class="btn ghost tiny icon-action" id="rplExportJson" title="Download filtered rows as JSON" aria-label="Download JSON">${huntToolIcon("json")}</button>
+                    <button type="button" class="btn ghost tiny icon-action" id="rplExportCsv" title="Download filtered rows as CSV" aria-label="Download CSV">${huntToolIcon("csv")}</button>
+                    <button type="button" class="btn ghost tiny icon-action" id="rplFullscreenBtn" title="Open results fullscreen" aria-label="Full screen">${huntToolIcon("expand")}</button>
+                  </div>
                 ` : ""}
               </div>
             </div>
@@ -7664,10 +9994,10 @@
             ${hasSearched ? `
             <div class="rpl-chart-panel">
               <div class="rpl-chart-head">
-                <span class="rpl-chart-title">Results view</span>
+                <span class="rpl-chart-title">View</span>
                 <div class="rpl-viz-switch" role="group" aria-label="Result visualization">
                   ${["table", "timechart", "bar", "single_value"].map((m) => `
-                    <button type="button" class="btn ghost ${panelViz === m || (m === "bar" && panelViz === "stats") ? "active" : ""}" data-rpl-viz="${m}">${m === "single_value" ? "single" : m === "bar" ? "bar" : m}</button>
+                    <button type="button" class="btn ghost ${panelViz === m || (m === "bar" && panelViz === "stats") ? "active" : ""}" data-rpl-viz="${m}">${vizLabels[m] || m}</button>
                   `).join("")}
                 </div>
               </div>
@@ -7676,22 +10006,31 @@
                 : `<div id="rplChart" class="hidden"></div>`}
             </div>` : ""}
 
-            <div class="rpl-split ${hasSearched ? "" : "rpl-split-empty"}${hasSearched && panelViz !== "table" && panelViz !== "stats" ? " rpl-split-viz" : ""}">
+            <div class="rpl-split ${hasSearched ? "" : "rpl-split-empty"}${hasSearched && panelViz !== "table" && panelViz !== "stats" ? " rpl-split-viz" : ""}" id="rplSplit" ${state._rplResultsHeight ? `style="--rpl-results-h:${Number(state._rplResultsHeight)}px"` : ""}>
               <div class="rpl-results" id="rplResults">${hasSearched
                 ? renderRplPanelBody(res, panelViz, selected)
                 : `<div class="rpl-empty-state">
-                    <h3>Hunt ClickHouse events</h3>
-                    <p class="muted">Write an RPL query above, pick a time range, then Run. Open <strong>Example hunts</strong> for starters, or the Guide tab for syntax.</p>
+                    <div class="rpl-empty-mark" aria-hidden="true"></div>
+                    <h3>Search fleet events</h3>
+                    <p class="rpl-empty-lead muted">Write a query, set the time scope, then run — results land here.</p>
+                    <ol class="hunt-empty-steps">
+                      <li><strong>Write or pick a query</strong> — expand Starter queries, or open Browse fields.</li>
+                      <li><strong>Set the time scope</strong> — 1h / 24h / 7d, or From/To.</li>
+                      <li><strong>Run hunt</strong> — then click a row to inspect the full event.</li>
+                    </ol>
+                    <p class="muted rpl-empty-foot">Need syntax? Open the <strong>Guide</strong> tab.</p>
                   </div>`}</div>
               <div class="rpl-inspector-wrap ${hasSearched && (panelViz === "table" || !panelViz) ? "" : "hidden"}" id="rplInspector">${hasSearched && (panelViz === "table" || !panelViz) ? renderRplInspector(res, selected) : ""}</div>
+              <div class="rpl-resize-handle" id="rplResizeHandle" title="Drag to resize results" role="separator" aria-orientation="horizontal" aria-label="Resize results" tabindex="0"></div>
             </div>
             <details class="rpl-sql" ${sqlOpen ? "open" : ""} id="rplSqlDetails">
-              <summary>SQL preview</summary>
+              <summary>Compiled SQL <span class="muted">(advanced)</span></summary>
               <pre class="json mono" id="rplSql">${esc(resRaw?.sql || hist?.sql || "(run or compile a query)")}</pre>
             </details>
           </section>` : ""}
         </div>
-      </div>`;
+      </div>
+      ${hasSearched && state._rplFullscreen ? renderRplFullscreen(res, selected, filterVal, filterRegex) : ""}`;
   }
 
   function checks() {
@@ -7743,23 +10082,15 @@
                   <input type="checkbox" id="ruleEnabled" ${detail.enabled ? "checked" : ""} />
                   Enabled
                 </label>
-                <button type="button" class="btn ghost" id="btnValidateRule" title="Compile + dry-run over recent observations">Validate</button>
-                <button type="button" class="btn ghost" id="btnTestRule" title="Dry-run test (Mobipwn-style)">Test</button>
+                <button type="button" class="btn ghost" id="btnValidateRule" title="Compile + dry-run over scoped observations">Validate</button>
+                <button type="button" class="btn ghost" id="btnTestRule" title="Dry-run test on selected host/scan">Test</button>
                 <button type="button" class="btn ghost" id="btnReloadRule">Reload file</button>
-                <button type="button" class="btn primary" id="btnSaveRule">Save TOML</button>
+                <button type="button" class="btn primary" id="btnSaveRule" title="Apply details form into TOML and write to disk">Save</button>
                 <button type="button" class="btn ghost danger-text" id="btnDeleteRule" title="Delete this rule from disk">Delete</button>
               </div>
             </div>
-            <div class="rules-meta">
-              <span class="pill">${esc(detail.check_type)}</span>
-              ${sev(detail.severity)}
-              <span class="tag">${esc(detail.confidence || "")}</span>
-              <span class="tag">cost ${esc(detail.cost || "")}</span>
-              <span class="tag">v${esc(String(detail.version ?? ""))}</span>
-              <span class="tag mono">match ${esc(detail.match_on || "")}</span>
-            </div>
-            ${detail.rationale ? `<p class="rules-rationale">${esc(detail.rationale)}</p>` : ""}
-            ${(detail.attack || []).length ? `<div class="rules-attack">${(detail.attack || []).map((a) => `<span class="tag">${esc(a)}</span>`).join("")}</div>` : ""}
+            ${ruleTestScopePanelHtml()}
+            ${ruleDetailsFormHtml(detail)}
             <div class="rules-scan-toggles">
               <div class="rules-section-label">Active in scan profiles</div>
               <div class="rules-scan-grid">
@@ -7775,7 +10106,7 @@
             ${detail.is_anomark ? `
             <div class="rules-anomark-panel">
               <div class="rules-section-label">AnoMark post-scan</div>
-              <p class="muted" style="font-size:0.82rem;margin:0 0 0.55rem">Scores process inventories after scans. Enable the rule and toggle scan profiles above. Changes apply to the TOML when you click Apply → Save TOML.</p>
+              <p class="muted" style="font-size:0.82rem;margin:0 0 0.55rem">Scores process inventories after scans. Enable the rule and toggle scan profiles above. Changes apply to the TOML when you click Apply → Save.</p>
               <div class="ml-form-grid" id="ruleAnoMarkForm">
                 <label>Trained model
                   <select id="ruleAnomarkModel">
@@ -7798,14 +10129,30 @@
                 <button type="button" class="btn ghost" id="btnApplyAnoMarkRule">Apply to TOML editor</button>
               </div>
             </div>` : ""}
-            ${detail.is_anomark ? "" : `<div class="rules-section-label">Where expression</div>
-            <pre class="rules-code" id="ruleWherePreview">${highlightWhere(detail.where_expr || "")}</pre>`}
-            <div class="rules-section-label">Rule source (TOML)</div>
-            <div class="rules-editor-wrap">
-              <textarea id="ruleTomlEditor" class="rules-editor" spellcheck="false">${esc(detail.toml || "")}</textarea>
-              <pre class="rules-code rules-editor-hl" id="ruleTomlHighlight" aria-hidden="true">${highlightToml(detail.toml || "")}</pre>
-            </div>
-            <p class="muted mono" style="font-size:0.72rem;margin:0.4rem 0 0">${esc(detail.path || "")}</p>
+            ${detail.is_anomark ? "" : `
+            <div class="rules-editor-block">
+              <div class="rules-section-label">Detection logic <span class="muted mono">(where)</span></div>
+              <p class="muted rules-editor-hint">
+                <strong>Edit here day-to-day.</strong> This is the boolean expression that decides when the rule fires.
+                Save writes it into the TOML file below.
+              </p>
+              <textarea id="ruleWhereEditor" class="rules-where-editor" spellcheck="false" rows="8" title="Applied into TOML on Save">${esc(detail.where_expr || "")}</textarea>
+            </div>`}
+            <details class="rules-toml-details" ${detail.is_anomark ? "open" : ""}>
+              <summary>
+                Full rule file <span class="muted mono">(TOML)</span>
+                <span class="muted"> — advanced: metadata, [test], collectors; prefer the form + where above</span>
+              </summary>
+              <p class="muted rules-editor-hint">
+                Raw on-disk source. Use this for uncommon keys or when pasting a whole rule.
+                On Save, the details form and where editor are applied into this file first.
+              </p>
+              <div class="rules-editor-wrap">
+                <textarea id="ruleTomlEditor" class="rules-editor" spellcheck="false">${esc(detail.toml || "")}</textarea>
+                <pre class="rules-code rules-editor-hl" id="ruleTomlHighlight" aria-hidden="true">${highlightToml(detail.toml || "")}</pre>
+              </div>
+              <p class="muted mono" style="font-size:0.72rem;margin:0.4rem 0 0">${esc(detail.path || "")}</p>
+            </details>
             <div id="ruleSandbox" class="rules-sandbox ${state._ruleSandbox ? "" : "hidden"}">
               ${ruleSandboxHtml(state._ruleSandbox)}
             </div>
@@ -7857,6 +10204,255 @@
     </section>`;
   }
 
+  function ruleTestHostIds() {
+    if (Array.isArray(state._ruleTestHostIds) && state._ruleTestHostIds.length) {
+      return state._ruleTestHostIds.map(String).filter(Boolean);
+    }
+    if (state._ruleTestHostId) return [String(state._ruleTestHostId)];
+    return [];
+  }
+
+  function ruleTestScanMode() {
+    const hosts = ruleTestHostIds();
+    if (hosts.length !== 1) return "all";
+    return state._ruleTestScanMode === "specific" ? "specific" : "all";
+  }
+
+  function ruleTestSortedHosts() {
+    return (state.hosts || []).slice().sort((a, b) =>
+      String(a.display_name || "").localeCompare(String(b.display_name || ""))
+    );
+  }
+
+  function isVirtualHostRec(h) {
+    return !!h && (
+      String(h.agent_kind || "").toLowerCase() === "virtual"
+      || String(h.auth_status || "").toLowerCase() === "virtual"
+    );
+  }
+
+  function ruleTestHostsListHtml(filterQ = "") {
+    const q = String(filterQ || state._ruleTestHostFilter || "").trim().toLowerCase();
+    const selected = new Set(ruleTestHostIds());
+    const rows = ruleTestSortedHosts().filter((h) => {
+      if (!q) return true;
+      const hay = `${h.display_name || ""} ${h.id || ""} ${h.primary_addr || ""} ${h.agent_kind || ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+    if (!rows.length) {
+      return `<div class="rules-host-empty muted">${q ? "No hosts match filter" : "No hosts enrolled"}</div>`;
+    }
+    return rows.map((h) => {
+      const hid = String(h.id || "");
+      const virt = isVirtualHostRec(h);
+      const nScans = hostScansFor(hid).length;
+      const on = selected.has(hid);
+      return `<label class="rules-host-row ${on ? "on" : ""}">
+        <input type="checkbox" data-rule-test-host="${esc(hid)}" ${on ? "checked" : ""} />
+        <span class="rules-host-row-main">
+          <span class="rules-host-name">${esc(h.display_name || shortId(hid))}</span>
+          <span class="rules-host-meta muted">
+            ${virt ? `<span class="tag">virtual</span>` : ""}
+            <span class="mono">${esc(shortId(hid))}</span>
+            <span>${nScans} scan${nScans === 1 ? "" : "s"}</span>
+          </span>
+        </span>
+      </label>`;
+    }).join("");
+  }
+
+  function ruleTestScanOptionsHtml(hostId, selectedScanId) {
+    const hid = String(hostId || "").trim();
+    if (!hid) return "";
+    const scans = hostScansFor(hid);
+    return scans.map((s) => {
+      const j = s.job || {};
+      const m = s.meta || {};
+      const sid = String(j.id || m.scan_id || "");
+      if (!sid) return "";
+      const when = m.finished_at || j.created_at || "";
+      const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
+      const tags = (m.tags || []).length ? ` · ${(m.tags || []).slice(0, 3).join(",")}` : "";
+      const sel = String(selectedScanId || "") === sid ? "selected" : "";
+      return `<option value="${esc(sid)}" ${sel}>${esc(`${fmtWhen(when)} · ${setLabel}${tags} · ${shortId(sid)}`)}</option>`;
+    }).filter(Boolean).join("");
+  }
+
+  function ruleTestScopeSummary() {
+    const hosts = ruleTestHostIds();
+    if (!hosts.length) return "All hosts · recent observations";
+    if (hosts.length > 1) return `${hosts.length} hosts · all retained scans`;
+    const name = hostName(hosts[0]);
+    const n = hostScansFor(hosts[0]).length;
+    if (ruleTestScanMode() === "specific" && state._ruleTestScanId) {
+      return `${name} · scan ${shortId(state._ruleTestScanId)}`;
+    }
+    return `${name} · all ${n} retained scan${n === 1 ? "" : "s"}`;
+  }
+
+  function ruleTestScopePanelHtml() {
+    const hosts = ruleTestHostIds();
+    const single = hosts.length === 1;
+    const mode = ruleTestScanMode();
+    const filter = state._ruleTestHostFilter || "";
+    const scanCount = single ? hostScansFor(hosts[0]).length : 0;
+    return `
+      <div class="rules-test-scope">
+        <div class="rules-section-label">Dry-run scope</div>
+        <div class="rules-test-grid">
+          <div class="rules-test-hosts">
+            <div class="rules-test-hosts-head">
+              <input type="search" id="ruleTestHostFilter" placeholder="Filter hosts…" value="${esc(filter)}" autocomplete="off" />
+              <div class="rules-test-host-actions">
+                <button type="button" class="btn ghost tiny" id="ruleTestHostsAll" title="Select every host">All</button>
+                <button type="button" class="btn ghost tiny" id="ruleTestHostsVirtual" title="Select virtual agents only">Virtual</button>
+                <button type="button" class="btn ghost tiny" id="ruleTestHostsClear" title="Clear host selection">Clear</button>
+              </div>
+            </div>
+            <div class="rules-host-list" id="ruleTestHostList">
+              ${ruleTestHostsListHtml(filter)}
+            </div>
+            <p class="muted rules-test-hint">Check one or more hosts. Empty selection = fleet-wide recent observations.</p>
+          </div>
+          <div class="rules-test-scans">
+            <div class="rules-test-scans-title">Scans</div>
+            ${!hosts.length ? `
+              <p class="muted rules-test-hint">Select a host to choose all scans or a specific import/scan.</p>
+            ` : !single ? `
+              <p class="muted rules-test-hint">Multiple hosts selected — dry-run uses <strong>all retained scans</strong> for each host.</p>
+            ` : `
+              <div class="rules-scan-mode" role="radiogroup" aria-label="Scan scope">
+                <label class="rules-scan-mode-opt ${mode === "all" ? "on" : ""}">
+                  <input type="radio" name="ruleTestScanMode" value="all" ${mode === "all" ? "checked" : ""} />
+                  <span>
+                    <strong>All scans</strong>
+                    <span class="muted">Every retained scan for this host (${scanCount})</span>
+                  </span>
+                </label>
+                <label class="rules-scan-mode-opt ${mode === "specific" ? "on" : ""}">
+                  <input type="radio" name="ruleTestScanMode" value="specific" ${mode === "specific" ? "checked" : ""} ${scanCount ? "" : "disabled"} />
+                  <span>
+                    <strong>Specific scan</strong>
+                    <span class="muted">${scanCount ? "One import / scan snapshot" : "No scans retained yet"}</span>
+                  </span>
+                </label>
+              </div>
+              <label class="rules-test-scan-pick ${mode === "specific" ? "" : "is-disabled"}">Scan
+                <select id="ruleTestScan" ${mode === "specific" && scanCount ? "" : "disabled"}>
+                  <option value="">Choose a scan…</option>
+                  ${ruleTestScanOptionsHtml(hosts[0], state._ruleTestScanId)}
+                </select>
+              </label>
+            `}
+            <div class="rules-test-summary">
+              <span class="tag">Scope</span>
+              <span>${esc(ruleTestScopeSummary())}</span>
+            </div>
+          </div>
+        </div>
+        <p class="muted rules-test-hint" style="margin-top:0.55rem">
+          Validate / Test dry-run only — no findings are persisted. Use Hunt RPL from the sandbox to pivot.
+        </p>
+      </div>`;
+  }
+
+  function refreshRuleTestHostList() {
+    const list = $("#ruleTestHostList");
+    if (list) list.innerHTML = ruleTestHostsListHtml(state._ruleTestHostFilter || "");
+    wireRuleTestHostChecks();
+    refreshRuleTestScanPanel();
+  }
+
+  function refreshRuleTestScanPanel() {
+    const summary = document.querySelector(".rules-test-summary span:last-child");
+    if (summary) summary.textContent = ruleTestScopeSummary();
+    // Rebuild scan controls by re-rendering the scans column when host selection changes.
+    const scansCol = document.querySelector(".rules-test-scans");
+    if (!scansCol) return;
+    const hosts = ruleTestHostIds();
+    const single = hosts.length === 1;
+    const mode = ruleTestScanMode();
+    const scanCount = single ? hostScansFor(hosts[0]).length : 0;
+    const head = `<div class="rules-test-scans-title">Scans</div>`;
+    let body = "";
+    if (!hosts.length) {
+      body = `<p class="muted rules-test-hint">Select a host to choose all scans or a specific import/scan.</p>`;
+    } else if (!single) {
+      body = `<p class="muted rules-test-hint">Multiple hosts selected — dry-run uses <strong>all retained scans</strong> for each host.</p>`;
+    } else {
+      body = `
+        <div class="rules-scan-mode" role="radiogroup" aria-label="Scan scope">
+          <label class="rules-scan-mode-opt ${mode === "all" ? "on" : ""}">
+            <input type="radio" name="ruleTestScanMode" value="all" ${mode === "all" ? "checked" : ""} />
+            <span>
+              <strong>All scans</strong>
+              <span class="muted">Every retained scan for this host (${scanCount})</span>
+            </span>
+          </label>
+          <label class="rules-scan-mode-opt ${mode === "specific" ? "on" : ""}">
+            <input type="radio" name="ruleTestScanMode" value="specific" ${mode === "specific" ? "checked" : ""} ${scanCount ? "" : "disabled"} />
+            <span>
+              <strong>Specific scan</strong>
+              <span class="muted">${scanCount ? "One import / scan snapshot" : "No scans retained yet"}</span>
+            </span>
+          </label>
+        </div>
+        <label class="rules-test-scan-pick ${mode === "specific" ? "" : "is-disabled"}">Scan
+          <select id="ruleTestScan" ${mode === "specific" && scanCount ? "" : "disabled"}>
+            <option value="">Choose a scan…</option>
+            ${ruleTestScanOptionsHtml(hosts[0], state._ruleTestScanId)}
+          </select>
+        </label>`;
+    }
+    scansCol.innerHTML = `${head}${body}
+      <div class="rules-test-summary">
+        <span class="tag">Scope</span>
+        <span>${esc(ruleTestScopeSummary())}</span>
+      </div>`;
+    wireRuleTestScanControls();
+  }
+
+  function wireRuleTestHostChecks() {
+    $$("[data-rule-test-host]").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const ids = $$("[data-rule-test-host]:checked").map((el) => el.getAttribute("data-rule-test-host"));
+        state._ruleTestHostIds = ids;
+        state._ruleTestHostId = ids[0] || "";
+        if (ids.length !== 1) {
+          state._ruleTestScanMode = "all";
+          state._ruleTestScanId = "";
+        }
+        $$(".rules-host-row").forEach((row) => {
+          const input = row.querySelector("[data-rule-test-host]");
+          row.classList.toggle("on", !!(input && input.checked));
+        });
+        refreshRuleTestScanPanel();
+      });
+    });
+  }
+
+  function wireRuleTestScanControls() {
+    $$("input[name=ruleTestScanMode]").forEach((r) => {
+      r.addEventListener("change", () => {
+        state._ruleTestScanMode = r.value === "specific" ? "specific" : "all";
+        if (state._ruleTestScanMode !== "specific") state._ruleTestScanId = "";
+        refreshRuleTestScanPanel();
+      });
+    });
+    $("#ruleTestScan")?.addEventListener("change", (e) => {
+      state._ruleTestScanId = e.target.value || "";
+      state._ruleTestScanMode = state._ruleTestScanId ? "specific" : "all";
+      const summary = document.querySelector(".rules-test-summary span:last-child");
+      if (summary) summary.textContent = ruleTestScopeSummary();
+      $$(".rules-scan-mode-opt").forEach((lab) => {
+        const input = lab.querySelector("input");
+        lab.classList.toggle("on", !!(input && input.checked));
+      });
+      const pick = document.querySelector(".rules-test-scan-pick");
+      if (pick) pick.classList.toggle("is-disabled", state._ruleTestScanMode !== "specific");
+    });
+  }
+
   function ruleSandboxHtml(result) {
     if (!result) return "";
     if (result.error) {
@@ -7866,14 +10462,43 @@
     const dry = result.dry_run || {};
     const compile = result.compile || {};
     const sample = dry.sample || [];
+    const scope = result.scope || {};
+    const hostIds = Array.isArray(scope.host_ids)
+      ? scope.host_ids.map(String).filter(Boolean)
+      : (scope.host_id ? [String(scope.host_id)] : []);
+    const scopeHost = !hostIds.length
+      ? "all hosts"
+      : hostIds.length === 1
+        ? hostName(hostIds[0])
+        : `${hostIds.length} hosts (${hostIds.slice(0, 3).map((id) => hostName(id)).join(", ")}${hostIds.length > 3 ? ", …" : ""})`;
+    const scopeScan = scope.scan_id
+      ? shortId(scope.scan_id)
+      : (hostIds.length ? "all retained scans" : "fleet recent window");
+    const huntRpl = String(result.hunt_rpl || "").trim();
     return `
       <div class="rules-section-label">Rule sandbox <span class="muted">${esc(result.mode || result.source || "validate")}</span></div>
+      <p class="muted" style="margin:0.25rem 0 0.5rem;font-size:0.78rem">
+        Scope: <strong>${esc(scopeHost)}</strong>
+        · scan <span class="mono">${esc(scopeScan)}</span>
+      </p>
       <div class="stats" style="margin:0.5rem 0 0.75rem">
         <div class="stat"><div class="label">Observations</div><div class="value">${esc(String(dry.observations_scanned ?? 0))}</div></div>
         <div class="stat ${Number(dry.hit_count) > 0 ? "crit" : ""}"><div class="label">Hits</div><div class="value">${esc(String(dry.hit_count ?? 0))}</div></div>
         <div class="stat"><div class="label">Elapsed</div><div class="value">${esc(String(dry.elapsed_ms ?? 0))}ms</div></div>
         <div class="stat"><div class="label">Match</div><div class="value mono" style="font-size:0.85rem">${esc(compile.match_on || "—")}</div></div>
       </div>
+      ${huntRpl ? `
+      <details class="rules-hunt-rpl" id="ruleHuntRplBox">
+        <summary>Equivalent Hunt RPL <span class="muted">(optional — translate where → Hunt query)</span></summary>
+        <p class="muted" style="margin:0.45rem 0;font-size:0.75rem">
+          Best-effort translation of this rule’s <span class="mono">where</span> for analysts (globs, not full regex). Copy into Hunt → Results.
+        </p>
+        <pre class="rules-code mono" id="ruleHuntRpl" style="white-space:pre-wrap;word-break:break-word;max-height:10rem;overflow:auto">${esc(huntRpl)}</pre>
+        <div class="toolbar" style="margin:0.45rem 0 0.75rem;gap:0.45rem">
+          <button type="button" class="btn ghost tiny" id="btnCopyRuleRpl">Copy RPL</button>
+          <button type="button" class="btn primary tiny" id="btnOpenRuleInHunt">Open in Hunt</button>
+        </div>
+      </details>` : ""}
       ${!sample.length
         ? `<div class="empty" style="padding:0.75rem">No hits on scanned observations (dry-run — no findings created).</div>`
         : `<table class="data"><thead><tr><th>Severity</th><th>Title</th><th>Evidence</th></tr></thead><tbody>
@@ -7898,6 +10523,294 @@
     out = out.replace(/^(\s*)([A-Za-z_][\w-]*)(\s*=)/gm, `$1<span class="tok-key">$2</span>$3`);
     out = out.replace(/\b(id|version|name|type|severity|confidence|enabled|cost|match|where|title|evidence_fields|attack|rationale|collectors|false_positives|references)\b/g,
       `<span class="tok-key">$1</span>`);
+    return out;
+  }
+
+  const RULE_CHECK_TYPES = ["process", "file", "user", "directory", "log", "policy", "incident", "recon", "custom"];
+  const RULE_MATCH_KINDS = [
+    "process", "hidden_process", "socket", "hidden_socket", "file_meta", "file_entropy",
+    "elf_info", "preload", "account", "module", "ssh_host_key", "policy", "recon",
+    "scheduled_task", "service", "authorized_key", "dir_anomaly", "mount", "log_integrity",
+    "utmp_session", "container_info", "integrity_mismatch", "shadow_entry", "sudo_rule",
+    "bpf_prog", "timestomp", "ioc_hit", "container", "anomark",
+  ];
+  const RULE_SEVERITIES = ["critical", "high", "medium", "low", "info"];
+  const RULE_CONFIDENCES = ["high", "medium", "low"];
+  const RULE_COSTS = ["trivial", "low", "medium", "high"];
+
+  function wireRuleDetailsLiveColors() {
+    const panel = $(".rules-details-panel");
+    if (!panel) return;
+    const chips = panel.querySelector(".rules-details-chips");
+    const paint = () => {
+      const sevVal = String($("#ruleFieldSeverity")?.value || "info").toLowerCase();
+      const confVal = String($("#ruleFieldConfidence")?.value || "medium").toLowerCase();
+      const costVal = String($("#ruleFieldCost")?.value || "trivial").toLowerCase();
+      const typeVal = String($("#ruleFieldType")?.value || "custom").toLowerCase();
+      const matchVal = String($("#ruleFieldMatch")?.value || "").trim();
+      const attack = String($("#ruleFieldAttack")?.value || "")
+        .split(",").map((s) => s.trim()).filter(Boolean);
+      panel.className = `rules-details-panel rules-details-panel--${sevVal}`;
+      const sevEl = $("#ruleFieldSeverity");
+      if (sevEl) sevEl.className = `rules-select-sev rules-select-sev--${sevVal}`;
+      const confEl = $("#ruleFieldConfidence");
+      if (confEl) confEl.className = `rules-select-conf rules-select-conf--${confVal}`;
+      const costEl = $("#ruleFieldCost");
+      if (costEl) costEl.className = `rules-select-cost rules-select-cost--${costVal}`;
+      if (chips) {
+        const attackPreview = attack.slice(0, 3).map((a) =>
+          `<span class="rules-chip rules-chip--attack">${esc(a)}</span>`
+        ).join("");
+        const attackMore = attack.length > 3
+          ? `<span class="rules-chip rules-chip--more">+${attack.length - 3}</span>`
+          : "";
+        chips.innerHTML = `
+          ${sev(sevVal)}
+          <span class="rules-chip rules-chip--type">${esc(typeVal)}</span>
+          <span class="rules-chip rules-chip--conf rules-chip--conf-${esc(confVal)}">conf ${esc(confVal)}</span>
+          <span class="rules-chip rules-chip--cost rules-chip--cost-${esc(costVal)}">cost ${esc(costVal)}</span>
+          ${matchVal ? `<span class="rules-chip rules-chip--match mono">${esc(matchVal)}</span>` : ""}
+          ${attackPreview}${attackMore}`;
+      }
+    };
+    ["#ruleFieldSeverity", "#ruleFieldConfidence", "#ruleFieldCost", "#ruleFieldType", "#ruleFieldMatch"]
+      .forEach((sel) => $(sel)?.addEventListener("change", paint));
+    $("#ruleFieldAttack")?.addEventListener("input", paint);
+  }
+
+  function ruleDetailsFormHtml(detail) {
+    const d = detail || {};
+    const sevKey = String(d.severity || "info").toLowerCase();
+    const confKey = String(d.confidence || "medium").toLowerCase();
+    const costKey = String(d.cost || "trivial").toLowerCase();
+    const typeKey = String(d.check_type || "custom").toLowerCase();
+    const typeOpts = RULE_CHECK_TYPES.map((t) =>
+      `<option value="${t}" ${typeKey === t ? "selected" : ""}>${t}</option>`
+    ).join("");
+    const matchVal = d.match_on || "";
+    const matchOpts = Array.from(new Set([matchVal, ...RULE_MATCH_KINDS].filter(Boolean))).map((m) =>
+      `<option value="${esc(m)}" ${matchVal === m ? "selected" : ""}>${esc(m)}</option>`
+    ).join("");
+    const sevOpts = RULE_SEVERITIES.map((s) =>
+      `<option value="${s}" ${sevKey === s ? "selected" : ""}>${s}</option>`
+    ).join("");
+    const confOpts = RULE_CONFIDENCES.map((c) =>
+      `<option value="${c}" ${confKey === c ? "selected" : ""}>${c}</option>`
+    ).join("");
+    const costOpts = Array.from(new Set([costKey, ...RULE_COSTS].filter(Boolean))).map((c) =>
+      `<option value="${esc(c)}" ${costKey === c ? "selected" : ""}>${esc(c)}</option>`
+    ).join("");
+    const attackPreview = (d.attack || []).slice(0, 3).map((a) =>
+      `<span class="rules-chip rules-chip--attack">${esc(a)}</span>`
+    ).join("");
+    const attackMore = (d.attack || []).length > 3
+      ? `<span class="rules-chip rules-chip--more">+${(d.attack || []).length - 3}</span>`
+      : "";
+    return `
+      <details class="rules-details-panel rules-details-panel--${esc(sevKey)}">
+        <summary class="rules-details-summary">
+          <span class="rules-details-summary-title">Rule details</span>
+          <span class="rules-details-chips">
+            ${sev(sevKey)}
+            <span class="rules-chip rules-chip--type">${esc(typeKey)}</span>
+            <span class="rules-chip rules-chip--conf rules-chip--conf-${esc(confKey)}">conf ${esc(confKey)}</span>
+            <span class="rules-chip rules-chip--cost rules-chip--cost-${esc(costKey)}">cost ${esc(costKey)}</span>
+            ${matchVal ? `<span class="rules-chip rules-chip--match mono">${esc(matchVal)}</span>` : ""}
+            ${attackPreview}${attackMore}
+          </span>
+          <span class="rules-details-summary-hint muted">Expand to edit</span>
+        </summary>
+        <div class="rules-details-body">
+          <p class="muted rules-editor-hint">Edit severity, name, and other metadata here — Save applies these into the TOML and writes the file.</p>
+          <div class="ml-form-grid rules-details-grid" id="ruleDetailsForm">
+            <label class="rules-field rules-field--name">Name
+              <input id="ruleFieldName" type="text" value="${esc(d.name || "")}" />
+            </label>
+            <label class="rules-field rules-field--version">Version
+              <input id="ruleFieldVersion" type="number" min="1" step="1" value="${esc(String(d.version ?? 1))}" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--title">Title template
+              <input id="ruleFieldTitle" type="text" value="${esc(d.title || "")}" />
+            </label>
+            <label class="rules-field rules-field--type">Type
+              <select id="ruleFieldType">${typeOpts}</select>
+            </label>
+            <label class="rules-field rules-field--severity">Severity
+              <select id="ruleFieldSeverity" class="rules-select-sev rules-select-sev--${esc(sevKey)}">${sevOpts}</select>
+            </label>
+            <label class="rules-field rules-field--confidence">Confidence
+              <select id="ruleFieldConfidence" class="rules-select-conf rules-select-conf--${esc(confKey)}">${confOpts}</select>
+            </label>
+            <label class="rules-field rules-field--cost">Cost
+              <select id="ruleFieldCost" class="rules-select-cost rules-select-cost--${esc(costKey)}">${costOpts}</select>
+            </label>
+            <label class="rules-field rules-field--match">Match stream
+              <select id="ruleFieldMatch">${matchOpts}</select>
+            </label>
+            <label class="rules-field rules-field--kill">Kill chain
+              <input id="ruleFieldKillChain" type="text" value="${esc(d.kill_chain || "")}" placeholder="optional" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--attack">ATT&amp;CK techniques <span class="muted">(comma-separated)</span>
+              <input id="ruleFieldAttack" type="text" value="${esc((d.attack || []).join(", "))}" placeholder="T1059.006, T1003" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--evidence">Evidence fields <span class="muted">(comma-separated)</span>
+              <input id="ruleFieldEvidence" type="text" value="${esc((d.evidence_fields || []).join(", "))}" placeholder="path, pid, cmdline" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--collectors">Collectors <span class="muted">(comma-separated)</span>
+              <input id="ruleFieldCollectors" type="text" value="${esc((d.collectors || []).join(", "))}" placeholder="process.inventory" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--refs">References <span class="muted">(comma-separated URLs)</span>
+              <input id="ruleFieldReferences" type="text" value="${esc((d.references || []).join(", "))}" />
+            </label>
+            <label class="ml-span-2 rules-field rules-field--rationale">Rationale
+              <textarea id="ruleFieldRationale" rows="3">${esc(d.rationale || "")}</textarea>
+            </label>
+            <label class="ml-span-2 rules-field rules-field--fp">False positives
+              <textarea id="ruleFieldFalsePositives" rows="2">${esc(d.false_positives || "")}</textarea>
+            </label>
+          </div>
+        </div>
+      </details>`;
+  }
+
+  function tomlQuoteString(s) {
+    return JSON.stringify(String(s ?? ""));
+  }
+
+  function tomlQuoteMultiline(s) {
+    const body = String(s ?? "").replace(/\r\n/g, "\n");
+    if (!body.includes("'''")) return `'''\n${body}\n'''`;
+    if (!body.includes('"""')) return `"""\n${body}\n"""`;
+    return tomlQuoteString(body);
+  }
+
+  function tomlFormatArray(arr) {
+    return `[${(arr || []).map(tomlQuoteString).join(", ")}]`;
+  }
+
+  function splitTomlRootTables(text) {
+    const src = String(text || "");
+    const m = src.match(/^\[/m);
+    if (!m || m.index == null) return { root: src, tables: "" };
+    return { root: src.slice(0, m.index), tables: src.slice(m.index) };
+  }
+
+  function removeTomlRootKey(root, key) {
+    const escKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `^${escKey}\\s*=\\s*(?:'''[\\s\\S]*?'''|"""[\\s\\S]*?"""|"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|true|false|-?\\d+(?:\\.\\d+)?|\\[[\\s\\S]*?\\])\\s*(?:\\r?\\n|$)`,
+      "m"
+    );
+    return String(root || "").replace(re, "");
+  }
+
+  function setTomlRootKey(text, key, formattedValue) {
+    const { root, tables } = splitTomlRootTables(text);
+    const escKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `^${escKey}\\s*=\\s*(?:'''[\\s\\S]*?'''|"""[\\s\\S]*?"""|"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|true|false|-?\\d+(?:\\.\\d+)?|\\[[\\s\\S]*?\\])\\s*(?:\\r?\\n|$)`,
+      "m"
+    );
+    const line = `${key} = ${formattedValue}\n`;
+    let nextRoot;
+    if (re.test(root)) {
+      nextRoot = root.replace(re, line);
+    } else {
+      nextRoot = removeTomlRootKey(root, key).replace(/\n{3,}/g, "\n\n");
+      if (nextRoot && !nextRoot.endsWith("\n")) nextRoot += "\n";
+      nextRoot += line;
+    }
+    return nextRoot + tables;
+  }
+
+  function csvFieldList(sel) {
+    return String($(sel)?.value || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function readRuleDetailsForm() {
+    const whereEl = $("#ruleWhereEditor");
+    return {
+      name: ($("#ruleFieldName")?.value || "").trim(),
+      version: Number($("#ruleFieldVersion")?.value || 1),
+      title: ($("#ruleFieldTitle")?.value || "").trim(),
+      type: ($("#ruleFieldType")?.value || "").trim(),
+      severity: ($("#ruleFieldSeverity")?.value || "").trim(),
+      confidence: ($("#ruleFieldConfidence")?.value || "").trim(),
+      cost: ($("#ruleFieldCost")?.value || "").trim(),
+      match: ($("#ruleFieldMatch")?.value || "").trim(),
+      kill_chain: ($("#ruleFieldKillChain")?.value || "").trim(),
+      attack: csvFieldList("#ruleFieldAttack"),
+      evidence_fields: csvFieldList("#ruleFieldEvidence"),
+      collectors: csvFieldList("#ruleFieldCollectors"),
+      references: csvFieldList("#ruleFieldReferences"),
+      rationale: ($("#ruleFieldRationale")?.value || "").trim(),
+      false_positives: ($("#ruleFieldFalsePositives")?.value || "").trim(),
+      where: whereEl ? whereEl.value : null,
+    };
+  }
+
+  function applyRuleDetailsToToml(text, fields) {
+    let out = String(text || "");
+    if (!fields) return out;
+    if (fields.name) out = setTomlRootKey(out, "name", tomlQuoteString(fields.name));
+    if (Number.isFinite(fields.version) && fields.version > 0) {
+      out = setTomlRootKey(out, "version", String(Math.floor(fields.version)));
+    }
+    if (fields.title != null) out = setTomlRootKey(out, "title", tomlQuoteString(fields.title));
+    if (fields.type) out = setTomlRootKey(out, "type", tomlQuoteString(fields.type));
+    if (fields.severity) out = setTomlRootKey(out, "severity", tomlQuoteString(fields.severity));
+    if (fields.confidence) out = setTomlRootKey(out, "confidence", tomlQuoteString(fields.confidence));
+    if (fields.cost) out = setTomlRootKey(out, "cost", tomlQuoteString(fields.cost));
+    if (fields.match) out = setTomlRootKey(out, "match", tomlQuoteString(fields.match));
+    out = setTomlRootKey(out, "attack", tomlFormatArray(fields.attack || []));
+    out = setTomlRootKey(out, "evidence_fields", tomlFormatArray(fields.evidence_fields || []));
+    out = setTomlRootKey(out, "collectors", tomlFormatArray(fields.collectors || []));
+    out = setTomlRootKey(out, "references", tomlFormatArray(fields.references || []));
+    if (fields.rationale) {
+      out = setTomlRootKey(out, "rationale", tomlQuoteString(fields.rationale));
+    } else {
+      const { root, tables } = splitTomlRootTables(out);
+      out = removeTomlRootKey(root, "rationale") + tables;
+    }
+    if (fields.false_positives) {
+      out = setTomlRootKey(out, "false_positives", tomlQuoteString(fields.false_positives));
+    } else {
+      const { root, tables } = splitTomlRootTables(out);
+      out = removeTomlRootKey(root, "false_positives") + tables;
+    }
+    if (fields.kill_chain) {
+      out = setTomlRootKey(out, "kill_chain", tomlQuoteString(fields.kill_chain));
+    } else {
+      const { root, tables } = splitTomlRootTables(out);
+      out = removeTomlRootKey(root, "kill_chain") + tables;
+    }
+    if (typeof fields.where === "string") {
+      out = setTomlRootKey(out, "where", tomlQuoteMultiline(fields.where));
+    }
+    return out;
+  }
+
+  function applyAnoMarkFormToToml(text) {
+    const model = ($("#ruleAnomarkModel")?.value || "").trim();
+    const suspect = Number($("#ruleAnomarkSuspect")?.value || 95);
+    const maxCmd = Number($("#ruleAnomarkMax")?.value || 5000);
+    const tags = String($("#ruleAnomarkTags")?.value || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const tagsToml = tags.length
+      ? `tags = [${tags.map((t) => JSON.stringify(t)).join(", ")}]`
+      : "tags = []";
+    const block = `[anomark]\nmodel_id = ${JSON.stringify(model)}\nsuspect_percent = ${suspect}\n${tagsToml}\nmax_commands = ${maxCmd}\n`;
+    let out = String(text || "");
+    if (/^\[anomark\]/m.test(out)) {
+      out = out.replace(/^\[anomark\][\s\S]*?(?=^\[|\z)/m, block);
+    } else {
+      out = `${out.trimEnd()}\n\n${block}`;
+    }
     return out;
   }
 
@@ -8927,7 +11840,11 @@
         </div>
       `);
       $$("[data-goto]", $("#drawerBody")).forEach((b) => {
-        b.addEventListener("click", () => { closeDrawer(); setView(b.dataset.goto); });
+        b.addEventListener("click", () => {
+          closeDrawer();
+          const tab = b.getAttribute("data-settings-tab");
+          setView(b.dataset.goto, tab ? { settingsTab: tab } : undefined);
+        });
       });
     } catch (err) {
       toast(err.message);
@@ -9039,11 +11956,12 @@
 
   function hostAgentInfo(h) {
     if (isVirtualHost(h)) {
+      const profile = String(h.labels?.virtual_agent || h.labels?.virtual_agent_id || "").trim();
       return {
         id: "virtual",
         title: "Virtual",
         short: "virtual",
-        detail: "log ingest · no SSH",
+        detail: profile ? `profile · ${profile}` : "log ingest · no SSH",
       };
     }
     if (isAgentLiteHost(h)) {
@@ -9059,6 +11977,79 @@
       title: "SSH probe",
       short: "ssh",
       detail: "ephemeral binary over SSH",
+    };
+  }
+
+  /** Exact agent used for a scan (host kind + delivery / probe clues). */
+  function scanAgentInfo(status) {
+    const job = status?.job || {};
+    const meta = status?.meta || {};
+    const hostId = job.host_id || meta.host_id || "";
+    const host = hostId
+      ? (state.hostById?.[hostId]
+        || (state.hosts || []).find((h) => String(h.id) === String(hostId))
+        || null)
+      : null;
+    const probe = String(meta.probe_version || "").trim();
+    const delivery = String(meta.delivery?.method || "").toLowerCase();
+    const fallback = String(meta.delivery?.fallback_reason || "");
+    const nodeId = meta.node_id || job.leased_by || "";
+    const node = nodeId
+      ? (state.nodes || []).find((n) => String(n.id || n.node_id || "") === String(nodeId))
+      : null;
+    const nodeLabel = node
+      ? (node.display_name || node.hostname || node.name || String(nodeId))
+      : (nodeId ? String(nodeId) : "");
+
+    const looksVirtual = probe === "virtual-import"
+      || /tree-import|feed-import|rehydrate/i.test(fallback)
+      || (host && isVirtualHost(host));
+    if (looksVirtual) {
+      const profile = String(host?.labels?.virtual_agent || host?.labels?.virtual_agent_id || "").trim();
+      return {
+        id: "virtual",
+        title: "Virtual",
+        detail: profile
+          ? `ingest profile · ${profile}`
+          : "log ingest · no live agent",
+        probe: probe || "virtual-import",
+        delivery: delivery || "pure_command",
+        node: nodeLabel,
+      };
+    }
+
+    // Prefer the host's configured agent; fall back to delivery clues when host is gone.
+    if (host) {
+      const info = hostAgentInfo(host);
+      return {
+        id: info.id,
+        title: info.title,
+        detail: info.detail,
+        probe: probe || "—",
+        delivery: delivery || (info.id === "agentlite" ? "pure_command" : "memfd"),
+        node: nodeLabel,
+      };
+    }
+
+    if (delivery === "pure_command"
+      || String(meta.delivery?.encoder || "").toLowerCase().includes("command")) {
+      return {
+        id: "agentlite",
+        title: "AgentLite",
+        detail: "SSH commands only · no binary",
+        probe: probe || "—",
+        delivery: delivery || "pure_command",
+        node: nodeLabel,
+      };
+    }
+
+    return {
+      id: "ssh",
+      title: "SSH probe",
+      detail: "ephemeral binary over SSH",
+      probe: probe || "—",
+      delivery: delivery || "memfd",
+      node: nodeLabel,
     };
   }
 
@@ -9220,11 +12211,19 @@
       return `<section class="panel"><div class="empty">Loading data summary…</div></section>`;
     }
     const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString());
-    const fmtBytes = (n) => {
-      const v = Number(n || 0);
-      if (v < 1024) return `${v} B`;
-      if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KiB`;
-      return `${(v / (1024 * 1024)).toFixed(1)} MiB`;
+    const cb = s.component_bytes || (s.storage && s.storage.components) || {};
+    const sizeOf = (id) => {
+      if (id === "virtual_ingest") return s.virtual_ingest_bytes ?? cb.virtual_ingest ?? null;
+      if (id === "events") {
+        return s.events_bytes
+          ?? cb.events
+          ?? (s.storage && s.storage.events_bytes)
+          ?? null;
+      }
+      if (id === "platform_blobs") return cb.platform_blobs ?? (s.storage && s.storage.platform_bytes) ?? null;
+      if (id === "ssh_identities") return cb.ssh_identities ?? (s.storage && s.storage.ssh_identities_bytes) ?? null;
+      if (id === "ssh_passwords") return cb.ssh_passwords ?? (s.storage && s.storage.ssh_passwords_bytes) ?? null;
+      return cb[id] != null ? cb[id] : null;
     };
     const clearable = [
       {
@@ -9234,18 +12233,21 @@
             id: "hosts",
             title: "Hosts",
             count: s.hosts ?? 0,
+            bytes: sizeOf("hosts"),
             blurb: "Enrolled fleet (also drops host-scoped scans, findings, baselines, and hunter placements).",
           },
           {
             id: "ssh_hunter",
             title: "SSH hunter keys",
             count: (s.ssh_keys ?? 0) + (s.ssh_placements ?? 0),
+            bytes: sizeOf("ssh_hunter"),
             blurb: `${fmt(s.ssh_keys)} key records · ${fmt(s.ssh_placements)} placements.`,
           },
           {
             id: "ssh_zones",
             title: "SSH zones",
             count: s.ssh_zones ?? 0,
+            bytes: sizeOf("ssh_zones"),
             blurb: "SSH hunter security zones.",
           },
         ],
@@ -9253,12 +12255,12 @@
       {
         group: "Operational",
         items: [
-          { id: "findings", title: "Findings", count: s.findings ?? 0, blurb: "Alert findings (Findings view, deep links)." },
-          { id: "scans", title: "Scans", count: s.scans ?? 0, blurb: "Scan jobs, queue history, and coverage metas." },
-          { id: "observations", title: "Observations", count: s.observations ?? 0, blurb: "Raw probe observations (process, sockets, …)." },
-          { id: "activity", title: "Activity", count: s.activity ?? 0, blurb: "Operator / scan progress activity feed." },
-          { id: "baselines", title: "Baselines", count: s.baselines ?? 0, blurb: "Per-host integrity / drift baseline snapshots." },
-          { id: "host_keys", title: "Host key pins", count: s.host_keys ?? 0, blurb: "Pinned SSH host keys used for auth trust." },
+          { id: "findings", title: "Findings", count: s.findings ?? 0, bytes: sizeOf("findings"), blurb: "Alert findings (Findings view, deep links)." },
+          { id: "scans", title: "Scans", count: s.scans ?? 0, bytes: sizeOf("scans"), blurb: "Scan jobs, queue history, and coverage metas." },
+          { id: "observations", title: "Observations", count: s.observations ?? 0, bytes: sizeOf("observations"), blurb: "Raw probe observations (process, sockets, …)." },
+          { id: "activity", title: "Activity", count: s.activity ?? 0, bytes: sizeOf("activity"), blurb: "Operator / scan progress activity feed." },
+          { id: "baselines", title: "Baselines", count: s.baselines ?? 0, bytes: sizeOf("baselines"), blurb: "Per-host integrity / drift baseline snapshots." },
+          { id: "host_keys", title: "Host key pins", count: s.host_keys ?? 0, bytes: sizeOf("host_keys"), blurb: "Pinned SSH host keys used for auth trust." },
         ],
       },
       {
@@ -9268,8 +12270,9 @@
             id: "events",
             title: "ClickHouse events",
             count: s.events == null ? "—" : s.events,
+            bytes: sizeOf("events"),
             blurb: s.clickhouse
-              ? "Hunt / RPL ingest rows (events + detection_signals)."
+              ? "Hunt / RPL ingest rows (events + detection_signals). On-disk size from ClickHouse system.parts."
               : "ClickHouse not configured — events cannot be cleared.",
             disabled: !s.clickhouse,
           },
@@ -9277,7 +12280,10 @@
             id: "virtual_ingest",
             title: "Virtual ingest",
             count: s.virtual_ingest_hosts ?? 0,
-            blurb: `JSONL caches under .dev/ingest (${fmtBytes(s.virtual_ingest_bytes)}). Cleared with matching ClickHouse blobs.`,
+            bytes: sizeOf("virtual_ingest"),
+            blurb: (s.virtual_ingest_storage || s.storage?.virtual_ingest_storage) === "clickhouse"
+              ? `Durable ClickHouse platform blobs (processes / files / provenance). Local staging under ${esc((s.storage && s.storage.virtual_ingest_path) || ".dev/ingest")} is purged after sync.`
+              : `Local staging under ${esc((s.storage && s.storage.virtual_ingest_path) || ".dev/ingest")} (ClickHouse unset).`,
           },
         ],
       },
@@ -9288,12 +12294,14 @@
             id: "ssh_identities",
             title: "SSH private keys",
             count: s.ssh_identities_count ?? 0,
+            bytes: sizeOf("ssh_identities"),
             blurb: `Node-sealed identities in the control-plane database (${fmt(s.hosts_with_ssh_identity)} host(s) reference one).`,
           },
           {
             id: "ssh_passwords",
             title: "SSH passwords",
             count: s.ssh_passwords_count ?? 0,
+            bytes: sizeOf("ssh_passwords"),
             blurb: `Node-sealed passwords in the control-plane database (${fmt(s.hosts_with_ssh_password)} host(s) reference one).`,
           },
         ],
@@ -9308,12 +12316,12 @@
         ${!(rows || []).length
           ? `<div class="empty" style="padding:0.65rem 0">${esc(emptyMsg)}</div>`
           : `<div class="data-table-wrap"><table class="data"><thead><tr>
-              <th>Id</th><th>Size</th><th>Sealed</th><th>Updated</th><th>Used by</th>
+              <th>Id</th><th class="data-size-cell">Size</th><th>Sealed</th><th>Updated</th><th>Used by</th>
             </tr></thead><tbody>
               ${(rows || []).map((f) => `
                 <tr>
                   <td class="mono" title="${esc(f.path || "")}">${esc(f.name)}</td>
-                  <td class="mono">${fmtBytes(f.bytes)}</td>
+                  <td class="data-size-cell">${sizeHtml(f.bytes)}</td>
                   <td>${f.sealed
                     ? `<span class="tag">node-sealed</span>`
                     : `<span class="tag" title="Legacy plaintext — re-upload to seal">legacy</span>`}</td>
@@ -9324,15 +12332,113 @@
                 </tr>`).join("")}
             </tbody></table></div>`}
       </div>`;
+    const st = s.storage || {};
+    const chTables = s.clickhouse_tables || st.clickhouse_tables || [];
+    const chBytes = s.clickhouse_bytes ?? st.clickhouse_bytes ?? null;
+    const localBytes = st.local_bytes ?? (
+      Number(s.virtual_ingest_bytes || 0)
+      + Number(st.credentials_bytes || 0)
+      + Number(st.store_bytes || 0)
+      + Number(st.platform_bytes || 0)
+    );
+    const totalBytes = st.total_bytes ?? (
+      Number(localBytes || 0) + Number(chBytes || 0)
+    );
+    const chDb = s.clickhouse_db || st.clickhouse_db || "rustmite";
+    const eventsBytes = sizeOf("events");
+    const tableLabel = (name) => ({
+      events: "Events",
+      detection_signals: "Detection signals",
+      cp_entities: "Control plane",
+      rm_platform_blobs: "Platform blobs",
+    }[name] || name);
     return `
       <div class="stats">
+        <div class="stat"><div class="label">Total size</div><div class="value">${sizeHtml(totalBytes)}</div><div class="hint">local + ClickHouse</div></div>
+        <div class="stat"><div class="label">ClickHouse</div><div class="value">${sizeHtml(chBytes)}</div><div class="hint">${s.clickhouse ? esc(chDb) : "unset"}</div></div>
         <div class="stat"><div class="label">Findings</div><div class="value">${fmt(s.findings)}</div><div class="hint">alerts</div></div>
         <div class="stat"><div class="label">Scans</div><div class="value">${fmt(s.scans)}</div><div class="hint">jobs + metas</div></div>
-        <div class="stat"><div class="label">Events</div><div class="value">${fmt(s.events)}</div><div class="hint">${s.clickhouse ? "ClickHouse" : "CH unset"}</div></div>
+        <div class="stat"><div class="label">Events</div><div class="value">${fmt(s.events)}</div><div class="hint">${eventsBytes != null ? sizeHtml(eventsBytes) : (s.clickhouse ? "ClickHouse" : "CH unset")}</div></div>
         <div class="stat"><div class="label">SSH identities</div><div class="value">${fmt(s.ssh_identities_count)}</div><div class="hint">in database</div></div>
         <div class="stat"><div class="label">SSH passwords</div><div class="value">${fmt(s.ssh_passwords_count)}</div><div class="hint">in database</div></div>
         <div class="stat"><div class="label">SSH keys</div><div class="value">${fmt(s.ssh_keys)}</div><div class="hint">${fmt(s.ssh_placements)} placements</div></div>
       </div>
+      <section class="panel">
+        <div class="panel-head">
+          <h3>Storage used</h3>
+          <span class="muted">On-disk / sealed payload sizes</span>
+        </div>
+        <div class="data-storage-grid">
+          <div class="data-storage-card is-total">
+            <div class="label">Total</div>
+            <div class="value">${sizeHtml(totalBytes)}</div>
+            <div class="hint">local ${sizeHtml(localBytes)} + ClickHouse ${sizeHtml(chBytes)}</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">ClickHouse</div>
+            <div class="value">${sizeHtml(chBytes)}</div>
+            <div class="hint">${s.clickhouse ? `${esc(chDb)} · ${fmt(chTables.length)} table(s)` : "not configured"}</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">Virtual ingest</div>
+            <div class="value">${sizeHtml(st.virtual_ingest_bytes ?? s.virtual_ingest_bytes)}</div>
+            <div class="hint" title="${esc(st.virtual_ingest_storage === "clickhouse" ? "rm_platform_blobs" : (st.virtual_ingest_path || ".dev/ingest"))}">${fmt(st.virtual_ingest_hosts ?? s.virtual_ingest_hosts)} host(s) · ${esc(st.virtual_ingest_storage || s.virtual_ingest_storage || "local_cache")}${Number(st.virtual_ingest_local_bytes || 0) > 0 ? ` · local staging ${sizeHtml(st.virtual_ingest_local_bytes)}` : ""}</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">Control-plane store</div>
+            <div class="value">${sizeHtml(st.store_bytes)}</div>
+            <div class="hint mono" title="${esc(st.store_path || "store.json")}">${esc(st.store_path || "store.json")}</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">Platform cache</div>
+            <div class="value">${sizeHtml(st.platform_bytes)}</div>
+            <div class="hint" title="${esc(st.platform_path || ".dev/sift-platform")}">${esc(st.platform_path || ".dev/sift-platform")}${s.clickhouse ? ` · ${fmt(s.platform_blobs)} CH blob(s)` : ""}</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">Credentials</div>
+            <div class="value">${sizeHtml(st.credentials_bytes)}</div>
+            <div class="hint">sealed identities + passwords in DB</div>
+          </div>
+          <div class="data-storage-card">
+            <div class="label">Hunt events</div>
+            <div class="value">${sizeHtml(eventsBytes)}</div>
+            <div class="hint">${s.clickhouse ? `${fmt(s.events)} row(s) · events + signals` : "ClickHouse unset"}</div>
+          </div>
+        </div>
+        ${s.clickhouse ? `
+        <div class="data-storage-subhead">ClickHouse tables <span class="muted">(${esc(chDb)} · bytes on disk)</span></div>
+        <div class="data-storage-grid data-storage-grid--compact">
+          ${!(chTables || []).length
+            ? `<div class="data-storage-card"><div class="label">Tables</div><div class="value">${sizeHtml(0)}</div><div class="hint">no active parts yet</div></div>`
+            : chTables.map((t) => `
+            <div class="data-storage-card">
+              <div class="label">${esc(tableLabel(t.table))}</div>
+              <div class="value">${sizeHtml(t.bytes)}</div>
+              <div class="hint mono" title="${esc(t.table)}">${esc(t.table)} · ${fmt(t.rows)} row(s)</div>
+            </div>`).join("")}
+        </div>` : ""}
+        <div class="data-storage-subhead">Store components <span class="muted">(approx. JSON size)</span></div>
+        <div class="data-storage-grid data-storage-grid--compact">
+          ${[
+            ["Hosts", cb.hosts],
+            ["Findings", cb.findings],
+            ["Scans", cb.scans],
+            ["Observations", cb.observations],
+            ["Activity", cb.activity],
+            ["Baselines", cb.baselines],
+            ["Host keys", cb.host_keys],
+            ["SSH hunter", cb.ssh_hunter],
+            ["SSH zones", cb.ssh_zones],
+            ["SSH identities", cb.ssh_identities ?? (s.storage && s.storage.ssh_identities_bytes)],
+            ["SSH passwords", cb.ssh_passwords ?? (s.storage && s.storage.ssh_passwords_bytes)],
+            ["Nodes", cb.nodes],
+          ].map(([label, bytes]) => `
+            <div class="data-storage-card">
+              <div class="label">${esc(label)}</div>
+              <div class="value">${sizeHtml(bytes)}</div>
+            </div>`).join("")}
+        </div>
+      </section>
       <section class="panel">
         <div class="panel-head">
           <h3>Stored credentials</h3>
@@ -9366,8 +12472,14 @@
               <div class="data-clear-row">
                 <div class="data-clear-main">
                   <strong>${esc(r.title)}</strong>
+                  <span class="muted">${typeof r.blurb === "string" ? r.blurb : ""}</span>
+                </div>
+                <div class="data-clear-metrics">
                   <span class="mono data-clear-count">${typeof r.count === "number" ? r.count.toLocaleString() : esc(String(r.count))}</span>
-                  <span class="muted">${esc(r.blurb)}</span>
+                  ${sizeHtml(r.bytes, {
+                    na: r.id === "events" ? "n/a" : "—",
+                    title: r.bytes == null ? "Size not measured" : "Approximate stored size",
+                  })}
                 </div>
                 <button type="button" class="btn danger" data-clear-target="${esc(r.id)}" ${r.disabled ? "disabled" : ""}>Clear</button>
               </div>
@@ -10541,10 +13653,44 @@
         <div class="finding-detail-title">${esc(f.title || "Finding")}</div>
         <div class="finding-detail-meta">
           ${sev(f.severity)}
+          ${findingStatusBadge(f)}
           <span class="pill">${esc(f.check_id)}</span>
           <span class="muted">${esc(fmtWhen(when.finished || when.seen))}</span>
         </div>
       </div>
+      ${(() => {
+        const siblings = findingSiblingCount(f);
+        const multi = siblings > 1;
+        return `<div class="finding-triage">
+        <div class="finding-triage-head">
+          <div>
+            <h3>Classification</h3>
+            <p class="muted findings-sub">${f.suppressed_by ? `Set by ${esc(f.suppressed_by)}. ` : ""}${
+              multi
+                ? `This check fired ${siblings}× on this host. <strong>False positive</strong> covers all of them and future scans; <strong>True positive</strong> is only this occurrence.`
+                : "False positive hides this host + check from Open (including future scans)."
+            }</p>
+          </div>
+        </div>
+        <div class="finding-classify" role="group" aria-label="Classification">
+          <button type="button" class="finding-classify-opt ${findingStatusKey(f) === "true_positive" ? "is-active is-tp" : ""}" data-classify-finding="${esc(f.id)}" data-status="true_positive">
+            <span class="finding-classify-label">True positive</span>
+            <span class="finding-classify-hint">This occurrence</span>
+          </button>
+          <button type="button" class="finding-classify-opt ${findingStatusKey(f) === "false_positive" || findingStatusKey(f) === "suppressed" ? "is-active is-fp" : ""}" data-classify-finding="${esc(f.id)}" data-status="false_positive">
+            <span class="finding-classify-label">False positive</span>
+            <span class="finding-classify-hint">${multi ? `Host + check (${siblings})` : "Host + check"}</span>
+          </button>
+          <button type="button" class="finding-classify-opt ${!["true_positive","false_positive","suppressed"].includes(findingStatusKey(f)) ? "is-active" : ""}" data-classify-finding="${esc(f.id)}" data-status="new">
+            <span class="finding-classify-label">Unclassified</span>
+            <span class="finding-classify-hint">${multi ? "Clear host + check" : "Clear verdict"}</span>
+          </button>
+        </div>
+        <div class="finding-triage-foot">
+          <button type="button" class="btn danger ghost tiny" data-delete-finding="${esc(f.id)}">Delete finding</button>
+        </div>
+      </div>`;
+      })()}
       <dl class="kv">
         <dt>When</dt><dd class="mono">${esc(fmtWhen(when.finished || when.seen))}</dd>
         <dt>First seen</dt><dd class="mono">${esc(fmtWhen(when.first))}</dd>
@@ -10559,7 +13705,6 @@
         <dt>Confidence</dt><dd>${esc(f.confidence)}</dd>
         <dt>Check</dt><dd><span class="pill">${esc(f.check_id)}</span> <span class="muted">v${esc(f.check_version ?? "—")}</span></dd>
         <dt>Type</dt><dd>${esc(f.check_type || "—")}</dd>
-        <dt>Status</dt><dd>${esc(f.status || "new")}</dd>
         <dt>Link</dt><dd class="mono finding-permalink"><a href="${esc(hash)}">${esc(permalink)}</a></dd>
         <dt>ATT&CK</dt><dd>${(f.attack || []).map((a) =>
           `<a class="tag" href="${esc(attackUrl(a))}" target="_blank" rel="noreferrer">${esc(a)}</a>`
@@ -10635,6 +13780,45 @@
       btn.addEventListener("click", () => {
         closeDrawer();
         setView("hunt");
+      });
+    });
+    $$("#drawerBody [data-classify-finding]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-classify-finding");
+        const status = btn.getAttribute("data-status") || "new";
+        if (!id) return;
+        btn.disabled = true;
+        try {
+          const updated = await classifyFinding(id, status);
+          toast(status === "false_positive"
+            ? "False positive — this host + check (incl. future scans)"
+            : status === "true_positive"
+              ? "Marked true positive"
+              : "Classification cleared for host + check");
+          if (updated) {
+            const live = (state.findings || []).find((x) => String(x.id) === String(id)) || updated;
+            findingDetail(live);
+          } else render();
+        } catch (err) {
+          toast(err.message || String(err));
+          btn.disabled = false;
+        }
+      });
+    });
+    $$("#drawerBody [data-delete-finding]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-delete-finding");
+        if (!id) return;
+        if (!confirm("Permanently delete this finding?")) return;
+        btn.disabled = true;
+        try {
+          await deleteFindingById(id);
+          toast("Finding deleted");
+          render();
+        } catch (err) {
+          toast(err.message || String(err));
+          btn.disabled = false;
+        }
       });
     });
   }
@@ -10764,6 +13948,7 @@
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
+        closeAllHostActionMenus();
         showFeedVirtualHost(
           btn.getAttribute("data-feed-virtual"),
           btn.getAttribute("data-feed-name") || ""
@@ -10871,7 +14056,10 @@
         }
       });
     });
-    $$("[data-goto]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.goto)));
+    $$("[data-goto]").forEach((b) => b.addEventListener("click", () => {
+      const tab = b.getAttribute("data-settings-tab");
+      setView(b.dataset.goto, tab ? { settingsTab: tab } : undefined);
+    }));
     $$("[data-fid]").forEach((tr) => {
       tr.addEventListener("click", (e) => {
         if (e.target.closest("a, button, [data-stop]")) return;
@@ -10903,6 +14091,7 @@
       btn.addEventListener("click", async (e) => {
         e.preventDefault();
         e.stopPropagation();
+        closeAllHostActionMenus();
         const url = btn.getAttribute("data-copy-host-link") || "";
         try {
           await navigator.clipboard.writeText(url);
@@ -10997,6 +14186,10 @@
     if (hostAgent) hostAgent.addEventListener("change", onHostSelectChange);
     if (hostOs) hostOs.addEventListener("change", onHostSelectChange);
     if (hostArch) hostArch.addEventListener("change", onHostSelectChange);
+    $("#btnHostMoreFilters")?.addEventListener("click", () => {
+      state._hostMoreFilters = !state._hostMoreFilters;
+      render();
+    });
 
     $$("[data-host]").forEach((tr) => {
       tr.addEventListener("click", () => setView("hosts"));
@@ -11056,7 +14249,22 @@
     }
     const btnScanSelected = $("#btnScanSelected");
     if (btnScanSelected) {
-      btnScanSelected.addEventListener("click", () => showScanHosts([...selectedHostIds()]));
+      btnScanSelected.addEventListener("click", () => {
+        const ids = [...selectedHostIds()];
+        const scannable = ids.filter((id) => {
+          const h = state.hosts.find((x) => x.id === id);
+          return h && !isVirtualHost(h);
+        });
+        const skipped = ids.length - scannable.length;
+        if (!scannable.length) {
+          toast(skipped
+            ? "Selected hosts are virtual — use Update ingest instead of Scan"
+            : "Select at least one SSH/AgentLite host to scan");
+          return;
+        }
+        if (skipped) toast(`Skipping ${skipped} virtual host${skipped === 1 ? "" : "s"}`);
+        showScanHosts(scannable);
+      });
     }
     const btnTagSelected = $("#btnTagSelected");
     if (btnTagSelected) btnTagSelected.addEventListener("click", showTagSelected);
@@ -11070,6 +14278,7 @@
     $$("[data-test-host]").forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
+        closeAllHostActionMenus();
         const h = state.hosts.find((x) => x.id === btn.dataset.testHost);
         if (!h) return;
         openModal(`Test ${h.display_name}`, `
@@ -11232,6 +14441,13 @@
       });
     }
 
+    const toggleFields = (open) => {
+      state._rplFieldsOpen = !!open;
+      render();
+    };
+    $("#rplFieldsToggle")?.addEventListener("click", () => toggleFields(!state._rplFieldsOpen));
+    $("#rplFieldsCollapse")?.addEventListener("click", () => toggleFields(false));
+
     bindRplFieldButtons();
 
     const rplSaveQuery = $("#rplSaveQuery");
@@ -11280,6 +14496,158 @@
       });
     });
 
+    const rplResizeHandle = $("#rplResizeHandle");
+    const rplSplit = $("#rplSplit");
+    if (rplResizeHandle && rplSplit) {
+      const applyRplHeight = (px) => {
+        const next = Math.max(180, Math.min(Math.round(window.innerHeight * 0.92), Math.round(px)));
+        rplSplit.style.setProperty("--rpl-results-h", `${next}px`);
+        state._rplResultsHeight = next;
+        return next;
+      };
+      rplResizeHandle.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const startY = e.clientY;
+        const startH = rplSplit.getBoundingClientRect().height;
+        const onMove = (ev) => {
+          applyRplHeight(startH + (ev.clientY - startY));
+        };
+        const onUp = () => {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+          document.body.classList.remove("rpl-resizing");
+          persistRplResultsPrefs();
+        };
+        document.body.classList.add("rpl-resizing");
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+      });
+      rplResizeHandle.addEventListener("keydown", (e) => {
+        const step = e.shiftKey ? 48 : 24;
+        let delta = 0;
+        if (e.key === "ArrowUp") delta = -step;
+        else if (e.key === "ArrowDown") delta = step;
+        else return;
+        e.preventDefault();
+        applyRplHeight(rplSplit.getBoundingClientRect().height + delta);
+        persistRplResultsPrefs();
+      });
+    }
+
+    const currentFilteredRpl = () => filteredRplResult(state._rplResult);
+
+    const applyRplResultFilter = (value, focusId) => {
+      snapshotRplForm();
+      state._rplResultFilter = value;
+      const sel = Number(state._rplSelected ?? 0);
+      const rows = filteredRplResult(state._rplResult)?.rows || [];
+      if (!rows.length) state._rplSelected = 0;
+      else if (sel >= rows.length) state._rplSelected = rows.length - 1;
+      render();
+      if (focusId) {
+        const el = document.getElementById(focusId);
+        if (el && typeof el.focus === "function") {
+          el.focus();
+          if (typeof el.setSelectionRange === "function" && typeof el.value === "string") {
+            const n = el.value.length;
+            try { el.setSelectionRange(n, n); } catch (_) {}
+          }
+        }
+      }
+    };
+
+    const bindRplFilterInput = (inputId, clearId) => {
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      let timer = null;
+      input.addEventListener("input", () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => applyRplResultFilter(input.value, inputId), 180);
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          clearTimeout(timer);
+          applyRplResultFilter(input.value, inputId);
+        }
+      });
+      document.getElementById(clearId)?.addEventListener("click", () => applyRplResultFilter("", inputId));
+    };
+
+    bindRplFilterInput("rplResultFilter", "rplResultFilterClear");
+    bindRplFilterInput("rplFsFilter", "rplFsFilterClear");
+
+    const toggleRplFilterRegex = () => {
+      snapshotRplForm();
+      state._rplResultFilterRegex = !state._rplResultFilterRegex;
+      render();
+      const focusId = state._rplFullscreen ? "rplFsFilter" : "rplResultFilter";
+      const el = document.getElementById(focusId);
+      el?.focus?.();
+    };
+    $("#rplResultFilterRegex")?.addEventListener("click", toggleRplFilterRegex);
+    $("#rplFsFilterRegex")?.addEventListener("click", toggleRplFilterRegex);
+
+    $("#rplExportJson")?.addEventListener("click", () => exportRplJson(currentFilteredRpl()));
+    $("#rplExportCsv")?.addEventListener("click", () => exportRplCsv(currentFilteredRpl()));
+    $("#rplCopyJson")?.addEventListener("click", () => {
+      copyTextToClipboard(rplRowsToJson(currentFilteredRpl()), "Copied JSON");
+    });
+    $("#rplFsDlJson")?.addEventListener("click", () => exportRplJson(currentFilteredRpl()));
+    $("#rplFsDlCsv")?.addEventListener("click", () => exportRplCsv(currentFilteredRpl()));
+    $("#rplFsCopyJson")?.addEventListener("click", () => {
+      copyTextToClipboard(rplRowsToJson(currentFilteredRpl()), "Copied JSON");
+    });
+    $("#rplFsCopyCsv")?.addEventListener("click", () => {
+      copyTextToClipboard(rplRowsToCsv(currentFilteredRpl()), "Copied CSV");
+    });
+    $("#rplFsCopyRow")?.addEventListener("click", () => {
+      const row = currentFilteredRpl()?.rows?.[state._rplSelected ?? 0];
+      if (!row) return toast("No row selected");
+      copyTextToClipboard(JSON.stringify(row, null, 2), "Copied row");
+    });
+
+    const openRplFullscreen = () => {
+      if (!state._rplResult) return;
+      snapshotRplForm();
+      state._rplFullscreen = true;
+      render();
+    };
+    const closeRplFullscreen = () => {
+      snapshotRplForm();
+      state._rplFullscreen = false;
+      render();
+    };
+    $("#rplFullscreenBtn")?.addEventListener("click", openRplFullscreen);
+    $("#rplFsClose")?.addEventListener("click", closeRplFullscreen);
+
+    if (state.view !== "hunt" && state._rplFullscreen) state._rplFullscreen = false;
+    document.body.classList.toggle("rpl-fs-open", !!(state.view === "hunt" && state._rplFullscreen && state._rplResult));
+    if (state._rplFullscreen && state.view === "hunt") {
+      const fs = $("#rplFullscreen");
+      const active = document.activeElement;
+      const inside = !!(fs && active && fs.contains(active));
+      if (!inside) {
+        const fsFilter = $("#rplFsFilter");
+        if (fsFilter) {
+          fsFilter.focus();
+          const n = fsFilter.value.length;
+          try { fsFilter.setSelectionRange(n, n); } catch (_) {}
+        }
+      }
+      if (!window.__rplFsEscBound) {
+        window.__rplFsEscBound = true;
+        document.addEventListener("keydown", (e) => {
+          if (e.key !== "Escape") return;
+          if (!state._rplFullscreen || state.view !== "hunt") return;
+          e.preventDefault();
+          state._rplFullscreen = false;
+          render();
+        });
+      }
+    }
+
     const rplSqlDetails = $("#rplSqlDetails");
     if (rplSqlDetails) {
       rplSqlDetails.addEventListener("toggle", () => {
@@ -11292,6 +14660,14 @@
         snapshotRplForm();
         state._rplSelected = Number(tr.dataset.rplRow);
         render();
+      });
+    });
+
+    $$("[data-rpl-copy-val]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copyTextToClipboard(btn.getAttribute("data-rpl-copy-val") || "", "Copied");
       });
     });
 
@@ -11374,6 +14750,14 @@
       });
     }
 
+    if (state._rplPendingRun) {
+      state._rplPendingRun = false;
+      const pendingQ = String(state._rplQuery || "").trim();
+      if (pendingQ) {
+        runRplQuery(pendingQ, { limit: Number(state._rplLimit || 500) || 500 });
+      }
+    }
+
     const rplCompile = $("#rplCompile");
     if (rplCompile) {
       rplCompile.addEventListener("click", async () => {
@@ -11449,6 +14833,7 @@
     const findHost = $("#findHost");
     const findTag = $("#findTag");
     const findCheck = $("#findCheck");
+    const findStatus = $("#findStatus");
     const findGroup = $("#findGroup");
     const applyFindFilters = (opts) => {
       const keepFocus = opts && opts.keepFocus;
@@ -11458,6 +14843,7 @@
       state._findHost = findHost?.value || "";
       state._findTag = findTag?.value || "";
       state._findCheck = findCheck?.value || "";
+      state._findStatus = findStatus?.value || "open";
       state._findGroup = findGroup?.value || "alert";
       if (!opts || opts.resetPage !== false) state.findPage = 0;
       render();
@@ -11485,7 +14871,7 @@
         );
       });
     }
-    [findSev, findHost, findTag, findCheck, findGroup].forEach((el) => {
+    [findSev, findHost, findTag, findCheck, findStatus, findGroup].forEach((el) => {
       if (el) el.addEventListener("change", () => applyFindFilters());
     });
     $$("[data-find-sev]").forEach((btn) => {
@@ -11502,6 +14888,7 @@
       state._findHost = "";
       state._findTag = "";
       state._findCheck = "";
+      state._findStatus = "open";
       state._findGroup = "alert";
       state._findExpanded = {};
       state.findPage = 0;
@@ -11516,6 +14903,28 @@
         state._findExpanded = { ...(state._findExpanded || {}) };
         state._findExpanded[key] = !state._findExpanded[key];
         render();
+      });
+    });
+    $$("[data-classify-finding]").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = btn.getAttribute("data-classify-finding");
+        const status = btn.getAttribute("data-status") || "new";
+        if (!id) return;
+        btn.disabled = true;
+        try {
+          await classifyFinding(id, status);
+          toast(status === "false_positive"
+            ? "False positive — this host + check (incl. future scans)"
+            : status === "true_positive"
+              ? "Marked true positive"
+              : "Classification cleared for host + check");
+          render();
+        } catch (err) {
+          toast(err.message || String(err));
+          btn.disabled = false;
+        }
       });
     });
 
@@ -11705,9 +15114,14 @@ title_contains = "Custom rule"
         const ta = $("#ruleTomlEditor");
         if (!ta || !state.selectedCheckId) return;
         try {
+          let text = applyRuleDetailsToToml(ta.value, readRuleDetailsForm());
+          if ($("#ruleAnoMarkForm")) text = applyAnoMarkFormToToml(text);
+          ta.value = text;
+          const hl = $("#ruleTomlHighlight");
+          if (hl && typeof highlightToml === "function") hl.innerHTML = highlightToml(text);
           state.checkDetail = await api(`/v1/checks/${encodeURIComponent(state.selectedCheckId)}`, {
             method: "PUT",
-            body: { toml: ta.value },
+            body: { toml: text },
           });
           await refreshChecksCatalog();
           toast("Rule saved");
@@ -11717,32 +15131,17 @@ title_contains = "Custom rule"
         }
       });
     }
+    wireRuleDetailsLiveColors();
     const applyAnomark = $("#btnApplyAnoMarkRule");
     if (applyAnomark) {
       applyAnomark.addEventListener("click", () => {
         const ta = $("#ruleTomlEditor");
         if (!ta) return;
-        const model = ($("#ruleAnomarkModel")?.value || "").trim();
-        const suspect = Number($("#ruleAnomarkSuspect")?.value || 95);
-        const maxCmd = Number($("#ruleAnomarkMax")?.value || 5000);
-        const tags = String($("#ruleAnomarkTags")?.value || "")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const tagsToml = tags.length
-          ? `tags = [${tags.map((t) => JSON.stringify(t)).join(", ")}]`
-          : "tags = []";
-        const block = `[anomark]\nmodel_id = ${JSON.stringify(model)}\nsuspect_percent = ${suspect}\n${tagsToml}\nmax_commands = ${maxCmd}\n`;
-        let text = ta.value;
-        if (/^\[anomark\]/m.test(text)) {
-          text = text.replace(/^\[anomark\][\s\S]*?(?=^\[|\z)/m, block);
-        } else {
-          text = `${text.trimEnd()}\n\n${block}`;
-        }
+        const text = applyAnoMarkFormToToml(ta.value);
         ta.value = text;
         const hl = $("#ruleTomlHighlight");
         if (hl && typeof highlightToml === "function") hl.innerHTML = highlightToml(text);
-        toast("AnoMark options applied to TOML — click Save TOML");
+        toast("AnoMark options applied to TOML — click Save");
       });
     }
     const reloadRule = $("#btnReloadRule");
@@ -11758,6 +15157,36 @@ title_contains = "Custom rule"
         }
       });
     }
+    wireRuleTestHostChecks();
+    wireRuleTestScanControls();
+    $("#ruleTestHostFilter")?.addEventListener("input", (e) => {
+      state._ruleTestHostFilter = e.target.value || "";
+      refreshRuleTestHostList();
+    });
+    $("#ruleTestHostsClear")?.addEventListener("click", () => {
+      state._ruleTestHostIds = [];
+      state._ruleTestHostId = "";
+      state._ruleTestScanId = "";
+      state._ruleTestScanMode = "all";
+      refreshRuleTestHostList();
+    });
+    $("#ruleTestHostsAll")?.addEventListener("click", () => {
+      state._ruleTestHostIds = ruleTestSortedHosts().map((h) => String(h.id)).filter(Boolean);
+      state._ruleTestHostId = state._ruleTestHostIds[0] || "";
+      state._ruleTestScanId = "";
+      state._ruleTestScanMode = "all";
+      refreshRuleTestHostList();
+    });
+    $("#ruleTestHostsVirtual")?.addEventListener("click", () => {
+      state._ruleTestHostIds = ruleTestSortedHosts()
+        .filter(isVirtualHostRec)
+        .map((h) => String(h.id))
+        .filter(Boolean);
+      state._ruleTestHostId = state._ruleTestHostIds[0] || "";
+      state._ruleTestScanId = "";
+      state._ruleTestScanMode = "all";
+      refreshRuleTestHostList();
+    });
     async function runRuleSandbox(mode) {
       const id = state.selectedCheckId;
       const ta = $("#ruleTomlEditor");
@@ -11770,19 +15199,46 @@ title_contains = "Custom rule"
         const path = mode === "test"
           ? `/v1/checks/${encodeURIComponent(id)}/test`
           : `/v1/checks/${encodeURIComponent(id)}/validate`;
+        const hostIds = $$("[data-rule-test-host]:checked").map((el) =>
+          el.getAttribute("data-rule-test-host")
+        ).filter(Boolean);
+        const wantSpecific = hostIds.length === 1 && ruleTestScanMode() === "specific";
+        const scanId = wantSpecific
+          ? String($("#ruleTestScan")?.value || state._ruleTestScanId || "").trim()
+          : "";
+        if (wantSpecific && !scanId) {
+          toast("Choose a specific scan, or switch to All scans");
+          return;
+        }
+        state._ruleTestHostIds = hostIds;
+        state._ruleTestHostId = hostIds[0] || "";
+        state._ruleTestScanId = scanId;
+        if (!wantSpecific) state._ruleTestScanMode = "all";
+        // Include unsaved details/where edits in dry-run without writing to disk.
+        let tomlText = applyRuleDetailsToToml(ta.value, readRuleDetailsForm());
+        if ($("#ruleAnoMarkForm")) tomlText = applyAnoMarkFormToToml(tomlText);
+        const body = {
+          toml: tomlText,
+          // All-scans / multi-host needs a wide window so older imports are included.
+          limit: (scanId || hostIds.length >= 1) ? 50000 : 5000,
+          sample_limit: 25,
+        };
+        if (hostIds.length) body.host_ids = hostIds;
+        if (scanId) body.scan_id = scanId;
         const res = await api(path, {
           method: "POST",
-          body: {
-            toml: ta.value,
-            limit: 5000,
-            sample_limit: 25,
-          },
+          body,
         });
         state._ruleSandbox = res;
         const hits = res?.dry_run?.hit_count ?? 0;
+        const scopeBit = !hostIds.length
+          ? ""
+          : hostIds.length === 1
+            ? ` on ${hostName(hostIds[0])}${scanId ? ` / ${shortId(scanId)}` : " (all scans)"}`
+            : ` on ${hostIds.length} hosts (all scans)`;
         toast(mode === "test"
-          ? `Test dry-run — ${hits} hit${hits === 1 ? "" : "s"}`
-          : `Validated — ${hits} hit${hits === 1 ? "" : "s"}`);
+          ? `Test dry-run${scopeBit} — ${hits} hit${hits === 1 ? "" : "s"}`
+          : `Validated${scopeBit} — ${hits} hit${hits === 1 ? "" : "s"}`);
         render();
       } catch (e) {
         state._ruleSandbox = { error: e.message || String(e) };
@@ -11797,6 +15253,24 @@ title_contains = "Custom rule"
     if (btnValidate) btnValidate.addEventListener("click", () => runRuleSandbox("validate"));
     const btnTest = $("#btnTestRule");
     if (btnTest) btnTest.addEventListener("click", () => runRuleSandbox("test"));
+    $("#btnCopyRuleRpl")?.addEventListener("click", async () => {
+      const q = String(state._ruleSandbox?.hunt_rpl || $("#ruleHuntRpl")?.textContent || "").trim();
+      if (!q) return;
+      try {
+        await navigator.clipboard.writeText(q);
+        toast("Hunt RPL copied");
+      } catch (_) {
+        toast(q);
+      }
+    });
+    $("#btnOpenRuleInHunt")?.addEventListener("click", () => {
+      const q = String(state._ruleSandbox?.hunt_rpl || $("#ruleHuntRpl")?.textContent || "").trim();
+      if (!q) return;
+      state._rplQuery = q;
+      setView("hunt");
+      location.hash = "#/hunt";
+      toast("Opened in Hunt");
+    });
     const editor = $("#ruleTomlEditor");
     const hl = $("#ruleTomlHighlight");
     if (editor && hl) {
@@ -11846,6 +15320,8 @@ title_contains = "Custom rule"
   }
 
   async function showHostDetail(id) {
+    showPageLoading("Loading host…");
+    openDrawer(hostName(id) || "Host", pageLoadingInlineHtml("Loading host detail…"), { mode: "wide" });
     try {
       const [pack, activityAll] = await Promise.all([
         api(`/v1/hosts/${id}`),
@@ -11854,7 +15330,7 @@ title_contains = "Custom rule"
       const hostActivity = (activityAll || []).filter((e) => e.host_id === id);
       const h = pack.host || {};
       const st = hostStatus(h);
-      const tags = hostTags(h);
+      const agent = hostAgentInfo(h);
       const findings = pack.findings || [];
       const hostScans = (state.scans || [])
         .filter((s) => {
@@ -11883,72 +15359,98 @@ title_contains = "Custom rule"
         api(`/v1/hosts/${id}/files?${scanQ}`).catch(() => null),
         api(`/v1/hosts/${id}/connections?${scanQ}`).catch(() => null),
       ]);
-      const invCounts = {
+      const headSub = virt
+        ? `<span class="tag host-agent-tag host-agent-tag--virtual">${esc(agent.title)}</span>${
+            h.labels?.virtual_agent ? ` · <span class="mono muted">${esc(h.labels.virtual_agent)}</span>` : " · log ingest"
+          }`
+        : `<span class="mono muted">${esc(h.primary_addr || "—")}:${h.ssh_port || 22}</span>`;
+      const selectedScan = (() => {
+        const sid = state._hostDetailScanId
+          || String(hostScans[0]?.job?.id || hostScans[0]?.meta?.scan_id || "");
+        return hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid) || hostScans[0] || null;
+      })();
+      const selectedScanMeta = await ensureScanInventoryMeta(selectedScan);
+      const invCounts = withScanInventoryTotals({
         processes: Number(procPack?.count ?? 0),
         files: Number(filePack?.count ?? 0),
         connections: Number(connPack?.count ?? 0),
-      };
+      }, selectedScanMeta);
+      state._hostDetailInvCounts = invCounts;
+      state._hostDetailSelectedScanMeta = selectedScanMeta;
+      const selectedScanTags = scanTagsList(selectedScan);
       if (location.hash !== hostHash) history.replaceState(null, "", hostHash);
       openDrawer(h.display_name || "Host", `
         <div class="host-detail-head">
           <div>
             <div class="host-detail-title">${esc(h.display_name || "Host")}</div>
-            <div class="mono muted">${esc(h.primary_addr || "—")}:${h.ssh_port || 22} · <span class="host-status ${st.key}">${esc(st.label)}</span></div>
+            <div class="host-detail-sub">${headSub} · <span class="host-status ${st.key}">${esc(st.label)}</span></div>
+            <div class="host-detail-scan-tags" id="hostDetailHeadScanTags">
+              ${selectedScanTags.length
+                ? `<span class="host-scan-tags-label">Scan</span>${formatScanTags(selectedScanTags)}`
+                : `<span class="host-scan-tags-label">Scan</span><span class="muted">${hostScans.length ? "No tags" : "No scans"}</span>`}
+            </div>
           </div>
           <button type="button" class="btn ghost tiny" data-copy-host-link="${esc(hostAbs)}">Copy link</button>
         </div>
         <div class="host-detail-tabs">
           <button type="button" class="tab active" data-host-tab="summary">Summary</button>
-          <button type="button" class="tab" data-host-tab="processes">Processes (${esc(String(invCounts.processes))})</button>
-          <button type="button" class="tab" data-host-tab="files">Files (${esc(String(invCounts.files))})</button>
+          <button type="button" class="tab" data-host-tab="processes">Processes (${esc(fmtInvShownTotal(invCounts.processes, invCounts.processesTotal))})</button>
+          <button type="button" class="tab" data-host-tab="files">Files (${esc(fmtInvShownTotal(invCounts.files, invCounts.filesTotal))})</button>
           <button type="button" class="tab" data-host-tab="connections">Connections (${esc(String(invCounts.connections))})</button>
-          <button type="button" class="tab" data-host-tab="scans">Scans (${hostScans.length}/${esc(String(histKeep))})</button>
-          <button type="button" class="tab" data-host-tab="scanlog">Scan log (${hostActivity.length})</button>
+          <button type="button" class="tab" data-host-tab="scans">${virt ? "Imports" : "Scans"} (${hostScans.length}/${esc(String(histKeep))})</button>
+          <button type="button" class="tab" data-host-tab="scanlog">Activity (${hostActivity.length})</button>
           <button type="button" class="tab" data-host-tab="findings">Findings (${findings.length})</button>
           <button type="button" class="tab" data-host-tab="ops">Operations</button>
           <button type="button" class="tab" data-host-tab="raw">Raw JSON</button>
         </div>
-        ${hostScanPickerHtml(hostScans, state._hostDetailScanId)}
+        ${hostScanPickerHtml(hostScans, state._hostDetailScanId, { virtual: virt })}
         <div data-host-pane="summary">
           <dl class="kv">
             <dt>Status</dt><dd><span class="host-status ${st.key}">${esc(st.label)}</span>
-              <div class="muted" style="font-size:0.75rem">Health checked ${esc(fmtWhen(h.auth_checked_at) || "never")}</div>
+              <div class="muted host-detail-note">${virt
+                ? "Log ingest only — no SSH health check"
+                : `Health checked ${esc(fmtWhen(h.auth_checked_at) || "never")}`}</div>
             </dd>
-            <dt>Target</dt><dd class="mono">${esc(h.primary_addr || "—")}:${h.ssh_port || 22}</dd>
-            <dt>Auth / outcome</dt><dd>${esc(st.auth || "—")}</dd>
-            <dt>Last scan</dt><dd class="mono">${esc(fmtWhen(h.last_scan_at))}</dd>
-            <dt>Selected scan</dt><dd class="mono" id="hostDetailScanHint">${esc(
-              (() => {
-                const sid = state._hostDetailScanId
-                  || String(hostScans[0]?.job?.id || hostScans[0]?.meta?.scan_id || "");
-                if (!sid) return "latest available";
-                const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
-                const when = s?.meta?.finished_at || s?.job?.created_at || "";
-                return `${shortId(sid)}${when ? ` · ${fmtWhen(when)}` : ""}`;
-              })()
-            )}</dd>
+            <dt>Target</dt><dd>${hostTargetHtml(h)}</dd>
+            <dt>${virt ? "Ingest" : "Auth / outcome"}</dt><dd>${esc(st.auth || "—")}</dd>
+            <dt>${virt ? "Last import" : "Last scan"}</dt><dd class="mono">${esc(fmtWhen(h.last_scan_at))}</dd>
+            <dt>Selected scan</dt><dd class="mono" id="hostDetailScanHint">${(() => {
+              const sid = state._hostDetailScanId
+                || String(hostScans[0]?.job?.id || hostScans[0]?.meta?.scan_id || "");
+              const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
+              return scanSelectedHintHtml(s, sid);
+            })()}</dd>
+            <dt>Scan tags</dt><dd id="hostDetailScanTagsSummary">${
+              selectedScanTags.length ? formatScanTags(selectedScanTags) : `<span class="muted">—</span>`
+            }</dd>
             <dt>Inventory</dt><dd id="hostDetailInvCounts">
-              <span class="mono">${esc(String(invCounts.processes))} processes</span>
-              · <span class="mono">${esc(String(invCounts.files))} files</span>
-              · <span class="mono">${esc(String(invCounts.connections))} connections</span>
-              <div class="muted" style="font-size:0.75rem">Counts for the selected scan (change above to compare history)</div>
+              ${hostInventoryCountsHtml(invCounts)}
             </dd>
             <dt>Open findings</dt><dd>${esc(pack.open_findings ?? findings.length)}</dd>
-            <dt>Host key</dt><dd class="mono">${pack.host_key ? esc(`${pack.host_key.key_type} ${pack.host_key.fingerprint}`) : "(unpinned)"}</dd>
-            <dt>Tags</dt><dd>${tags.length ? tags.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ") : "—"}</dd>
+            ${virt ? "" : `<dt>Host key</dt><dd class="mono">${pack.host_key ? esc(`${pack.host_key.key_type} ${pack.host_key.fingerprint}`) : "(unpinned)"}</dd>`}
+            <dt>Tags</dt><dd>${hostTagsCellHtml(h)}</dd>
             <dt>OS</dt><dd>${esc(h.os || "—")}${h.os_id || h.os_version ? ` <span class="mono muted">(${esc([h.os_id, h.os_version].filter(Boolean).join(" "))})</span>` : ""}</dd>
             <dt>Arch / kernel</dt><dd>${esc(h.arch || "—")} / ${esc(h.kernel || "—")}</dd>
-            <dt>Agent</dt><dd><span class="tag">${esc(hostAgentInfo(h).title)}</span>
-              <div class="muted" style="font-size:0.8rem;margin-top:0.2rem">${esc(hostAgentInfo(h).detail)}</div>
+            <dt>Agent</dt><dd><span class="tag host-agent-tag host-agent-tag--${esc(agent.id)}">${esc(agent.title)}</span>
+              <div class="muted host-detail-note">${esc(agent.detail)}</div>
               ${isAgentLiteHost(h) && (h.labels?.collect_paths || "").trim()
-                ? `<div class="mono muted" style="font-size:0.78rem;margin-top:0.25rem;white-space:pre-wrap">collect_paths:\n${esc(String(h.labels.collect_paths).trim())}</div>`
-                : (isAgentLiteHost(h) ? `<div class="muted" style="font-size:0.75rem;margin-top:0.2rem">File inventory: defaults (/bin, /etc, /tmp, …). Edit host to add paths.</div>` : "")}
-              ${h.ingest_token ? `<div class="mono muted" style="font-size:0.78rem">ingest ${esc(shortId(h.ingest_token))}</div>` : ""}
-              ${virt && h.labels?.virtual_agent ? `<div class="mono muted" style="font-size:0.78rem">profile ${esc(h.labels.virtual_agent)}</div>` : ""}
+                ? `<div class="mono muted host-detail-note host-detail-pre">collect_paths:\n${esc(String(h.labels.collect_paths).trim())}</div>`
+                : (isAgentLiteHost(h) ? `<div class="muted host-detail-note">File inventory: defaults (/bin, /etc, /tmp, …). Edit host to add paths.</div>` : "")}
+              ${virt && h.labels?.virtual_agent ? `<div class="mono muted host-detail-note">profile ${esc(h.labels.virtual_agent)}</div>` : ""}
+              ${h.ingest_token ? `<div class="mono muted host-detail-note">ingest ${esc(shortId(h.ingest_token))}</div>` : ""}
+              ${virt && h.labels?.source ? `<div class="mono muted host-detail-note" title="${esc(h.labels.source)}">source ${esc(h.labels.source)}</div>` : ""}
             </dd>
             <dt>Link</dt><dd class="mono finding-permalink"><a href="${esc(hostHash)}">${esc(hostAbs)}</a></dd>
           </dl>
-          <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
+          ${virt ? `
+          <section class="host-virtual-blobs" id="hostVirtualBlobs">
+            <div class="panel-head" style="padding:0.55rem 0;border:0">
+              <h4 style="margin:0;font-size:0.92rem">Ingest blobs</h4>
+              <span class="muted" style="font-size:0.78rem">ClickHouse · download or reingest</span>
+            </div>
+            <div id="hostVirtualBlobsBody"><div class="muted" style="font-size:0.85rem">Loading…</div></div>
+          </section>` : ""}
+          <div class="form-actions host-detail-actions">
             ${virt
               ? `<button class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>
                  <button class="btn ghost" data-copy-ingest="${esc(h.ingest_token || "")}">Copy ingest token</button>
@@ -11960,11 +15462,13 @@ title_contains = "Custom rule"
           </div>
         </div>
         <div data-host-pane="processes" class="hidden">
-          <div class="muted" style="margin-bottom:0.65rem">${virt
-            ? `Process inventory from the selected scan (or ingest JSONL when no scan rows).`
-            : `Process inventory from the <strong>selected scan</strong> above (falls back to latest if empty).`}</div>
-          <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
+          <div id="hostProcCapBanner">${scanInvCapBannerHtml("processes", invCounts.processes, invCounts.processesTotal, h.id)
+            || `<div class="muted host-pane-lead">${virt
+              ? `Process inventory from the selected scan (or ingest JSONL when no scan rows).`
+              : `Process inventory from the <strong>selected scan</strong> above (falls back to latest if empty).`}</div>`}</div>
+          <div class="form-actions host-pane-actions">
             <button type="button" class="btn ghost" id="btnLoadProcesses">Reload processes</button>
+            <button type="button" class="btn ghost" data-hunt-inventory="processes" data-hunt-host="${esc(h.id)}">Search in Hunt</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
@@ -11972,11 +15476,13 @@ title_contains = "Custom rule"
           <div id="hostProcessesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="files" class="hidden">
-          <div class="muted" style="margin-bottom:0.65rem">${virt
-            ? `File inventory from the selected scan (or ingest JSONL when no scan rows).`
-            : `File inventory from the <strong>selected scan</strong> above.`}</div>
-          <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
+          <div id="hostFileCapBanner">${scanInvCapBannerHtml("files", invCounts.files, invCounts.filesTotal, h.id)
+            || `<div class="muted host-pane-lead">${virt
+              ? `File inventory from the selected scan (or ingest JSONL when no scan rows).`
+              : `File inventory from the <strong>selected scan</strong> above.`}</div>`}</div>
+          <div class="form-actions host-pane-actions">
             <button type="button" class="btn ghost" id="btnLoadFiles">Reload files</button>
+            <button type="button" class="btn ghost" data-hunt-inventory="files" data-hunt-host="${esc(h.id)}">Search in Hunt</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
@@ -11984,10 +15490,10 @@ title_contains = "Custom rule"
           <div id="hostFilesPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="connections" class="hidden">
-          <div class="muted" style="margin-bottom:0.65rem">${virt
+          <div class="muted host-pane-lead">${virt
             ? `Open sockets from the selected import snapshot when present.`
             : `Open sockets from the <strong>selected scan</strong> above.`}</div>
-          <div class="form-actions" style="justify-content:flex-start;margin-bottom:0.75rem">
+          <div class="form-actions host-pane-actions">
             <button type="button" class="btn ghost" id="btnLoadConnections">Reload connections</button>
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
@@ -11996,7 +15502,7 @@ title_contains = "Custom rule"
           <div id="hostConnectionsPane"><div class="empty">Loading…</div></div>
         </div>
         <div data-host-pane="scans" class="hidden">
-          <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+          <p class="muted host-pane-lead">
             ${virt
               ? `Import snapshots for this virtual agent (keep=${esc(String(histKeep))}). Each Update/import with “Record a scan snapshot” adds a row here.`
               : `Retained finished scans for this host (keep=${esc(String(histKeep))}). Active jobs are always listed.`}
@@ -12005,7 +15511,7 @@ title_contains = "Custom rule"
             ? `No import scans yet — use <strong>Update</strong> and keep “Record a scan snapshot” checked.`
             : `No scan history for this host yet.`}</div>` : `
           <table class="data scan-history-table"><thead><tr>
-            <th>When</th><th>Scan</th><th>Set</th><th>State</th><th>Coverage</th><th>Findings</th><th></th>
+            <th>When</th><th>Scan</th><th>Set</th><th>Tags</th><th>State</th><th>Coverage</th><th>Findings</th><th></th>
           </tr></thead><tbody>
             ${hostScans.map((s) => {
               const j = s.job || {};
@@ -12025,6 +15531,7 @@ title_contains = "Custom rule"
                 </td>
                 <td class="mono"><a href="${esc(href)}" data-open-scan="${esc(sid)}">${esc(shortId(sid))}</a></td>
                 <td>${esc(setLabel)}</td>
+                <td>${formatScanTags(m.tags)}</td>
                 <td><span class="pill neutral">${esc(stateLabel)}</span></td>
                 <td class="mono">${esc(String(fired))}/${esc(String(applicable))}</td>
                 <td>${(s.findings || []).length}</td>
@@ -12035,7 +15542,7 @@ title_contains = "Custom rule"
               </tr>`;
             }).join("")}
           </tbody></table>`}
-          <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
+          <div class="form-actions host-detail-actions">
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
@@ -12052,14 +15559,14 @@ title_contains = "Custom rule"
               <span class="ts mono">${esc(fmtTime(e.ts))}</span>
               <span class="lvl">${esc(lvl)}</span>
               <span class="msg">${esc(e.message)}</span>
-              <div class="mono muted" style="font-size:0.72rem">${esc(e.kind || "")}${e.scan_id ? " · " + esc(shortId(e.scan_id)) : ""}</div>
+              <div class="mono muted host-detail-note">${esc(e.kind || "")}${e.scan_id ? " · " + esc(shortId(e.scan_id)) : ""}</div>
             </div>`;
           }).join("")}</div>`}
-          <div class="form-actions" style="justify-content:flex-start;margin-top:1rem">
+          <div class="form-actions host-detail-actions">
             ${virt
               ? `<button type="button" class="btn primary" data-feed-virtual="${esc(h.id)}" data-feed-name="${esc(h.display_name || "")}">Update</button>`
               : `<button class="btn primary" data-scan-host="${esc(h.id)}">Scan now</button>`}
-            <button class="btn ghost" data-goto="activity">Open Activity</button>
+            <button class="btn ghost" data-goto="settings" data-settings-tab="audit">Open audit log</button>
           </div>
         </div>
         <div data-host-pane="findings" class="hidden">
@@ -12083,17 +15590,29 @@ title_contains = "Custom rule"
           <dl class="kv">
             <dt>Host ID</dt><dd class="mono">${esc(h.id)}</dd>
             <dt>Tenant</dt><dd class="mono">${esc(h.tenant_id || "—")}</dd>
+            <dt>Agent</dt><dd><span class="tag host-agent-tag host-agent-tag--${esc(agent.id)}">${esc(agent.title)}</span>
+              <div class="muted host-detail-note">${esc(agent.detail)}</div>
+            </dd>
+            ${virt ? `
+            <dt>Virtual profile</dt><dd class="mono">${esc(h.labels?.virtual_agent || h.labels?.virtual_agent_id || "—")}</dd>
+            <dt>Ingest token</dt><dd class="mono">${h.ingest_token ? esc(h.ingest_token) : "—"}</dd>
+            <dt>Source</dt><dd class="mono">${esc(h.labels?.source || "—")}</dd>
+            <dt>Status</dt><dd><span class="host-status ${st.key}">${esc(st.label)}</span>
+              <div class="muted host-detail-note">${esc(h.auth_detail || st.auth || "")}</div>
+            </dd>
+            <dt>Import history keep</dt><dd>${esc(h.labels?.scan_history || h.labels?.scan_history_per_host || "fleet default")}</dd>
+            ` : `
             <dt>Credential</dt><dd>${esc(h.labels?.credential || "(default / unset)")}</dd>
             <dt>SSH auth</dt><dd>${esc(h.labels?.ssh_auth || (h.labels?.ssh_password_file ? "password" : "publickey"))} · ${esc(h.labels?.ssh_user || "—")}
-              <div class="muted mono" style="font-size:0.78rem">${esc(h.labels?.ssh_identity || h.labels?.ssh_password_file || "—")}</div>
+              <div class="muted mono host-detail-note">${esc(h.labels?.ssh_identity || h.labels?.ssh_password_file || "—")}</div>
             </dd>
             <dt>Sudo</dt><dd>${["1","true","yes","on"].includes(String(h.labels?.ssh_sudo || "").toLowerCase())
               ? `enabled · ${esc(h.labels?.ssh_sudo_mode || "ssh_password")}`
               : "off"}</dd>
-            <dt>Scan method</dt><dd>${esc(hostAgentInfo(h).detail)}</dd>
+            <dt>Scan method</dt><dd>${esc(agent.detail)}</dd>
             <dt>Auth status</dt><dd><span class="host-status ${st.key}">${esc(st.label)}</span> ${esc(h.auth_status || "never")}
-              <div class="muted" style="font-size:0.8rem">${esc(h.auth_detail || "")}</div>
-              <div class="muted" style="font-size:0.75rem">Checked ${esc(fmtWhen(h.auth_checked_at) || "never")}</div>
+              <div class="muted host-detail-note">${esc(h.auth_detail || "")}</div>
+              <div class="muted host-detail-note">Checked ${esc(fmtWhen(h.auth_checked_at) || "never")}</div>
             </dd>
             <dt>Connect timeout</dt><dd>${esc(h.timeouts?.connect_timeout_secs ?? "fleet default")}s</dd>
             <dt>Auth timeout</dt><dd>${esc(h.timeouts?.auth_timeout_secs ?? "fleet default")}s</dd>
@@ -12102,6 +15621,7 @@ title_contains = "Custom rule"
             <dt>Scan interval</dt><dd>${esc(hostScanIntervalLabel(h))}</dd>
             <dt>Scan history keep</dt><dd>${esc(h.labels?.scan_history || h.labels?.scan_history_per_host || "fleet default")}</dd>
             <dt>Connect delay</dt><dd>${esc(h.timeouts?.connect_delay_ms ?? 0)}ms</dd>
+            `}
           </dl>
         </div>
         <div data-host-pane="raw" class="hidden">
@@ -12121,12 +15641,25 @@ title_contains = "Custom rule"
           );
         });
       });
+      if (virt) {
+        loadHostVirtualBlobs(h.id).catch((err) => toast(err.message));
+      }
+      const hostInvOpts = () => ({
+        virtual: virt,
+        scanId: state._hostDetailScanId || undefined,
+      });
       const btnProc = $("#btnLoadProcesses");
-      if (btnProc) btnProc.addEventListener("click", () => loadHostProcesses(h.id, { virtual: virt }));
+      if (btnProc) btnProc.addEventListener("click", () => loadHostProcesses(h.id, hostInvOpts()));
       const btnFiles = $("#btnLoadFiles");
-      if (btnFiles) btnFiles.addEventListener("click", () => loadHostFiles(h.id, { virtual: virt }));
+      if (btnFiles) btnFiles.addEventListener("click", () => loadHostFiles(h.id, hostInvOpts()));
       const btnConn = $("#btnLoadConnections");
-      if (btnConn) btnConn.addEventListener("click", () => loadHostConnections(h.id, { virtual: virt }));
+      if (btnConn) btnConn.addEventListener("click", () => loadHostConnections(h.id, hostInvOpts()));
+      $$("[data-hunt-inventory]", $("#drawerBody")).forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          openInventoryInHunt(h.id, btn.getAttribute("data-hunt-inventory") || "processes", "");
+        });
+      });
 
       const scanSel = $("#hostDetailScanSelect");
       if (scanSel) {
@@ -12135,42 +15668,73 @@ title_contains = "Custom rule"
           state._hostDetailScanId = sid;
           if (!state._hostDetailScanByHost) state._hostDetailScanByHost = {};
           state._hostDetailScanByHost[h.id] = sid;
+          const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
+          const tags = scanTagsList(s);
           const hint = $("#hostDetailScanHint");
-          if (hint) {
-            const s = hostScans.find((x) => String(x.job?.id || x.meta?.scan_id || "") === sid);
-            const when = s?.meta?.finished_at || s?.job?.created_at || "";
-            hint.textContent = sid ? `${shortId(sid)}${when ? ` · ${fmtWhen(when)}` : ""}` : "latest available";
+          if (hint) hint.innerHTML = scanSelectedHintHtml(s, sid);
+          const tagPrev = $("#hostDetailScanTagsPreview");
+          if (tagPrev) tagPrev.innerHTML = hostScanTagsPreviewHtml(tags);
+          const tagSummary = $("#hostDetailScanTagsSummary");
+          if (tagSummary) {
+            tagSummary.innerHTML = tags.length ? formatScanTags(tags) : `<span class="muted">—</span>`;
+          }
+          const headTags = $("#hostDetailHeadScanTags");
+          if (headTags) {
+            headTags.innerHTML = tags.length
+              ? `<span class="host-scan-tags-label">Scan</span>${formatScanTags(tags)}`
+              : `<span class="host-scan-tags-label">Scan</span><span class="muted">${sid ? "No tags" : "No scans"}</span>`;
           }
           // Refresh counts + any open inventory pane.
           try {
+            const meta = await ensureScanInventoryMeta(s);
+            state._hostDetailSelectedScanMeta = meta;
             const q = hostInventoryScanQuery({ scanId: sid });
             const [p, f, c] = await Promise.all([
               api(`/v1/hosts/${h.id}/processes?${q}`).catch(() => null),
               api(`/v1/hosts/${h.id}/files?${q}`).catch(() => null),
               api(`/v1/hosts/${h.id}/connections?${q}`).catch(() => null),
             ]);
+            const inv = withScanInventoryTotals({
+              processes: Number(p?.count ?? 0),
+              files: Number(f?.count ?? 0),
+              connections: Number(c?.count ?? 0),
+            }, meta);
+            state._hostDetailInvCounts = inv;
             const tabBtns = $$("[data-host-tab]");
-            const pc = Number(p?.count ?? 0);
-            const fc = Number(f?.count ?? 0);
-            const cc = Number(c?.count ?? 0);
             tabBtns.forEach((b) => {
               const tab = b.getAttribute("data-host-tab");
-              if (tab === "processes") b.textContent = `Processes (${pc})`;
-              if (tab === "files") b.textContent = `Files (${fc})`;
-              if (tab === "connections") b.textContent = `Connections (${cc})`;
+              if (tab === "processes") {
+                b.textContent = `Processes (${fmtInvShownTotal(inv.processes, inv.processesTotal)})`;
+              }
+              if (tab === "files") {
+                b.textContent = `Files (${fmtInvShownTotal(inv.files, inv.filesTotal)})`;
+              }
+              if (tab === "connections") b.textContent = `Connections (${inv.connections})`;
             });
             const invDd = $("#hostDetailInvCounts");
-            if (invDd) {
-              invDd.innerHTML = `<span class="mono">${pc} processes</span>
-              · <span class="mono">${fc} files</span>
-              · <span class="mono">${cc} connections</span>
-              <div class="muted" style="font-size:0.75rem">Counts for the selected scan (change above to compare history)</div>`;
+            if (invDd) invDd.innerHTML = hostInventoryCountsHtml(inv);
+            const procBanner = $("#hostProcCapBanner");
+            if (procBanner) {
+              procBanner.innerHTML = scanInvCapBannerHtml("processes", inv.processes, inv.processesTotal, h.id)
+                || `<div class="muted host-pane-lead">Process inventory from the selected scan.</div>`;
             }
+            const fileBanner = $("#hostFileCapBanner");
+            if (fileBanner) {
+              fileBanner.innerHTML = scanInvCapBannerHtml("files", inv.files, inv.filesTotal, h.id)
+                || `<div class="muted host-pane-lead">File inventory from the selected scan.</div>`;
+            }
+            $$("[data-hunt-inventory]", $("#drawerBody")).forEach((btn) => {
+              btn.onclick = (e) => {
+                e.preventDefault();
+                openInventoryInHunt(h.id, btn.getAttribute("data-hunt-inventory") || "processes", "");
+              };
+            });
           } catch (_) {}
           const active = $$("[data-host-tab].active")[0]?.getAttribute("data-host-tab");
-          if (active === "processes") loadHostProcesses(h.id, { virtual: virt });
-          else if (active === "files") loadHostFiles(h.id, { virtual: virt });
-          else if (active === "connections") loadHostConnections(h.id, { virtual: virt });
+          const invOpts = { virtual: virt, scanId: sid || undefined };
+          if (active === "processes") loadHostProcesses(h.id, invOpts);
+          else if (active === "files") loadHostFiles(h.id, invOpts);
+          else if (active === "connections") loadHostConnections(h.id, invOpts);
           toast(`Inventory scan → ${shortId(sid) || "latest"}`);
         });
       }
@@ -12194,13 +15758,17 @@ title_contains = "Custom rule"
           $$("[data-host-pane]").forEach((p) => {
             p.classList.toggle("hidden", p.getAttribute("data-host-pane") !== btn.dataset.hostTab);
           });
-          if (btn.dataset.hostTab === "processes") loadHostProcesses(h.id, { virtual: virt });
-          if (btn.dataset.hostTab === "files") loadHostFiles(h.id, { virtual: virt });
-          if (btn.dataset.hostTab === "connections") loadHostConnections(h.id, { virtual: virt });
+          if (btn.dataset.hostTab === "processes") loadHostProcesses(h.id, hostInvOpts());
+          if (btn.dataset.hostTab === "files") loadHostFiles(h.id, hostInvOpts());
+          if (btn.dataset.hostTab === "connections") loadHostConnections(h.id, hostInvOpts());
         });
       });
       $$("[data-goto]", $("#drawerBody")).forEach((b) => {
-        b.addEventListener("click", () => { closeDrawer(); setView(b.dataset.goto); });
+        b.addEventListener("click", () => {
+          closeDrawer();
+          const tab = b.getAttribute("data-settings-tab");
+          setView(b.dataset.goto, tab ? { settingsTab: tab } : undefined);
+        });
       });
       $$("[data-copy-ingest]", $("#drawerBody")).forEach((btn) => {
         btn.addEventListener("click", async (e) => {
@@ -12290,6 +15858,12 @@ title_contains = "Custom rule"
       wireHostActionButtons($("#drawerBody"));
     } catch (err) {
       toast(err.message);
+      const body = $("#drawerBody");
+      if (body) {
+        body.innerHTML = `<div class="empty">${esc(err.message || "Failed to load host")}</div>`;
+      }
+    } finally {
+      hidePageLoading();
     }
   }
 
@@ -12300,29 +15874,67 @@ title_contains = "Custom rule"
     return parts.join("&");
   }
 
-  function hostScanPickerHtml(hostScans, selectedScanId) {
-    const opts = (hostScans || []).map((s, i) => {
-      const j = s.job || {};
-      const m = s.meta || {};
-      const sid = String(j.id || m.scan_id || "");
-      if (!sid) return "";
-      const when = m.finished_at || j.created_at || "";
-      const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
-      const label = `#${i + 1} · ${fmtWhen(when)} · ${setLabel} · ${shortId(sid)}`;
-      const sel = String(selectedScanId || "") === sid || (!selectedScanId && i === 0) ? "selected" : "";
-      return `<option value="${esc(sid)}" ${sel}>${esc(label)}</option>`;
-    }).filter(Boolean);
-    if (!opts.length) {
-      return `<div class="host-scan-picker muted" style="font-size:0.82rem;margin-bottom:0.65rem">No retained scans yet — inventory uses latest available data.</div>`;
+  function scanPickerLabel(s, index) {
+    const j = s?.job || {};
+    const m = s?.meta || {};
+    const sid = String(j.id || m.scan_id || "");
+    const when = m.finished_at || j.created_at || "";
+    const setLabel = j.check_set || (m.probe_version === "virtual-import" ? "virtual-import" : "scan");
+    const tags = Array.isArray(m.tags) ? m.tags.filter(Boolean) : [];
+    const tagBit = tags.length ? ` · ${tags.join(", ")}` : "";
+    return `#${index + 1} · ${fmtWhen(when)} · ${setLabel}${tagBit} · ${shortId(sid)}`;
+  }
+
+  function scanTagsList(s) {
+    const tags = Array.isArray(s?.meta?.tags) ? s.meta.tags.filter(Boolean) : [];
+    return tags.map((t) => String(t).trim()).filter(Boolean);
+  }
+
+  function scanSelectedHintHtml(s, sid) {
+    if (!sid) return esc("latest available");
+    const when = s?.meta?.finished_at || s?.job?.created_at || "";
+    const tags = scanTagsList(s);
+    return `${esc(shortId(sid))}${when ? ` · ${esc(fmtWhen(when))}` : ""}${
+      tags.length ? ` · <span class="host-scan-picker-tags">${formatScanTags(tags)}</span>` : ""
+    }`;
+  }
+
+  function hostScanTagsPreviewHtml(tags) {
+    const list = Array.isArray(tags) ? tags.filter(Boolean) : [];
+    if (!list.length) {
+      return `<span class="host-scan-tags-label">Scan tags</span><span class="muted">None</span>`;
     }
+    return `<span class="host-scan-tags-label">Scan tags</span>${formatScanTags(list)}`;
+  }
+
+  function hostScanPickerHtml(hostScans, selectedScanId, opts = {}) {
+    const virt = !!opts.virtual;
+    const list = hostScans || [];
+    const scanOpts = list.map((s, i) => {
+      const sid = String(s.job?.id || s.meta?.scan_id || "");
+      if (!sid) return "";
+      const sel = String(selectedScanId || "") === sid || (!selectedScanId && i === 0) ? "selected" : "";
+      return `<option value="${esc(sid)}" ${sel} title="${esc(scanPickerLabel(s, i))}">${esc(scanPickerLabel(s, i))}</option>`;
+    }).filter(Boolean);
+    if (!scanOpts.length) {
+      return `<div class="host-scan-picker host-scan-picker--empty muted">${virt
+        ? "No import snapshots yet — inventory uses latest ingest data."
+        : "No retained scans yet — inventory uses latest available data."}</div>`;
+    }
+    const activeSid = String(selectedScanId || list[0]?.job?.id || list[0]?.meta?.scan_id || "");
+    const active = list.find((x) => String(x.job?.id || x.meta?.scan_id || "") === activeSid) || list[0];
+    const activeTags = scanTagsList(active);
     return `<div class="host-scan-picker">
-      <label>Inventory scan
+      <label>${virt ? "Inventory import" : "Inventory scan"}
         <select id="hostDetailScanSelect" class="ml-select" title="Which finished scan feeds Processes / Files / Connections">
-          ${opts.join("")}
+          ${scanOpts.join("")}
         </select>
       </label>
-      <button type="button" class="btn primary tiny" id="btnViewSelectedScan" title="Open the selected scan as a full page">View scan</button>
-      <span class="muted" style="font-size:0.75rem">Applies to Processes, Files, and Connections · View scan opens the full page</span>
+      <div class="host-scan-picker-preview" id="hostDetailScanTagsPreview" title="Tags on the selected scan">
+        ${hostScanTagsPreviewHtml(activeTags)}
+      </div>
+      <button type="button" class="btn primary tiny" id="btnViewSelectedScan" title="Open the selected scan as a full page">View ${virt ? "import" : "scan"}</button>
+      <span class="muted host-detail-note">Applies to Processes, Files, and Connections</span>
     </div>`;
   }
 
@@ -12396,6 +16008,51 @@ title_contains = "Custom rule"
     try { el.setSelectionRange(value.length, value.length); } catch (_) {}
   }
 
+  /** Heal mangled kernel-thread comm (`0:0H]` from basename of `[kworker/0:0H]`). */
+  function displayProcessComm(p) {
+    const comm = String(p?.comm || "").trim();
+    const cmd0 = pathBytes((p?.cmdline || [])[0]) || pathBytes(p?.exe) || "";
+    const kernel = (s) => s.startsWith("[") && s.endsWith("]");
+    if (kernel(cmd0) && !kernel(comm)) return cmd0;
+    return comm || "—";
+  }
+
+  /** Argv tokens from a process observation (`cmdline` PathBytes[] or string fallbacks). */
+  function processArgvTokens(p) {
+    const raw = p?.cmdline;
+    if (Array.isArray(raw) && raw.length) {
+      return raw.map(pathBytes).filter(Boolean);
+    }
+    if (typeof raw === "string" && raw.trim()) {
+      return raw.trim().split(/\s+/);
+    }
+    if (typeof p?.command === "string" && p.command.trim()) {
+      return p.command.trim().split(/\s+/);
+    }
+    const exe = pathBytes(p?.exe) || "";
+    const args = typeof p?.args === "string" ? p.args.trim() : "";
+    if (exe || args) {
+      return [exe, ...args.split(/\s+/).filter(Boolean)].filter(Boolean);
+    }
+    return [];
+  }
+
+  /** Full extracted command line (exe + args), Hunt-compatible. */
+  function processCmdlineExtracted(p) {
+    const toks = processArgvTokens(p);
+    if (toks.length) return toks.join(" ");
+    return pathBytes(p?.exe) || displayProcessComm(p) || "";
+  }
+
+  /** Args-only portion (everything after argv[0]). */
+  function processArgsExtracted(p) {
+    if (typeof p?.args === "string" && p.args.trim() && !Array.isArray(p?.cmdline)) {
+      return p.args.trim();
+    }
+    const toks = processArgvTokens(p);
+    return toks.length > 1 ? toks.slice(1).join(" ") : "";
+  }
+
   async function loadHostProcesses(hostId, opts) {
     const pane = $("#hostProcessesPane");
     if (!pane) return;
@@ -12413,6 +16070,18 @@ title_contains = "Custom rule"
       const src = pack.source === "virtual_ingest"
         ? "ingest JSONL"
         : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
+      const metaForTotals = (opts?.scanId
+        && state.scanDetail?.id
+        && String(state.scanDetail.id) === String(opts.scanId))
+        ? state.scanDetail.status?.meta
+        : (state._hostDetailSelectedScanMeta || null);
+      const invSummary = scanInventorySummary(metaForTotals);
+      const totalKnown = invSummary?.processes
+        ?? state._hostDetailInvCounts?.processesTotal
+        ?? (state.scanDetail?.id && opts?.scanId && String(state.scanDetail.id) === String(opts.scanId)
+          ? state.scanDetail?.invCounts?.processesTotal
+          : null)
+        ?? null;
       let sortKey = "pid";
       let sortDir = "asc";
       let filterQ = "";
@@ -12421,8 +16090,9 @@ title_contains = "Custom rule"
         ppid: (p) => p.ppid,
         user: (p) => p.username || ((p.uids && p.uids[0] != null) ? String(p.uids[0]) : ""),
         state: (p) => p.state || "",
-        comm: (p) => p.comm || "",
-        cmdline: (p) => (p.cmdline || []).map(pathBytes).filter(Boolean).join(" "),
+        comm: (p) => displayProcessComm(p),
+        cmdline: (p) => processCmdlineExtracted(p),
+        args: (p) => processArgsExtracted(p),
         exe: (p) => pathBytes(p.exe) || "",
         listen: (p) => (p.listen_ports || [])[0] ?? "",
         ns: (p) => {
@@ -12442,27 +16112,32 @@ title_contains = "Custom rule"
         const q = String(filterQ || "").toLowerCase().trim();
         let shown = !q ? rows : rows.filter((p) => {
           const hay = [
-            p.comm, p.username, pathBytes(p.exe),
-            ...(p.cmdline || []).map(pathBytes),
+            displayProcessComm(p), p.username, pathBytes(p.exe),
+            processCmdlineExtracted(p), processArgsExtracted(p),
             String(p.pid), String(p.ppid),
           ].join(" ").toLowerCase();
           return hay.includes(q);
         });
         const getter = sortGetters[sortKey];
         if (getter) shown = sortRowsBy(shown, getter, sortDir);
+        const totalBit = totalKnown != null && totalKnown > rows.length
+          ? ` · scan ${rows.length.toLocaleString()} of ${Number(totalKnown).toLocaleString()} total`
+          : "";
         pane.innerHTML = `
-        <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem">
-          <input id="hostProcQ" type="search" placeholder="Filter by name, path, pid…" value="${esc(filterQ)}" style="min-width:14rem" />
-          <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()} · ${esc(src)}</span>
+        <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem;flex-wrap:wrap">
+          <input id="hostProcQ" type="search" placeholder="Filter by name, path, args, pid…" value="${esc(filterQ)}" style="min-width:14rem" />
+          <button type="button" class="btn ghost tiny" id="hostProcHuntBtn" title="Search full inventory in Hunt${filterQ ? " (includes filter)" : ""}">Search in Hunt</button>
+          <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()}${esc(totalBit)} · ${esc(src)}</span>
         </div>
-        <table class="data"><thead><tr>
+        <table class="data host-proc-table"><thead><tr>
           ${sortableTh("PID", "pid", sortKey, sortDir)}
           ${sortableTh("PPID", "ppid", sortKey, sortDir)}
           ${sortableTh("User", "user", sortKey, sortDir)}
           ${sortableTh("State", "state", sortKey, sortDir)}
           ${sortableTh("Comm", "comm", sortKey, sortDir)}
-          ${sortableTh("Cmdline", "cmdline", sortKey, sortDir)}
           ${sortableTh("Exe", "exe", sortKey, sortDir)}
+          ${sortableTh("Args", "args", sortKey, sortDir)}
+          ${sortableTh("Cmdline", "cmdline", sortKey, sortDir)}
           ${sortableTh("Listen", "listen", sortKey, sortDir)}
           ${sortableTh("NS net", "ns", sortKey, sortDir)}
           ${sortableTh("Flags", "flags", sortKey, sortDir)}
@@ -12477,18 +16152,21 @@ title_contains = "Custom rule"
             if ((p.environ_flags || []).length) flags.push(...p.environ_flags);
             const listen = (p.listen_ports || []).join(", ") || "—";
             const user = p.username || ((p.uids && p.uids[0] != null) ? String(p.uids[0]) : "—");
-            const cmd = (p.cmdline || []).map(pathBytes).filter(Boolean).join(" ") || "—";
+            const cmd = processCmdlineExtracted(p) || "—";
+            const args = processArgsExtracted(p) || "—";
             const nsNet = (p.ns && (p.ns.net?.utf8 || p.ns.net?.b64 || p.ns.net?.s || p.ns.net?.b || p.ns.net)) || "—";
             const nsNetStr = typeof nsNet === "string" ? nsNet : (pathBytes(nsNet) || "—");
             const exeStr = pathBytes(p.exe) || "—";
+            const clip = (s, n) => (s && s.length > n ? `${s.slice(0, n)}…` : s);
             return `<tr>
               <td class="mono">${esc(p.pid)}</td>
               <td class="mono">${esc(p.ppid)}</td>
               <td class="mono">${esc(user)}</td>
               <td class="mono">${esc(p.state || "—")}</td>
-              <td class="mono">${esc(p.comm || "—")}</td>
-              <td class="mono" title="${esc(cmd)}">${esc(cmd.length > 64 ? cmd.slice(0, 64) + "…" : cmd)}</td>
-              <td class="mono" title="${esc(exeStr)}">${esc(exeStr)}</td>
+              <td class="mono">${esc(displayProcessComm(p))}</td>
+              <td class="mono host-proc-exe" title="${esc(exeStr)}">${esc(clip(exeStr, 48))}</td>
+              <td class="mono host-proc-args" title="${esc(args)}">${esc(clip(args, 96))}</td>
+              <td class="mono host-proc-cmdline" title="${esc(cmd)}">${esc(clip(cmd, 120))}</td>
               <td class="mono">${esc(listen)}</td>
               <td class="mono" title="${esc(nsNetStr)}">${esc(nsNetStr === "—" ? "—" : String(nsNetStr).slice(0, 12))}</td>
               <td>${flags.length ? flags.map((f) => `<span class="tag">${esc(f)}</span>`).join(" ") : "—"}</td>
@@ -12503,6 +16181,9 @@ title_contains = "Custom rule"
             paint();
             restoreSearchFocus("#hostProcQ", filterQ);
           }, 100);
+        });
+        $("#hostProcHuntBtn")?.addEventListener("click", () => {
+          openInventoryInHunt(hostId, "processes", filterQ);
         });
         wireSortableHeaders(pane, (key) => {
           const next = toggleSortState(sortKey, sortDir, key);
@@ -12535,6 +16216,18 @@ title_contains = "Custom rule"
       const src = pack.source === "virtual_ingest"
         ? "ingest JSONL"
         : (pack.scan_id ? `scan ${shortId(pack.scan_id)}` : "store");
+      const metaForTotals = (opts?.scanId
+        && state.scanDetail?.id
+        && String(state.scanDetail.id) === String(opts.scanId))
+        ? state.scanDetail.status?.meta
+        : (state._hostDetailSelectedScanMeta || null);
+      const invSummary = scanInventorySummary(metaForTotals);
+      const totalKnown = invSummary?.files
+        ?? state._hostDetailInvCounts?.filesTotal
+        ?? (state.scanDetail?.id && opts?.scanId && String(state.scanDetail.id) === String(opts.scanId)
+          ? state.scanDetail?.invCounts?.filesTotal
+          : null)
+        ?? null;
       let sortKey = "path";
       let sortDir = "asc";
       let filterQ = "";
@@ -12574,10 +16267,14 @@ title_contains = "Custom rule"
         const getter = sortGetters[sortKey];
         if (getter) shown = sortRowsBy(shown, getter, sortDir);
         const capped = shown.slice(0, 5000);
+        const totalBit = totalKnown != null && totalKnown > rows.length
+          ? ` · scan ${rows.length.toLocaleString()} of ${Number(totalKnown).toLocaleString()} total`
+          : "";
         pane.innerHTML = `
-        <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem">
+        <div class="toolbar" style="margin-bottom:0.55rem;gap:0.45rem;flex-wrap:wrap">
           <input id="hostFileQ" type="search" placeholder="Filter by path, owner, mode…" value="${esc(filterQ)}" style="min-width:14rem" />
-          <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()} · ${esc(src)}</span>
+          <button type="button" class="btn ghost tiny" id="hostFileHuntBtn" title="Search full inventory in Hunt${filterQ ? " (includes filter)" : ""}">Search in Hunt</button>
+          <span class="muted" style="font-size:0.78rem">${shown.length.toLocaleString()} / ${rows.length.toLocaleString()}${esc(totalBit)} · ${esc(src)}</span>
         </div>
         <table class="data"><thead><tr>
           ${sortableTh("Path", "path", sortKey, sortDir)}
@@ -12618,7 +16315,10 @@ title_contains = "Custom rule"
             </tr>`;
           }).join("")}
         </tbody></table>
-        ${shown.length > 5000 ? `<div class="muted" style="margin-top:0.45rem">Showing first 5,000 of ${shown.length.toLocaleString()}</div>` : ""}`;
+        ${shown.length > 5000 ? `<div class="muted" style="margin-top:0.45rem">Showing first 5,000 of ${shown.length.toLocaleString()} filtered rows</div>` : ""}
+        ${totalKnown != null && totalKnown > rows.length
+          ? `<div class="muted" style="margin-top:0.35rem">This scan embeds ${rows.length.toLocaleString()} of ${Number(totalKnown).toLocaleString()} files — use <strong>Search in Hunt</strong> for the full set.</div>`
+          : ""}`;
         let t = 0;
         $("#hostFileQ")?.addEventListener("input", (e) => {
           clearTimeout(t);
@@ -12627,6 +16327,9 @@ title_contains = "Custom rule"
             paint();
             restoreSearchFocus("#hostFileQ", filterQ);
           }, 100);
+        });
+        $("#hostFileHuntBtn")?.addEventListener("click", () => {
+          openInventoryInHunt(hostId, "files", filterQ);
         });
         wireSortableHeaders(pane, (key) => {
           const next = toggleSortState(sortKey, sortDir, key);
@@ -12719,122 +16422,156 @@ title_contains = "Custom rule"
     }
     const labels = h.labels || {};
     const timeouts = h.timeouts || {};
+    const isVirtual = String(h.agent_kind || "").toLowerCase() === "virtual";
     openModal("Update host", `
-      <form class="form" id="editHostForm">
-        <label>Display name
-          <input name="display_name" required value="${esc(h.display_name)}" />
-        </label>
-        <label>Primary address
-          <input name="primary_addr" value="${esc(h.primary_addr || "")}" />
-        </label>
-        <div class="form-row">
-          <label>SSH port
-            <input name="ssh_port" type="number" min="1" max="65535" value="${esc(h.ssh_port || 22)}" />
-          </label>
-          <label>Credential ref
-            <input name="credential" placeholder="vault://ssh/prod" value="${esc(labels.credential || "")}" />
-          </label>
-          <label>SSH username
-            <input name="ssh_user" placeholder="root" value="${esc(labels.ssh_user || "")}" />
-          </label>
-        </div>
-        ${sshAuthFieldsHtml({
-          method: labels.ssh_auth === "password" || labels.ssh_password_file ? "password" : "publickey",
-          identityName: "ssh_identity",
-          identityFileId: "editHostIdentityFile",
-          identityValue: labels.ssh_identity || "",
-          passwordFileValue: labels.ssh_password_file || "",
-          passwordPlaceholder: labels.ssh_password_file ? "Leave blank to keep saved password" : "SSH password",
-          idPrefix: "editSshAuth",
-          sudoEnabled: ["1", "true", "yes", "on"].includes(String(labels.ssh_sudo || "").toLowerCase()),
-          sudoMode: labels.ssh_sudo_mode || (labels.ssh_password_file ? "ssh_password" : "nopasswd"),
-          sudoPasswordFileValue: labels.ssh_sudo_password_file || "",
-        })}
-        ${String(h.agent_kind || "").toLowerCase() !== "virtual" ? `
-        <label>Agent
-          <select name="agent_kind">
-            <option value="ssh" ${!isAgentLiteHost(h) ? "selected" : ""}>SSH probe (ephemeral binary)</option>
-            <option value="agentlite" ${isAgentLiteHost(h) ? "selected" : ""}>AgentLite (SSH commands only, no binary)</option>
-          </select>
-        </label>
-        <p class="muted" style="margin:0.25rem 0 0.75rem;font-size:0.75rem">
-          AgentLite never copies a probe onto the host — collection uses read-only SSH shell commands (sudo when configured). Coverage is lower; scans raise RM-POL-0021.
-        </p>` : ""}
-        <div class="form-row">
-          <label>Env
-            <input name="env" value="${esc(labels.env || "")}" />
-          </label>
-          <label>Profile
-            <input name="profile" value="${esc(labels.profile || "")}" />
-          </label>
-          <label>Region
-            <input name="region" value="${esc(labels.region || "")}" />
-          </label>
-        </div>
-        <label>Tags (comma-separated)
-          <input name="tags" value="${esc(labels.tags || "")}" />
-        </label>
-        <div class="form-row">
-          <label>Preferred check set
-            <select name="check_set">
-              <option value="">Fleet default (${esc(state.settings?.effective?.default_check_set || "standard")})</option>
-              ${CHECK_SETS.map((s) => `<option value="${esc(s.id)}" ${(labels.check_set || labels.default_check_set) === s.id ? "selected" : ""}>${esc(s.title)}</option>`).join("")}
+      <form class="form edit-host-form" id="editHostForm">
+        <section class="form-section">
+          <h3 class="form-section-title">Identity</h3>
+          <div class="form-row form-row-2">
+            <label>Display name
+              <input name="display_name" required value="${esc(h.display_name)}" />
+            </label>
+            <label>Primary address
+              <input name="primary_addr" value="${esc(h.primary_addr || "")}" />
+            </label>
+          </div>
+          ${!isVirtual ? `
+          <div class="form-row form-row-3">
+            <label>SSH port
+              <input name="ssh_port" type="number" min="1" max="65535" value="${esc(h.ssh_port || 22)}" />
+            </label>
+            <label>SSH username
+              <input name="ssh_user" placeholder="root" value="${esc(labels.ssh_user || "")}" />
+            </label>
+            <label>Credential ref
+              <input name="credential" placeholder="vault://ssh/prod" value="${esc(labels.credential || "")}" />
+            </label>
+          </div>` : `
+          <input type="hidden" name="ssh_port" value="${esc(h.ssh_port || 22)}" />
+          <p class="form-hint muted">Virtual host — log ingest only (no SSH).</p>`}
+        </section>
+
+        ${!isVirtual ? `
+        <section class="form-section">
+          <h3 class="form-section-title">SSH access</h3>
+          ${sshAuthFieldsHtml({
+            method: labels.ssh_auth === "password" || labels.ssh_password_file ? "password" : "publickey",
+            identityName: "ssh_identity",
+            identityFileId: "editHostIdentityFile",
+            identityValue: labels.ssh_identity || "",
+            passwordFileValue: labels.ssh_password_file || "",
+            passwordPlaceholder: labels.ssh_password_file ? "Leave blank to keep saved password" : "SSH password",
+            idPrefix: "editSshAuth",
+            sudoEnabled: ["1", "true", "yes", "on"].includes(String(labels.ssh_sudo || "").toLowerCase()),
+            sudoMode: labels.ssh_sudo_mode || (labels.ssh_password_file ? "ssh_password" : "nopasswd"),
+            sudoPasswordFileValue: labels.ssh_sudo_password_file || "",
+          })}
+          <label>Agent
+            <select name="agent_kind">
+              <option value="ssh" ${!isAgentLiteHost(h) ? "selected" : ""}>SSH probe (ephemeral binary)</option>
+              <option value="agentlite" ${isAgentLiteHost(h) ? "selected" : ""}>AgentLite (SSH commands only, no binary)</option>
             </select>
           </label>
-          <label>Scan interval
-            <select name="scan_interval">
-              ${scanIntervalOptionsHtml(labels.scan_interval || "manual")}
-            </select>
-          </label>
-          <label>Scan history keep
-            <select name="scan_history">
-              <option value="">Fleet default (${esc(String(state.settings?.effective?.scan_history_per_host ?? 10))})</option>
-              ${[1,3,5,10,20,50].map((v) => `<option value="${v}" ${String(labels.scan_history || labels.scan_history_per_host || "") === String(v) ? "selected" : ""}>${v}</option>`).join("")}
-            </select>
-          </label>
-        </div>
-        <div class="form-row">
-          <label>Connect timeout (s)
-            <input name="connect_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.connect_timeout_secs ?? "")}" />
-          </label>
-          <label>Auth timeout (s)
-            <input name="auth_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.auth_timeout_secs ?? "")}" />
-          </label>
-          <label>Command timeout (s)
-            <input name="cmd_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.cmd_timeout_secs ?? "")}" />
-          </label>
-        </div>
-        <div class="form-row">
-          <label>Inactivity timeout (s)
-            <input name="inactivity_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.inactivity_timeout_secs ?? "")}" />
-          </label>
-          <label>Delivery timeout (s)
-            <input name="delivery_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.delivery_timeout_secs ?? "")}" />
-          </label>
-          <label>Scan timeout (s)
-            <input name="scan_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.scan_timeout_secs ?? "")}" />
-          </label>
-        </div>
-        <div class="form-row">
-          <label>Connect delay (ms)
-            <input name="connect_delay_ms" type="number" min="0" value="${esc(timeouts.connect_delay_ms ?? "")}" />
-          </label>
-        </div>
-        ${String(h.agent_kind || "").toLowerCase() !== "virtual" ? `
-        <div id="editHostCollectPaths" class="${isAgentLiteHost(h) ? "" : "hidden"}">
-          <label>Extra file paths to inventory (AgentLite)
-            <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh">${esc(labels.collect_paths || "")}</textarea>
-          </label>
-          <p class="muted" style="margin:0.25rem 0 0.75rem;font-size:0.75rem">
-            Absolute files or directories (one per line, or comma-separated). Merged with AgentLite defaults (/bin, /usr/bin, /etc, /tmp, …). Directories are walked shallowly (depth ≤3).
+          <p class="form-hint muted">
+            AgentLite never copies a probe onto the host — collection uses read-only SSH shell commands (sudo when configured). Coverage is lower; scans raise RM-POL-0021.
           </p>
-        </div>` : ""}
+          <div id="editHostCollectPaths" class="${isAgentLiteHost(h) ? "" : "hidden"}">
+            <label>Extra file paths to inventory (AgentLite)
+              <textarea name="collect_paths" rows="3" class="mono" placeholder="/opt/app&#10;/var/www&#10;/home/deploy/.ssh">${esc(labels.collect_paths || "")}</textarea>
+            </label>
+            <p class="form-hint muted">
+              Absolute files or directories (one per line, or comma-separated). Merged with AgentLite defaults (/bin, /usr/bin, /etc, /tmp, …). Directories are walked shallowly (depth ≤3).
+            </p>
+          </div>
+        </section>` : ""}
+
+        <section class="form-section">
+          <h3 class="form-section-title">Platform</h3>
+          ${hostPlatformFieldsHtml({
+            arch: h.arch || "",
+            kernel: h.kernel || "",
+            os: h.os || "",
+            hint: isVirtual
+              ? "Set during ingest or edit here. Virtual imports no longer force x86_64."
+              : "Usually filled by SSH probe fingerprint; you can override.",
+          })}
+        </section>
+
+        <section class="form-section">
+          <h3 class="form-section-title">Labels &amp; scan policy</h3>
+          <div class="form-row form-row-3">
+            <label>Env
+              <input name="env" value="${esc(labels.env || "")}" />
+            </label>
+            <label>Profile
+              <input name="profile" value="${esc(labels.profile || "")}" />
+            </label>
+            <label>Region
+              <input name="region" value="${esc(labels.region || "")}" />
+            </label>
+          </div>
+          <label>Tags (comma-separated)
+            <input name="tags" value="${esc(labels.tags || "")}" />
+          </label>
+          <div class="form-row form-row-3">
+            <label>Preferred check set
+              <select name="check_set">
+                <option value="">Fleet default (${esc(state.settings?.effective?.default_check_set || "standard")})</option>
+                ${CHECK_SETS.map((s) => `<option value="${esc(s.id)}" ${(labels.check_set || labels.default_check_set) === s.id ? "selected" : ""}>${esc(s.title)}</option>`).join("")}
+              </select>
+            </label>
+            <label>Scan interval
+              <select name="scan_interval">
+                ${scanIntervalOptionsHtml(labels.scan_interval || "manual")}
+              </select>
+            </label>
+            <label>Scan history keep
+              <select name="scan_history">
+                <option value="">Fleet default (${esc(String(state.settings?.effective?.scan_history_per_host ?? 10))})</option>
+                ${[1,3,5,10,20,50].map((v) => `<option value="${v}" ${String(labels.scan_history || labels.scan_history_per_host || "") === String(v) ? "selected" : ""}>${v}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <h3 class="form-section-title">Timeouts</h3>
+          <p class="form-hint muted">Leave blank to use fleet defaults.</p>
+          <div class="form-row form-row-3">
+            <label>Connect timeout (s)
+              <input name="connect_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.connect_timeout_secs ?? "")}" />
+            </label>
+            <label>Auth timeout (s)
+              <input name="auth_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.auth_timeout_secs ?? "")}" />
+            </label>
+            <label>Command timeout (s)
+              <input name="cmd_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.cmd_timeout_secs ?? "")}" />
+            </label>
+          </div>
+          <div class="form-row form-row-3">
+            <label>Inactivity timeout (s)
+              <input name="inactivity_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.inactivity_timeout_secs ?? "")}" />
+            </label>
+            <label>Delivery timeout (s)
+              <input name="delivery_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.delivery_timeout_secs ?? "")}" />
+            </label>
+            <label>Scan timeout (s)
+              <input name="scan_timeout_secs" type="number" min="0" placeholder="fleet default" value="${esc(timeouts.scan_timeout_secs ?? "")}" />
+            </label>
+          </div>
+          <div class="form-row form-row-2">
+            <label>Connect delay (ms)
+              <input name="connect_delay_ms" type="number" min="0" value="${esc(timeouts.connect_delay_ms ?? "")}" />
+            </label>
+          </div>
+        </section>
+
         <div class="form-actions">
           <button type="button" class="btn ghost" data-close-modal>Cancel</button>
           <button class="btn primary" type="submit">Save</button>
         </div>
       </form>
-    `);
+    `, { mode: "wide" });
     const editForm = $("#editHostForm");
     wireIdentityPicker("ssh_identity", "editHostIdentityFile");
     wireSshAuthMethodToggle(editForm);
@@ -12913,6 +16650,9 @@ title_contains = "Custom rule"
             agent_kind: String(h.agent_kind || "").toLowerCase() === "virtual"
               ? undefined
               : (agentKind === "agentlite" ? "agentlite" : "ssh"),
+            arch: String(fd.get("arch") || "").trim(),
+            kernel: String(fd.get("kernel") || "").trim(),
+            os: String(fd.get("os") || "").trim(),
             labels: labelsOut,
             timeouts: {
               connect_timeout_secs: numOrUndef(fd.get("connect_timeout_secs")),
@@ -13039,13 +16779,27 @@ title_contains = "Custom rule"
   function showTagSelected() {
     const ids = [...selectedHostIds()];
     if (!ids.length) return;
+    const selected = ids.map((id) => state.hosts.find((x) => x.id === id)).filter(Boolean);
+    const unionTags = [...new Set(selected.flatMap((h) => hostFreeformTags(h)))].sort();
+    const envs = [...new Set(selected.map((h) => h.labels?.env).filter(Boolean))];
     openModal(`Tag ${ids.length} host(s)`, `
       <form class="form" id="tagHostsForm">
+        ${unionTags.length || envs.length ? `
+        <div class="host-tag-preview">
+          <div class="muted host-detail-note">Current on selection</div>
+          <div class="host-tags-cell">
+            ${unionTags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+            ${envs.map((e) => `<span class="host-meta-chip" title="env">${esc(e)}</span>`).join("")}
+          </div>
+        </div>` : ""}
         <label>Tags to merge (comma-separated)
-          <input name="tags" placeholder="pci, linux, jump" required />
+          <input name="tags" placeholder="pci, linux, jump" />
         </label>
         <label>Env (optional)
-          <input name="env" placeholder="prod" />
+          <input name="env" placeholder="prod" value="${esc(envs.length === 1 ? envs[0] : "")}" />
+        </label>
+        <label>Profile (optional)
+          <input name="profile" placeholder="workstation" />
         </label>
         <div class="form-actions">
           <button type="button" class="btn ghost" data-close-modal>Cancel</button>
@@ -13058,12 +16812,18 @@ title_contains = "Custom rule"
       const fd = new FormData(e.target);
       const tags = String(fd.get("tags") || "").trim();
       const env = String(fd.get("env") || "").trim();
+      const profile = String(fd.get("profile") || "").trim();
+      if (!tags && !env && !profile) {
+        toast("Add tags, env, or profile");
+        return;
+      }
       let n = 0;
       for (const id of ids) {
         const h = state.hosts.find((x) => x.id === id);
         if (!h) continue;
         const patch = {};
         if (env) patch.env = env;
+        if (profile) patch.profile = profile;
         if (tags) {
           const existing = String(h.labels?.tags || "")
             .split(/[,;]+/)
@@ -13093,8 +16853,8 @@ title_contains = "Custom rule"
         h.display_name,
         agent.title,
         agent.detail,
-        h.primary_addr || "",
-        h.ssh_port || 22,
+        isVirtualHost(h) ? "" : (h.primary_addr || ""),
+        isVirtualHost(h) ? "" : (h.ssh_port || 22),
         h.os || "",
         h.os_id || "",
         h.os_version || "",
@@ -13123,15 +16883,18 @@ title_contains = "Custom rule"
 
   function wireHostActionButtons(root) {
     const scope = root || document;
+    wireHostActionMenus(scope);
     $$("[data-scan-host]", scope).forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
+        closeAllHostActionMenus();
         showScanHosts([btn.dataset.scanHost]);
       });
     });
     $$("[data-edit-host]", scope).forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
+        closeAllHostActionMenus();
         closeDrawer();
         showEditHost(btn.dataset.editHost);
       });
@@ -13139,6 +16902,7 @@ title_contains = "Custom rule"
     $$("[data-delete-host]", scope).forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
+        closeAllHostActionMenus();
         await deleteHosts([btn.dataset.deleteHost]);
       });
     });
@@ -13490,9 +17254,9 @@ title_contains = "Custom rule"
               </span>
             </label>
           </div>
-          <label>Server path (file or directory on the server)
-            <input name="path" class="mono" placeholder="/var/log/fleet or ./samples/procs.jsonl" autocomplete="off" />
-          </label>
+          ${serverPathFieldHtml({
+            label: "Server path (file or directory on the server)",
+          })}
           <label>Upload .jsonl / .json / .csv files
             <input type="file" id="addHostVirtualFiles" multiple accept=".jsonl,.ndjson,.json,.csv,text/*" />
           </label>
@@ -13507,6 +17271,12 @@ title_contains = "Custom rule"
             </label>
             <p class="form-hint muted">Only needed for a single host (tree import off, or flat file upload). Same name updates an existing virtual host and adds a new scan.</p>
           </div>
+          ${hostPlatformFieldsHtml({
+            hint: "Optional — set at ingest (tree import applies to every host). Edit later via Update host.",
+          })}
+          ${scanTagsFieldHtml({
+            hint: "Optional — tags the scan created by this import (first import or update).",
+          })}
           <div id="addHostVirtualProgress" class="hidden"></div>
           <div id="addHostVirtualResult" class="hidden add-host-virtual-result"></div>
         </section>
@@ -13675,7 +17445,7 @@ title_contains = "Custom rule"
         try {
           setImportProgress("addHostVirtualProgBar", {
             title: "Preparing import",
-            detail: "Scanning selected files…",
+            detail: "Checking path / files…",
             pct: 0,
           });
           const feed = await readVirtualFeedFields(
@@ -13683,14 +17453,15 @@ title_contains = "Custom rule"
             "#addHostVirtualFiles",
             "#addHostVirtualDir",
             (p) => setImportProgress("addHostVirtualProgBar", {
-              title: p.phase === "scan" || p.phase === "scan_done" ? "Scanning folder" : "Reading files",
+              title: virtualProgressTitle(p.phase),
               detail: p.detail,
               pct: p.pct,
             })
           );
-          const wantTree = fd.get("tree_import") != null
-            && isVirtualTreeFolderUpload(feed.files || []);
-          if (fd.get("tree_import") != null && (feed.files || []).length && !wantTree) {
+          const treeChecked = fd.get("tree_import") != null;
+          const wantTreeUpload = treeChecked && isVirtualTreeFolderUpload(feed.files || []);
+          const wantTreeServer = treeChecked && !!(feed.path || "").trim() && !(feed.files || []).length;
+          if (treeChecked && (feed.files || []).length && !wantTreeUpload) {
             $("#addVirtDisplayNameWrap")?.classList.remove("hidden");
             const name = String(fd.get("virtual_name") || "").trim();
             if (!name) {
@@ -13699,37 +17470,55 @@ title_contains = "Custom rule"
               return;
             }
           }
-          if (wantTree) {
+          if (wantTreeServer || wantTreeUpload) {
             const treeOpts = readTreeHostFromForm(fd, "addVirt");
-            setImportProgress("addHostVirtualProgBar", {
-              title: "Importing host tree",
-              detail: "Create or update one virtual host per subdirectory…",
-              pct: 0,
-            });
-            const res = await importVirtualTreeUpload(
-              feed.files,
-              {
-                host_from: treeOpts.host_from,
-                parent_dir_field: treeOpts.parent_dir_field,
-                delimiter: treeOpts.delimiter,
-                create_scan: treeOpts.create_scan,
-                replace: treeOpts.replace,
-                kind: feed.kind || "auto",
-                virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
-              },
-              (p) => setImportProgress("addHostVirtualProgBar", {
+            const treeCommon = {
+              host_from: treeOpts.host_from,
+              parent_dir_field: treeOpts.parent_dir_field,
+              delimiter: treeOpts.delimiter,
+              create_scan: treeOpts.create_scan,
+              replace: treeOpts.replace,
+              kind: feed.kind || "auto",
+              virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+              labels,
+              ...readHostPlatformFromForm(fd),
+              ...readScanTagsFromForm(fd),
+            };
+            const onTreeProg = bindImportTreeProgress("addHostVirtualProgBar");
+            if (wantTreeServer) {
+              onTreeProg({
                 title: "Importing host tree",
-                detail: p.detail,
-                pct: p.pct,
-              })
-            );
+                detail: `Server path ${feed.path}`,
+                pct: 1,
+                log: `Server path tree · ${feed.path}`,
+                logLevel: "progress",
+              });
+            } else {
+              setImportProgress("addHostVirtualProgBar", {
+                title: "Importing host tree",
+                detail: "Create or update one virtual host per subdirectory…",
+                pct: null,
+              });
+            }
+            const res = wantTreeServer
+              ? await importVirtualTreeFromServerPath(feed.path, treeCommon, onTreeProg)
+              : await importVirtualTreeUpload(
+                feed.files,
+                treeCommon,
+                (p) => setImportProgress("addHostVirtualProgBar", {
+                  title: "Importing host tree",
+                  detail: p.detail,
+                  pct: p.pct,
+                })
+              );
             ticker.stop();
             const s = res.summary || {};
             const updated = (s.results || []).filter((r) => !r.error && r.created === false).length;
             const created = (s.results || []).filter((r) => !r.error && r.created === true).length;
             setImportProgress("addHostVirtualProgBar", {
-              title: "Done",
-              detail: `${s.hosts_ok ?? 0} hosts ok (${created} new · ${updated} updated) · ${s.hosts_failed ?? 0} failed`,
+              title: s.hosts_failed ? "Finished with errors" : "Done",
+              detail: `${s.hosts_ok ?? 0} hosts ok (${created} new · ${updated} updated) · ${s.hosts_failed ?? 0} failed · ${s.hosts_skipped ?? 0} skipped`,
+              counts: `${s.hosts_ok ?? 0} ok · ${s.hosts_failed ?? 0} fail · ${s.hosts_skipped ?? 0} skip`,
               done: true,
             });
             const box = $("#addHostVirtualResult");
@@ -13771,11 +17560,14 @@ title_contains = "Custom rule"
           }
           const existed = existingVirtualHostNames().has(name);
           const treeOpts = readTreeHostFromForm(fd, "addVirt");
+          const usingServerPath = !!(feed.path || "").trim() && !(feed.files || []).length;
           setImportProgress("addHostVirtualProgBar", {
             title: existed ? "Updating host" : "Creating host",
-            detail: feed.files.length
-              ? `Uploading ${feed.fileCount} file(s) · ${formatUploadBytes(feed.readBytes)}…`
-              : (existed ? "Refreshing virtual agent…" : "Registering virtual agent…"),
+            detail: usingServerPath
+              ? `Server is importing ${feed.path}…`
+              : (feed.files.length
+                ? `Uploading ${feed.fileCount} file(s) · ${formatUploadBytes(feed.readBytes)}…`
+                : (existed ? "Refreshing virtual agent…" : "Registering virtual agent…")),
             pct: null,
           });
           const res = await createVirtualHostChunked({
@@ -13788,8 +17580,10 @@ title_contains = "Custom rule"
             create_scan: treeOpts.create_scan,
             replace: treeOpts.replace,
             virtual_agent_id: String(fd.get("virtual_agent_id") || "").trim() || null,
+            ...readHostPlatformFromForm(fd),
+            ...readScanTagsFromForm(fd),
           }, (p) => setImportProgress("addHostVirtualProgBar", {
-            title: p.phase === "pack" ? "Packaging upload" : "Uploading to server",
+            title: virtualProgressTitle(p.phase),
             detail: p.detail,
             pct: p.pct,
           }));
@@ -14024,12 +17818,6 @@ title_contains = "Custom rule"
   }
 
   function boot() {
-    const saved = localStorage.getItem("rustmite_api_token") || "";
-    if ($("#apiToken")) $("#apiToken").value = saved;
-    $("#apiToken")?.addEventListener("change", (e) => {
-      saveToken(e.target.value.trim());
-      loadAll().catch((err) => toast(err.message));
-    });
     wireLoginForm();
     $("#btnLogout")?.addEventListener("click", async () => {
       try {
@@ -14073,18 +17861,23 @@ title_contains = "Custom rule"
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         const group = btn.closest(".nav-group");
-        if (!group) return;
+        if (!group || !group.id) return;
         const open = !group.classList.contains("open");
-        // If collapsing while on an SSH page, jump back to hosts so the menu can stay closed.
-        if (!open && String(state.view || "").startsWith("ssh-")) {
-          setView("hosts");
-          return;
-        }
-        setSshHunterOpen(open);
+        setNavGroupOpen(group.id, open);
       });
     });
-    // Ensure SSH Hunter starts collapsed on boot.
-    setSshHunterOpen(false);
+    // Nested groups start collapsed; setView opens the active one.
+    setNavGroupOpen("navSshHunter", false);
+    setNavGroupOpen("navAdvanced", false);
+    try {
+      applySidebarCollapsed(localStorage.getItem("rustmite_sidebar_collapsed") === "1");
+    } catch (_) {
+      applySidebarCollapsed(false);
+    }
+    $("#btnSidebarCollapse")?.addEventListener("click", () => {
+      applySidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+    });
+    $("#btnSidebarExpand")?.addEventListener("click", () => applySidebarCollapsed(false));
     $$(".nav-item[data-view]").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
     $("#btnRefresh").addEventListener("click", () => loadAll().catch((e) => toast(e.message)));
     $("#btnQuickScan").addEventListener("click", () => showQuickScan("standard"));
@@ -14103,7 +17896,7 @@ title_contains = "Custom rule"
       localStorage.setItem("rustmite_clock_utc", state.useUtc ? "1" : "0");
       updateClock();
       renderLiveStrip();
-      if (state.view === "activity" || state.view === "dashboard") render();
+      if (state.view === "dashboard") render();
     });
     const menu = $("#scanMenu");
     $("#btnScanMenu").addEventListener("click", (e) => {
@@ -14117,9 +17910,42 @@ title_contains = "Custom rule"
       });
     });
     document.addEventListener("click", () => menu.classList.add("hidden"));
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest?.(".host-action-menu")) closeAllHostActionMenus();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeAllHostActionMenus();
+    });
+    window.addEventListener("scroll", closeAllHostActionMenus, true);
+    window.addEventListener("resize", closeAllHostActionMenus);
     $$("[data-close]").forEach((el) => el.addEventListener("click", closeDrawer));
     document.addEventListener("click", (e) => {
-      if (e.target.matches("[data-close-modal]")) closeModal();
+      if (e.target.closest?.("#fsBrowse")) return;
+      if (e.target.closest?.("[data-close-modal]")) closeModal();
+    });
+    document.addEventListener("click", (e) => {
+      if (e.target.closest?.("[data-close-fs-browse]")) {
+        e.preventDefault();
+        closeFsBrowse();
+        return;
+      }
+      const btn = e.target.closest?.("[data-browse-server-path]");
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const row = btn.closest(".server-path-row");
+      const input = row?.querySelector("input")
+        || btn.parentElement?.querySelector("input");
+      openServerPathBrowser(input, btn.getAttribute("data-browse-mode") || "any");
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      const fs = $("#fsBrowse");
+      if (fs && !fs.classList.contains("hidden")) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeFsBrowse();
+      }
     });
     updateClock();
     window.addEventListener("hashchange", () => applyLocationHash());

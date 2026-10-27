@@ -52,9 +52,55 @@ pub trait Store: Send + Sync {
     async fn enqueue_scan(&self, req: EnqueueScan) -> StoreResult<ScanJob>;
     async fn lease_jobs(&self, node_id: NodeId, capacity: usize) -> StoreResult<Vec<ScanJob>>;
     async fn complete_scan(&self, req: CompleteScan) -> StoreResult<()>;
+    /// Replace operator tags on an existing scan's meta (empty clears).
+    async fn update_scan_tags(
+        &self,
+        scan_id: rustmite_proto::ScanId,
+        tags: Vec<String>,
+    ) -> StoreResult<rustmite_proto::ScanMeta> {
+        let _ = (scan_id, tags);
+        Err(crate::error::StoreError::Backend(
+            "update_scan_tags not supported".into(),
+        ))
+    }
+
+    /// Set / replace inventory summary on an existing scan's meta (virtual-import caps).
+    async fn update_scan_inventory(
+        &self,
+        scan_id: rustmite_proto::ScanId,
+        inventory: rustmite_proto::ScanInventorySummary,
+    ) -> StoreResult<rustmite_proto::ScanMeta> {
+        let _ = (scan_id, inventory);
+        Err(crate::error::StoreError::Backend(
+            "update_scan_inventory not supported".into(),
+        ))
+    }
     async fn insert_observations(&self, rows: Vec<StoredObservation>) -> StoreResult<()>;
     async fn insert_findings(&self, findings: Vec<Finding>) -> StoreResult<()>;
     async fn list_findings(&self, filter: FindingFilter) -> StoreResult<Vec<Finding>>;
+
+    /// Update triage status for one finding.
+    ///
+    /// Implementations should treat `false_positive` / `suppressed` / clear-to-`new` as
+    /// host×check scoped (all matching findings), so re-scans don't reopen muted alerts.
+    /// `true_positive` stays per-finding.
+    async fn update_finding_status(
+        &self,
+        id: rustmite_proto::FindingId,
+        status: rustmite_proto::FindingStatus,
+        suppressed_by: Option<String>,
+    ) -> StoreResult<Finding> {
+        let _ = (id, status, suppressed_by);
+        Err(crate::error::StoreError::Backend(
+            "update_finding_status not supported".into(),
+        ))
+    }
+
+    /// Permanently remove one finding.
+    async fn delete_finding(&self, id: rustmite_proto::FindingId) -> StoreResult<bool> {
+        let _ = id;
+        Ok(false)
+    }
 
     /// Drop prior findings for `host_id` whose `check_id` is in `check_ids`.
     /// Used so a re-scan that re-evaluates a check clears stale alerts (e.g. fixed FPs).

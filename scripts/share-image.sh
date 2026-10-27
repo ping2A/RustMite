@@ -19,8 +19,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 NAME="rustmite"
+# Keep in sync with ./dev.sh — workspace Cargo.toml is the default release line;
+# override with --tag (also sets RUSTMITE_VERSION for the console).
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION#v}"
+VERSION="${VERSION:-0.0.0}"
 OUT_DIR="${ROOT}/dist"
 
 DO_LOAD=0

@@ -30,10 +30,10 @@
       <p id="loginError" class="login-error hidden"></p>
       <div id="loginCredFields">
         <label>Username
-          <input name="username" autocomplete="username" value="admin" />
+          <input name="username" autocomplete="username" />
         </label>
         <label>Password
-          <input name="password" type="password" autocomplete="current-password" value="admin" />
+          <input name="password" type="password" autocomplete="current-password" />
         </label>
       </div>
       <div id="loginMfaFields" class="hidden">
@@ -45,23 +45,36 @@
         <button type="button" class="btn ghost hidden" id="btnLoginWebauthn">Use YubiKey / security key</button>
       </div>
       <button class="btn primary" type="submit" id="loginSubmit">Sign in</button>
-      <p class="muted login-hint">Default account: admin / admin · enable MFA under Settings → Account</p>
+      <p class="muted login-hint">Enable MFA under Settings → Account after signing in</p>
     </form>
   </div>
 
   <div id="app" class="shell hidden">
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="brand">
         <img class="brand-logo" src="/ui/assets/logo-mark.png" width="64" height="64" alt="RustMite" />
-        <div>
+        <div class="brand-text">
           <div class="brand-name">RustMite</div>
           <div class="brand-sub">Agentless Linux IDS</div>
         </div>
+        <button type="button" class="sidebar-toggle" id="btnSidebarCollapse" title="Collapse sidebar" aria-label="Collapse sidebar" aria-expanded="true">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M15 18l-6-6 6-6"/>
+          </svg>
+        </button>
       </div>
       <nav class="nav" id="nav">
         <button data-view="dashboard" class="nav-item active">Dashboard</button>
-        <button data-view="findings" class="nav-item">Findings</button>
+        <button data-view="findings" class="nav-item nav-item-findings">
+          Findings
+          <span class="nav-count" id="navFindingsCount" hidden>0</span>
+        </button>
         <button data-view="hosts" class="nav-item">Hosts</button>
+        <button data-view="scans" class="nav-item">Scans</button>
+        <button data-view="queue" class="nav-item">Task queue</button>
+
+        <div class="nav-section-label">Hunt</div>
+        <button data-view="hunt" class="nav-item">Hunt</button>
         <div class="nav-group" id="navSshHunter">
           <button type="button" class="nav-item nav-group-toggle" data-nav-group="ssh" aria-expanded="false">
             SSH Hunter
@@ -77,13 +90,21 @@
             <button data-view="ssh-tags" class="nav-item nav-subitem">Tag Workbench</button>
           </div>
         </div>
-        <button data-view="scans" class="nav-item">Scans</button>
-        <button data-view="queue" class="nav-item">Task queue</button>
-        <button data-view="activity" class="nav-item">Activity</button>
-        <button data-view="hunt" class="nav-item">Hunt</button>
-        <button data-view="fleet-sift" class="nav-item">Fleet Sift</button>
-        <button data-view="anomark" class="nav-item">AnoMark</button>
+
+        <div class="nav-section-label">Detection</div>
+        <div class="nav-group" id="navAdvanced">
+          <button type="button" class="nav-item nav-group-toggle" data-nav-group="advanced" aria-expanded="false">
+            Advanced
+            <span class="nav-caret" aria-hidden="true"></span>
+          </button>
+          <div class="nav-sub" hidden>
+            <button data-view="fleet-sift" class="nav-item nav-subitem">Fleet Sift</button>
+            <button data-view="anomark" class="nav-item nav-subitem">AnoMark</button>
+          </div>
+        </div>
         <button data-view="checks" class="nav-item">Rules</button>
+
+        <div class="nav-section-label">Settings</div>
         <button data-view="data" class="nav-item">Data</button>
         <button data-view="settings" class="nav-item">Settings</button>
       </nav>
@@ -91,17 +112,21 @@
         <div class="health" id="healthPill">connecting…</div>
         <div id="sessionUser" class="session-user muted" style="font-size:0.78rem;margin:0.35rem 0"></div>
         <button type="button" class="btn ghost hidden" id="btnLogout" style="width:100%;margin-bottom:0.35rem">Sign out</button>
-        <label class="token-label">Legacy API token
-          <input id="apiToken" type="password" placeholder="optional shared Bearer" autocomplete="off" />
-        </label>
       </div>
     </aside>
 
     <div class="main">
       <header class="topbar sandfly-top">
-        <div>
-          <h1 id="pageTitle">Dashboard</h1>
-          <p id="pageSub" class="muted">Fleet posture at a glance</p>
+        <div class="topbar-title-block">
+          <button type="button" class="sidebar-expand-btn" id="btnSidebarExpand" title="Show sidebar" aria-label="Show sidebar" hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M4 6h16M4 12h16M4 18h16"/>
+            </svg>
+          </button>
+          <div>
+            <h1 id="pageTitle">Dashboard</h1>
+            <p id="pageSub" class="muted">Fleet posture at a glance</p>
+          </div>
         </div>
         <div class="top-actions">
           <div class="theme-switcher">
@@ -197,7 +222,23 @@
         </div>
       </section>
 
-      <main id="content" class="content"></main>
+      <div class="content-shell">
+        <div id="pageLoading" class="page-loading hidden" hidden aria-hidden="true" role="status" aria-live="polite">
+          <div class="page-loading-card">
+            <div class="page-loading-mark" aria-hidden="true">
+              <span class="page-loading-ring"></span>
+              <span class="page-loading-ring page-loading-ring--delay"></span>
+              <img class="page-loading-logo" src="/ui/assets/logo-mark.png" width="36" height="36" alt="" />
+            </div>
+            <div class="page-loading-copy">
+              <div class="page-loading-label" id="pageLoadingLabel">Loading…</div>
+              <div class="page-loading-hint" id="pageLoadingHint">Please wait</div>
+            </div>
+            <div class="page-loading-bar" aria-hidden="true"><span></span></div>
+          </div>
+        </div>
+        <main id="content" class="content"></main>
+      </div>
     </div>
   </div>
 
@@ -220,6 +261,17 @@
         <button class="icon-btn" data-close-modal aria-label="Close">×</button>
       </header>
       <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="fsBrowse" class="fs-browse-overlay hidden" aria-hidden="true">
+    <div class="fs-browse-backdrop" data-close-fs-browse></div>
+    <div class="fs-browse-panel" role="dialog" aria-modal="true" aria-labelledby="fsBrowseTitle">
+      <header class="fs-browse-head">
+        <h2 id="fsBrowseTitle">Browse server</h2>
+        <button type="button" class="icon-btn" data-close-fs-browse aria-label="Close">×</button>
+      </header>
+      <div id="fsBrowseBody" class="fs-browse-body"></div>
     </div>
   </div>
 

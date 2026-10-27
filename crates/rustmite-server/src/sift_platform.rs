@@ -21,7 +21,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::routes::{ApiError, AppState};
-use crate::sift_api::{ensure_sift_dirs, load_virtual_files_jsonl, load_virtual_jsonl};
+use crate::sift_api::{
+    ensure_sift_dirs, load_virtual_files_jsonl_preferred, load_virtual_jsonl_preferred,
+};
 
 fn platform_db_path() -> PathBuf {
     PathBuf::from(".dev/sift-platform/db.json")
@@ -215,7 +217,7 @@ pub async fn sync_fleet_dataset(
         let mut got = false;
 
         if h.agent_kind.eq_ignore_ascii_case("virtual") {
-            for row in load_virtual_jsonl(h) {
+            for row in load_virtual_jsonl_preferred(&state, h).await {
                 if let Ok(line) = serde_json::to_string(&row) {
                     ndjson.push_str(&line);
                     ndjson.push('\n');
@@ -223,7 +225,7 @@ pub async fn sync_fleet_dataset(
                     got = true;
                 }
             }
-            for row in load_virtual_files_jsonl(h) {
+            for row in load_virtual_files_jsonl_preferred(&state, h, usize::MAX).await {
                 if let Ok(line) = serde_json::to_string(&row) {
                     ndjson.push_str(&line);
                     ndjson.push('\n');

@@ -1,6 +1,6 @@
 //! Fleet Sift (IronSift) — TF-IDF + DBSCAN, file fleet, temporal diffs, virtual ingest.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -80,7 +80,7 @@ pub struct FleetSiftBody {
     pub host_ids: Vec<Uuid>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// Soft tag match against host label keys/values (and comma-split `labels.tags`).
+    /// Soft tag match against host labels **or** any retained scan's `meta.tags`.
     #[serde(default)]
     pub tags: Vec<String>,
     /// Only include hosts whose `last_scan_at` is on/after this ISO timestamp.
@@ -153,7 +153,27 @@ fn host_matches_labels(h: &HostRecord, want: &BTreeMap<String, String>) -> bool 
         .all(|(k, v)| h.labels.get(k).map(|x| x == v).unwrap_or(false))
 }
 
-fn host_matches_tags(h: &HostRecord, tags: &[String]) -> bool {
+fn label_matches_tag(h: &HostRecord, want: &str, want_lc: &str) -> bool {
+    h.labels.iter().any(|(k, v)| {
+        if k.eq_ignore_ascii_case(want) || v.eq_ignore_ascii_case(want) {
+            return true;
+        }
+        v.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .any(|p| p.trim().eq_ignore_ascii_case(want))
+            || k.to_ascii_lowercase().contains(want_lc)
+            || v.to_ascii_lowercase().contains(want_lc)
+    })
+}
+
+fn scan_tags_match(scan_tags: &[String], want: &str, want_lc: &str) -> bool {
+    scan_tags.iter().any(|t| {
+        let t = t.trim();
+        t.eq_ignore_ascii_case(want) || t.to_ascii_lowercase().contains(want_lc)
+    })
+}
+
+/// Match when every requested tag hits host labels **or** any retained scan tag for the host.
+fn host_matches_tags(h: &HostRecord, tags: &[String], scan_tags: &[String]) -> bool {
     if tags.is_empty() {
         return true;
     }
@@ -163,16 +183,102 @@ fn host_matches_tags(h: &HostRecord, tags: &[String]) -> bool {
             return true;
         }
         let wl = w.to_ascii_lowercase();
-        h.labels.iter().any(|(k, v)| {
-            if k.eq_ignore_ascii_case(w) || v.eq_ignore_ascii_case(w) {
-                return true;
-            }
-            v.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                .any(|p| p.trim().eq_ignore_ascii_case(w))
-                || k.to_ascii_lowercase().contains(&wl)
-                || v.to_ascii_lowercase().contains(&wl)
-        })
+        label_matches_tag(h, w, &wl) || scan_tags_match(scan_tags, w, &wl)
     })
+}
+
+fn scan_tags_by_host(
+    scans: &[rustmite_store::ScanStatus],
+) -> HashMap<Uuid, Vec<String>> {
+    let mut map: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for s in scans {
+        let hid = s
+            .job
+            .as_ref()
+            .map(|j| j.host_id.0)
+            .or_else(|| s.meta.as_ref().map(|m| m.host_id.0));
+        let Some(hid) = hid else { continue };
+        let Some(meta) = s.meta.as_ref() else { continue };
+        if meta.tags.is_empty() {
+            continue;
+        }
+        let entry = map.entry(hid).or_default();
+        for t in &meta.tags {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !entry.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                entry.push(t.to_string());
+            }
+        }
+    }
+    map
+}
+
+fn scan_matches_all_tags(scan_tags: &[String], want: &[String]) -> bool {
+    if want.is_empty() {
+        return true;
+    }
+    want.iter().all(|raw| {
+        let w = raw.trim();
+        if w.is_empty() {
+            return true;
+        }
+        let wl = w.to_ascii_lowercase();
+        scan_tags_match(scan_tags, w, &wl)
+    })
+}
+
+/// Newest finished scan id per host that carries every requested tag.
+fn scan_id_by_tags(
+    scans: &[rustmite_store::ScanStatus],
+    want_tags: &[String],
+) -> HashMap<Uuid, Uuid> {
+    if want_tags.is_empty() {
+        return HashMap::new();
+    }
+    let mut by_host: HashMap<Uuid, Vec<(String, Uuid, Vec<String>)>> = HashMap::new();
+    for s in scans {
+        let hid = s
+            .job
+            .as_ref()
+            .map(|j| j.host_id.0)
+            .or_else(|| s.meta.as_ref().map(|m| m.host_id.0));
+        let Some(hid) = hid else { continue };
+        let Some(meta) = s.meta.as_ref() else { continue };
+        if meta.tags.is_empty() {
+            continue;
+        }
+        let sid = s
+            .job
+            .as_ref()
+            .map(|j| j.id.0)
+            .unwrap_or(meta.scan_id.0);
+        let when = if !meta.finished_at.is_empty() {
+            meta.finished_at.clone()
+        } else {
+            s.job
+                .as_ref()
+                .and_then(|j| j.updated_at.clone())
+                .unwrap_or_default()
+        };
+        by_host
+            .entry(hid)
+            .or_default()
+            .push((when, sid, meta.tags.clone()));
+    }
+    let mut out = HashMap::new();
+    for (hid, mut list) in by_host {
+        list.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, sid, _)) = list
+            .into_iter()
+            .find(|(_, _, tags)| scan_matches_all_tags(tags, want_tags))
+        {
+            out.insert(hid, sid);
+        }
+    }
+    out
 }
 
 fn parse_scan_ts(s: &str) -> Option<i64> {
@@ -300,34 +406,25 @@ fn report_json(report: &AnalysisReport) -> serde_json::Value {
     })
 }
 
-pub fn load_virtual_jsonl(host: &HostRecord) -> Vec<RawLogEntry> {
-    let path = ingest_dir()
-        .join(host.id.0.to_string())
-        .join("processes.jsonl");
-    if !path.is_file() {
-        return Vec::new();
-    }
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let machine = host.display_name.clone();
+/// Parse process NDJSON payload (ClickHouse blob or on-disk JSONL).
+pub fn parse_virtual_process_jsonl(payload: &str, machine: &str) -> Vec<RawLogEntry> {
     let mut out = Vec::new();
-    for line in raw.lines() {
+    for line in payload.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if let Ok(mut row) = serde_json::from_str::<RawLogEntry>(line) {
             if row.machine_id.trim().is_empty() {
-                row.machine_id = machine.clone();
+                row.machine_id = machine.to_string();
             }
             out.push(row);
             continue;
         }
         // PulseSecure / vendor JSONL (command/cmdline) and loose shapes.
-        if let Ok(mut row) = rustmite_sift::parse_jsonl_process_line(line, &machine) {
+        if let Ok(mut row) = rustmite_sift::parse_jsonl_process_line(line, machine) {
             if row.machine_id.trim().is_empty() {
-                row.machine_id = machine.clone();
+                row.machine_id = machine.to_string();
             }
             out.push(row);
             continue;
@@ -347,7 +444,7 @@ pub fn load_virtual_jsonl(host: &HostRecord) -> Vec<RawLogEntry> {
                     .get("machine_id")
                     .or_else(|| v.get("host"))
                     .and_then(|x| x.as_str())
-                    .unwrap_or(machine.as_str())
+                    .unwrap_or(machine)
                     .to_string(),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
                 ppid: v.get("ppid").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
@@ -375,34 +472,27 @@ pub fn load_virtual_jsonl(host: &HostRecord) -> Vec<RawLogEntry> {
     out
 }
 
-pub fn load_virtual_files_jsonl(host: &HostRecord) -> Vec<RawFileEntry> {
-    let path = ingest_dir()
-        .join(host.id.0.to_string())
-        .join("files.jsonl");
-    if !path.is_file() {
+/// Parse file NDJSON payload (ClickHouse blob or on-disk JSONL).
+pub fn parse_virtual_files_jsonl(payload: &str, machine: &str, max: usize) -> Vec<RawFileEntry> {
+    if max == 0 {
         return Vec::new();
     }
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let machine = host.display_name.clone();
     let mut out = Vec::new();
-    for line in raw.lines() {
+    for line in payload.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if let Ok(mut row) = serde_json::from_str::<RawFileEntry>(line) {
             if row.machine_id.trim().is_empty() {
-                row.machine_id = machine.clone();
+                row.machine_id = machine.to_string();
             }
             out.push(row);
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             let path = v
                 .get("path")
                 .or_else(|| v.get("file"))
+                .or_else(|| v.get("file_path"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -414,7 +504,7 @@ pub fn load_virtual_files_jsonl(host: &HostRecord) -> Vec<RawFileEntry> {
                     .get("machine_id")
                     .or_else(|| v.get("host"))
                     .and_then(|x| x.as_str())
-                    .unwrap_or(machine.as_str())
+                    .unwrap_or(machine)
                     .to_string(),
                 path,
                 uid: v.get("uid").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
@@ -445,6 +535,122 @@ pub fn load_virtual_files_jsonl(host: &HostRecord) -> Vec<RawFileEntry> {
                     .map(str::to_string),
                 size: v.get("size").and_then(|x| x.as_u64()),
             });
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+async fn virtual_blob_from_ch(
+    state: &AppState,
+    kind: &str,
+    host_id: Uuid,
+) -> Option<(serde_json::Value, String)> {
+    let ch = state.clickhouse.as_ref()?;
+    match ch.get_platform_blob(kind, &host_id.to_string()).await {
+        Ok(Some((meta, payload))) if !payload.is_empty() => Some((meta, payload)),
+        _ => None,
+    }
+}
+
+/// Load virtual process rows: ClickHouse `rm_platform_blobs` first, disk fallback.
+pub async fn load_virtual_jsonl_preferred(
+    state: &AppState,
+    host: &HostRecord,
+) -> Vec<RawLogEntry> {
+    if let Some((_meta, payload)) = virtual_blob_from_ch(
+        state,
+        crate::platform_ch::KIND_VIRTUAL_PROCESSES,
+        host.id.0,
+    )
+    .await
+    {
+        return parse_virtual_process_jsonl(&payload, &host.display_name);
+    }
+    load_virtual_jsonl(host)
+}
+
+/// Load virtual file rows: ClickHouse first, disk fallback.
+pub async fn load_virtual_files_jsonl_preferred(
+    state: &AppState,
+    host: &HostRecord,
+    max: usize,
+) -> Vec<RawFileEntry> {
+    if let Some((_meta, payload)) = virtual_blob_from_ch(
+        state,
+        crate::platform_ch::KIND_VIRTUAL_FILES,
+        host.id.0,
+    )
+    .await
+    {
+        return parse_virtual_files_jsonl(&payload, &host.display_name, max);
+    }
+    load_virtual_files_jsonl_capped(host, max)
+}
+
+/// Fast line count from ClickHouse blob meta when available (avoids full parse).
+pub async fn virtual_ingest_count_preferred(
+    state: &AppState,
+    host: &HostRecord,
+    kind: &str,
+) -> usize {
+    if let Some((meta, payload)) = virtual_blob_from_ch(state, kind, host.id.0).await {
+        if let Some(n) = meta.get("lines").and_then(|v| v.as_u64()) {
+            return n as usize;
+        }
+        return payload.lines().filter(|l| !l.trim().is_empty()).count();
+    }
+    match kind {
+        crate::platform_ch::KIND_VIRTUAL_PROCESSES => load_virtual_jsonl(host).len(),
+        crate::platform_ch::KIND_VIRTUAL_FILES => load_virtual_files_jsonl(host).len(),
+        _ => 0,
+    }
+}
+
+/// On-disk virtual process JSONL (local cache / pre-ClickHouse fallback).
+pub fn load_virtual_jsonl(host: &HostRecord) -> Vec<RawLogEntry> {
+    let path = ingest_dir()
+        .join(host.id.0.to_string())
+        .join("processes.jsonl");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    parse_virtual_process_jsonl(&raw, &host.display_name)
+}
+
+pub fn load_virtual_files_jsonl(host: &HostRecord) -> Vec<RawFileEntry> {
+    load_virtual_files_jsonl_capped(host, usize::MAX)
+}
+
+/// Load virtual file JSONL from disk, stopping after `max` rows.
+pub fn load_virtual_files_jsonl_capped(host: &HostRecord, max: usize) -> Vec<RawFileEntry> {
+    use std::io::{BufRead, BufReader};
+
+    if max == 0 {
+        return Vec::new();
+    }
+    let path = ingest_dir()
+        .join(host.id.0.to_string())
+        .join("files.jsonl");
+    let Ok(file) = fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let machine = host.display_name.clone();
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let parsed = parse_virtual_files_jsonl(&line, &machine, 1);
+        out.extend(parsed);
+        if out.len() >= max {
+            out.truncate(max);
+            break;
         }
     }
     out
@@ -504,20 +710,6 @@ async fn obs_for_host_inventory(
         .collect())
 }
 
-async fn latest_scan_obs(
-    state: &AppState,
-    host: &HostRecord,
-) -> Result<Vec<rustmite_store::StoredObservation>, ApiError> {
-    obs_for_host_inventory(state, host, "latest", None).await
-}
-
-async fn process_rows_for_host(
-    state: &AppState,
-    host: &HostRecord,
-) -> Result<(Vec<RawLogEntry>, String), ApiError> {
-    process_rows_for_host_ex(state, host, "latest", None).await
-}
-
 async fn process_rows_for_host_ex(
     state: &AppState,
     host: &HostRecord,
@@ -539,7 +731,8 @@ async fn process_rows_for_host_ex(
             }
         }
         if scan_override.is_none() && inventory.eq_ignore_ascii_case("latest") {
-            return Ok((load_virtual_jsonl(host), "virtual_ingest".into()));
+            let rows = load_virtual_jsonl_preferred(state, host).await;
+            return Ok((rows, "virtual_ingest".into()));
         }
         return Ok((Vec::new(), "virtual_scan".into()));
     }
@@ -569,13 +762,6 @@ async fn process_rows_for_host_ex(
     Ok((out, "scan_observations".into()))
 }
 
-async fn file_rows_for_host(
-    state: &AppState,
-    host: &HostRecord,
-) -> Result<(Vec<RawFileEntry>, String), ApiError> {
-    file_rows_for_host_ex(state, host, "latest", None).await
-}
-
 async fn file_rows_for_host_ex(
     state: &AppState,
     host: &HostRecord,
@@ -593,7 +779,8 @@ async fn file_rows_for_host_ex(
             }
         }
         if scan_override.is_none() && inventory.eq_ignore_ascii_case("latest") {
-            return Ok((load_virtual_files_jsonl(host), "virtual_ingest".into()));
+            let rows = load_virtual_files_jsonl_preferred(state, host, usize::MAX).await;
+            return Ok((rows, "virtual_ingest".into()));
         }
         return Ok((Vec::new(), "virtual_scan".into()));
     }
@@ -624,6 +811,15 @@ pub async fn run_fleet_sift(
     } else {
         Some(body.host_ids.iter().copied().collect())
     };
+    let (scan_tags_map, tag_scan_pick) = if body.tags.is_empty() {
+        (HashMap::new(), HashMap::new())
+    } else {
+        let scans = state.store.list_scans(50_000).await.unwrap_or_default();
+        (
+            scan_tags_by_host(&scans),
+            scan_id_by_tags(&scans, &body.tags),
+        )
+    };
 
     let mut all_logs: Vec<RawLogEntry> = Vec::new();
     let mut all_files: Vec<RawFileEntry> = Vec::new();
@@ -638,19 +834,26 @@ pub async fn run_fleet_sift(
         if !host_matches_labels(&h, &body.labels) {
             continue;
         }
-        if !host_matches_tags(&h, &body.tags) {
+        let host_scan_tags = scan_tags_map.get(&h.id.0).map(|v| v.as_slice()).unwrap_or(&[]);
+        if !host_matches_tags(&h, &body.tags, host_scan_tags) {
             continue;
         }
         if !host_in_scan_window(&h, &body.scan_after, &body.scan_before) {
             continue;
         }
 
+        // Explicit scan_ids win; otherwise a tag filter picks the newest matching scan.
+        let override_id = body
+            .scan_ids
+            .get(&h.id.0.to_string())
+            .copied()
+            .or_else(|| tag_scan_pick.get(&h.id.0).copied());
+
         let mut process_rows = 0usize;
         let mut file_rows = 0usize;
         let mut source = String::new();
 
         if want_process {
-            let override_id = body.scan_ids.get(&h.id.0.to_string()).copied();
             let (rows, src) =
                 process_rows_for_host_ex(&state, &h, &body.inventory, override_id).await?;
             process_rows = rows.len();
@@ -658,7 +861,6 @@ pub async fn run_fleet_sift(
             all_logs.extend(rows);
         }
         if want_file {
-            let override_id = body.scan_ids.get(&h.id.0.to_string()).copied();
             let (rows, src) =
                 file_rows_for_host_ex(&state, &h, &body.inventory, override_id).await?;
             file_rows = rows.len();
@@ -1183,17 +1385,7 @@ pub fn record_virtual_import_provenance(
     Ok(())
 }
 
-/// Read accumulated import folders/files for a virtual host (empty if none).
-pub fn load_virtual_import_provenance(host: &HostRecord) -> (Vec<String>, Vec<String>) {
-    let path = ingest_dir()
-        .join(host.id.0.to_string())
-        .join("import_provenance.json");
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return (Vec::new(), Vec::new());
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return (Vec::new(), Vec::new());
-    };
+fn provenance_folders_files(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let folders = v
         .get("folders")
         .and_then(|x| x.as_array())
@@ -1213,6 +1405,39 @@ pub fn load_virtual_import_provenance(host: &HostRecord) -> (Vec<String>, Vec<St
         })
         .unwrap_or_default();
     (folders, files)
+}
+
+/// Read accumulated import folders/files for a virtual host (empty if none).
+pub fn load_virtual_import_provenance(host: &HostRecord) -> (Vec<String>, Vec<String>) {
+    let path = ingest_dir()
+        .join(host.id.0.to_string())
+        .join("import_provenance.json");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (Vec::new(), Vec::new());
+    };
+    provenance_folders_files(&v)
+}
+
+/// Prefer ClickHouse provenance blob; fall back to local staging file.
+pub async fn load_virtual_import_provenance_preferred(
+    state: &AppState,
+    host: &HostRecord,
+) -> (Vec<String>, Vec<String>) {
+    if let Some((_meta, payload)) = virtual_blob_from_ch(
+        state,
+        crate::platform_ch::KIND_VIRTUAL_PROVENANCE,
+        host.id.0,
+    )
+    .await
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            return provenance_folders_files(&v);
+        }
+    }
+    load_virtual_import_provenance(host)
 }
 
 pub fn append_virtual_process_logs(host: &HostRecord, body: &str) -> Result<usize, String> {
